@@ -460,7 +460,7 @@ docker run -d --name drouter --restart unless-stopped \
 > **端口由配置文件决定，不是环境变量**。`network_mode: host` 下 `ports:` 会被
 > Docker 忽略。端口存在 `/etc/drouter/web-port`，默认 8443，
 > 要改请去界面改（`DROUTER_WEB_PORT` 环境变量只在**首次启动**播种，之后会失效，
-> 这是故意的 —— 见 `packaging/docker/DOCKER-使用说明.md`）。
+> 这是故意的 —— 见 `packaging/docker/packaging/docker/DOCKER-GUIDE.md`）。
 
 > Docker 形态只建议用来**体验界面和 API**。容器里没有 systemd，
 > 所以「服务管理」页会显示 `active: unknown`（这是预期的优雅降级，不是故障）；

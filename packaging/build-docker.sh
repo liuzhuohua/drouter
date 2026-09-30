@@ -38,7 +38,7 @@ echo "== 3/3 产物 =="
 docker images --filter "reference=drouter" --filter "reference=liuzhuohua/drouter"
 echo ""
 cat <<RUN
-运行示例（详见 packaging/docker/DOCKER-使用说明.md）：
+运行示例（详见 packaging/docker/packaging/docker/DOCKER-GUIDE.md）：
 
   # 方式 A：docker compose（Release 里附了 docker-compose.yml）
   docker compose up -d
