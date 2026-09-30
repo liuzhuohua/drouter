@@ -47,6 +47,10 @@ PY
 "$PYBIN" _dev/t-nat-detail.py || { echo "❌ NAT 详情渲染预检失败"; exit 1; }
 # Web 终端（真 PTY）：helper/shelld/web 三端的协议契约 + 超时分级
 "$PYBIN" _dev/t-webshell.py || { echo "❌ Web 终端契约预检失败"; exit 1; }
+# PTY 可用性：/dev/ptmx 丢失时内核只报一句「out of pty devices」，
+# 而 kernel.pty.nr 是 0（一个都没用），排查起来极其费时。
+# 这里钉住「启动自愈 + 失败重试 + 可定位的诊断信息」三件事。
+"$PYBIN" _dev/t-pty.py || { echo "❌ PTY 可用性预检失败"; exit 1; }
 # 终端模拟器行为：ANSI 光标 / 颜色 / 换行 / 分帧中文，在 node 里真跑一遍前端代码
 "$NODEBIN" _dev/t-webterm.js || { echo "❌ 终端模拟器预检失败"; exit 1; }
 # 依赖自检清单：一键安装绝不能把 xfce4 / samba / docker 这类可选大件一起装上

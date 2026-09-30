@@ -5880,6 +5880,10 @@ async function runDepInstall(keys) {
 
 const WS_MAX_SB = 600;          // 回滚区最多保留多少行
 const WS_WRITE_CHUNK = 1024;    // 单次写入字节上限（粘贴长文本时分片发）
+/* 距底部多少像素内算「在底部」。wsAutoScroll（决定要不要继续跟随）
+   wsSyncTailBtn（决定要不要显示「↓ 最新」按钮）必须用同一个阈值 ——
+   两处不一致会出现「按钮没出现，输出也不跟着滚了」这种迷惑状态。 */
+const WS_TAIL_GAP = 40;
 
 const WS = {
   sid: null, cols: 0, rows: 0,
@@ -6253,9 +6257,10 @@ function wsAutoScroll(force) {
   const max = Number(el.scrollHeight) || 0;
   const top = Number(el.scrollTop) || 0;
   const h = Number(el.clientHeight) || max;
-  if (force || (max - top - h) < 40) {
+  if (force || (max - top - h) < WS_TAIL_GAP) {
     try { el.scrollTop = max; } catch (e) { /* 少数环境是只读的，忽略 */ }
   }
+  wsSyncTailBtn();
 }
 
 function wsNote(text) {
@@ -6263,12 +6268,19 @@ function wsNote(text) {
   wsRequestRender(true);
 }
 
+/* 清屏：只清本地这份 ANSI 状态，不向服务端发任何东西 —— 与在终端里敲
+   clear / Ctrl+L 等价。会话、进程、历史都保留，服务端 PTY 完全不知情。
+   （服务端只推原始字节流，客户端自己解释，所以本地清屏是安全的：
+     全屏程序如 top/vi 下一次刷新会整屏重绘。） */
 function wsClearScreen() {
   wsGridInit(WS.cols || 100, WS.rows || 26);
   WS.carry = '';
   const sb = $('#ws-scroll');
   if (sb) sb.innerHTML = '';
   wsRenderScreen();
+  const el = $('#ws-term');
+  if (el) { try { el.scrollTop = 0; } catch (e) { /* 只读环境忽略 */ } }
+  wsSyncTailBtn();
 }
 
 /* ---------------------------- 尺寸测量与同步 ---------------------------- */
@@ -6445,6 +6457,14 @@ async function wsConnect() {
     if (st) st.innerHTML = '<span class="tag err">连接失败</span>';
     wsNote('连接失败：' + (r.msg_cn || '未知错误'));
     if (r.code === 'NO_SHELLD') wsNote('请确认终端守护在运行：systemctl start drouter-shelld');
+    // PTY_FAIL 里最坑的一种是 /dev/ptmx 入口丢失：明明一个终端都没开，
+    // 内核却报「out of pty devices」。守护会尝试自愈；还失败的话给条
+    // 能照着敲的命令，别让用户对着 errno 干瞪眼。
+    if (r.code === 'PTY_FAIL') {
+      wsNote('若提示 out of pty devices，通常是 /dev/ptmx 缺失（容器/虚拟化环境常见）。');
+      wsNote('排查：ls -l /dev/ptmx   修复：ln -sf pts/ptmx /dev/ptmx');
+      wsNote('然后重启守护：systemctl restart drouter-shelld');
+    }
     toast(r.msg_cn || '连接失败', 'err', 5000);
     return;
   }
@@ -6531,7 +6551,7 @@ async function viewWebShell() {
         </select></label>
         <button id="ws-connect" class="primary">连接</button>
         <button id="ws-disconnect" class="ghost" disabled>断开</button>
-        <button id="ws-clear" class="ghost small">清屏</button>
+        <button id="ws-clear" class="ghost small" title="清屏：只清本地显示，不中断会话">清屏</button>
         <button id="ws-copy" class="ghost small">复制可见内容</button>
         <span class="desc" id="ws-status" style="margin:0"></span>
       </div>
@@ -6548,6 +6568,10 @@ async function viewWebShell() {
         <div class="term-bar">
           <span class="term-dot r"></span><span class="term-dot y"></span><span class="term-dot g"></span>
           <span class="term-title" id="ws-title">未连接</span>
+          <button type="button" class="term-btn" id="ws-tobottom" hidden
+            title="回到底部，继续跟随最新输出">↓ 最新</button>
+          <button type="button" class="term-btn" id="ws-clearbar"
+            title="清屏：只清本地显示，不中断会话（等价于命令 clear）">清屏</button>
           <span class="tag gray" id="ws-size">—</span>
         </div>
         <div class="term-body term-screen" id="ws-term" tabindex="0">
@@ -6557,7 +6581,10 @@ async function viewWebShell() {
         <textarea id="ws-key" class="ws-capture" spellcheck="false" autocomplete="off"
           autocapitalize="off" autocorrect="off" aria-label="终端输入"></textarea>
       </div>
-      <p class="desc">点击终端区域即可开始输入；窗口大小变化时会自动同步给服务端。</p>
+      <p class="desc">点击终端区域即可开始输入；窗口大小变化时会自动同步给服务端。
+        长回显会<b>自动跟随最新输出</b>（右侧不显示滚动条）——想翻看历史用滚轮或
+        <span class="mono">PgUp</span>，翻上去之后标题栏会出现「↓ 最新」按钮一键回到底部。
+        清屏只清本地显示，会话和正在跑的程序都不受影响。</p>
     </div>
 
     <div class="card" id="fm-card">
@@ -6630,8 +6657,31 @@ function wsInit() {
   if (c) c.onclick = wsConnect;
   if (d) d.onclick = () => wsDisconnect(false);
   if ($('#ws-clear')) $('#ws-clear').onclick = wsClearScreen;
+  if ($('#ws-clearbar')) $('#ws-clearbar').onclick = wsClearScreen;
   if ($('#ws-copy')) $('#ws-copy').onclick = wsCopyAll;
+  // 隐藏滚动条后，用户滚上去就没有「拖回底部」这个操作了，
+  // 所以给一个显式的「↓ 最新」按钮，只在离开底部时才出现。
+  const tb = $('#ws-tobottom');
+  if (tb) tb.onclick = () => wsAutoScroll(true);
+  const box = $('#ws-term');
+  if (box && box.addEventListener) box.addEventListener('scroll', wsSyncTailBtn, { passive: true });
   wsBindInput();
+  wsSyncTailBtn();
+}
+
+/* 距底部 WS_TAIL_GAP 内算「在底部」：此时不需要按钮，且新输出继续自动跟随。 */
+function wsSyncTailBtn() {
+  const box = $('#ws-term'), tb = $('#ws-tobottom');
+  if (!box || !tb) return;
+  const max = Number(box.scrollHeight) || 0;
+  const top = Number(box.scrollTop) || 0;
+  const h = Number(box.clientHeight) || max;
+  const atBottom = (max - top - h) < WS_TAIL_GAP;
+  if (atBottom) {
+    if (!tb.hidden) { tb.hidden = true; }
+  } else if (tb.hidden) {
+    tb.hidden = false;
+  }
 }
 
 function wsBindInput() {

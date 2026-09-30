@@ -328,26 +328,11 @@ svg[role=img]{display:block;margin:0 auto}
 .lang-tabs button.on{background:var(--grad);color:#fff;border-color:transparent;font-weight:600}
 
 /* ---------- Web 终端 ---------- */
-.term-wrap{border:1px solid var(--line);border-radius:11px;overflow:hidden;background:#0d1526;
-  display:flex;flex-direction:column;margin-bottom:14px}
-.term-bar{display:flex;align-items:center;gap:10px;padding:8px 12px;background:#16233a;
-  border-bottom:1px solid #22314d;font-size:12.5px;color:#9db0cc}
-.term-bar .tdot{width:10px;height:10px;border-radius:50%;background:#31405c;flex:0 0 10px}
-.term-bar .tdot.r{background:#e05c4c} .term-bar .tdot.y{background:#d9a400} .term-bar .tdot.g{background:#3fa15c}
-.term-bar .tt{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.term-body{height:430px;overflow:auto;padding:10px 12px;
-  font-family:ui-monospace,Consolas,"Cascadia Code",monospace;font-size:12.5px;line-height:1.62;
-  color:#cdd9ea;white-space:pre-wrap;word-break:break-all}
-.term-in{display:flex;align-items:center;gap:8px;padding:8px 12px;background:#111c2f;
-  border-top:1px solid #22314d}
-.term-in .ps1{color:#4ea1ff;font-family:ui-monospace,Consolas,monospace;font-size:12.5px;flex:0 0 auto}
-.term-in input{background:transparent;border:none;color:#e6edf7;padding:2px 0;font-size:12.5px;
-  font-family:ui-monospace,Consolas,monospace}
-.term-in input:focus{box-shadow:none;border:none}
-.tk-dir{color:#4ea1ff} .tk-file{color:#cdd9ea} .tk-link{color:#5fd0c8}
-.tk-cmd{color:#8ce99a} .tk-err{color:#f87171} .tk-warn{color:#fbbf24} .tk-num{color:#f0a35e}
-.tk-str{color:#e5c07b} .tk-var{color:#c792ea} .tk-cmt{color:#6b7f9c} .tk-prompt{color:#4ea1ff}
-.tk-key{color:#7ec2ff}
+/* 历史上这里有过一套 .term-wrap/.term-bar/.term-body/.term-in/.tk-* 的旧定义，
+   已被下方「真 PTY 终端」那套（.term-dot/.term-title/.term-body.term-screen）
+   完全取代：旧的一组属性全部被后者覆盖，.tdot/.tt/.term-in/.ps1/.tk-*
+   在 app.js 里 0 引用。留着只会让人误以为改这里有作用，故删除。
+   新增终端样式请一律加到下方「真 PTY 终端」段。 */
 
 /* ---------- 文件管理器 ---------- */
 .fm-toolbar{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:12px}
@@ -471,15 +456,31 @@ svg[role=img]{display:block;margin:0 auto}
 
 /* ---------- Web 终端（新结构：term-bar/term-dot/term-title/term-body/term-input/term-prompt） ---------- */
 .term-wrap{border:1px solid #22314d;border-radius:11px;overflow:hidden;background:#0d1526;
-  display:flex;flex-direction:column;margin-bottom:14px}
+  display:flex;flex-direction:column;margin-bottom:14px;position:relative}
 .term-bar{display:flex;align-items:center;gap:9px;padding:8px 12px;background:#16233a;
   border-bottom:1px solid #22314d;font-size:12.5px;color:#9db0cc}
 .term-dot{width:10px;height:10px;border-radius:50%;background:#31405c;flex:0 0 10px}
 .term-dot.r{background:#e05c4c} .term-dot.y{background:#d9a400} .term-dot.g{background:#3fa15c}
 .term-title{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.term-body{height:420px;overflow:auto;margin:0;padding:10px 12px;
+/* 栏内小按钮（清屏 / 回到底部）。刻意做得比正文小、低对比：
+   这些是辅助动作，不该和「连接 / 断开」抢注意力。 */
+.term-btn{flex:0 0 auto;padding:2px 9px;font-size:11.5px;line-height:1.6;cursor:pointer;
+  border:1px solid #2b3c5c;border-radius:6px;background:#1b2a44;color:#9db0cc;
+  font-family:inherit;transition:background .15s,color .15s,border-color .15s}
+.term-btn:hover{background:#233754;color:#dce7f7;border-color:#3a5080}
+.term-btn:active{background:#16233a}
+.term-btn[hidden]{display:none}
+.term-body{height:clamp(260px,54vh,560px);overflow-y:auto;overflow-x:hidden;
+  margin:0;padding:10px 12px;
   font-family:ui-monospace,Consolas,"Cascadia Code",monospace;font-size:12.5px;line-height:1.62;
-  color:#cdd9ea;white-space:pre-wrap;word-break:break-all;background:transparent;border:none;border-radius:0}
+  color:#cdd9ea;white-space:pre-wrap;word-break:break-all;background:transparent;border:none;border-radius:0;
+  /* 去掉右侧滚动条：长回显靠「自动跟随底部」呈现，不靠拖条。
+     滚动能力保留（滚轮 / PgUp / Ctrl+Home 仍可用），只是不画那根条。 */
+  scrollbar-width:none;          /* Firefox */
+  -ms-overflow-style:none;       /* 旧 Edge / IE */
+  /* 滚到边界时不要把滚动传给外层页面，否则在终端里滚到底会把整页卷走 */
+  overscroll-behavior:contain}
+.term-body::-webkit-scrollbar{width:0;height:0;display:none}  /* Chrome / Edge / Safari */
 .term-input{display:flex;align-items:center;gap:8px;margin-top:10px}
 .term-prompt{color:var(--pri);font-family:ui-monospace,Consolas,monospace;font-size:14px;flex:0 0 auto}
 .term-input input{flex:1;font-size:12.5px;font-family:ui-monospace,Consolas,monospace}
@@ -487,7 +488,6 @@ svg[role=img]{display:block;margin:0 auto}
 /* ---------- 真 PTY 终端（#4 重做）：网格化渲染 ---------- */
 /* 终端按「行」渲染：每行一个 .tl，字符对齐靠等宽字体 + 固定行高。
    这里必须 white-space:pre —— pre-wrap 会把超宽行折回来，行列就对不上了。 */
-.term-wrap{position:relative}
 .term-screen{white-space:pre;word-break:normal;overflow-x:hidden}
 .tl{white-space:pre;height:1.62em;line-height:1.62;min-height:1.62em}
 /* 光标方块：只在当前行当前列画一个 */

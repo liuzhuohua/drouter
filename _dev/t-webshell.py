@@ -194,5 +194,43 @@ chk('Ctrl+C 走控制码', "k.charCodeAt(0) - 96" in APP_JS)
 chk('有选中文字时 Ctrl+C 不中断命令', "k === 'c' && wsSelection()" in APP_JS)
 chk('粘贴不会被当成控制码吞掉', "k === 'v') return;" in APP_JS)
 
+# =========================================================================
+# 5. 前端终端外观：无滚动条 / 跟随最新 / 清屏按钮
+# =========================================================================
+# 需求：右侧不要那根滚动条，长回显自动跟随显示，另给一个小的清屏按钮。
+# 做法是「隐藏滚动条 + 继续自动滚到底」，而不是彻底禁掉滚动 ——
+# 禁掉的话用户就再也翻不了历史了，属于把功能改没了。
+chk('隐藏了 WebKit 滚动条', '::-webkit-scrollbar' in APP_CSS and 'display:none' in APP_CSS)
+chk('隐藏了 Firefox 滚动条', 'scrollbar-width:none' in APP_CSS)
+chk('滚动能力保留（不是把 overflow 关掉）',
+    'overflow-y:auto' in APP_CSS and 'overflow-y:hidden' not in APP_CSS)
+chk('终端高度随视口自适应', 'clamp(' in APP_CSS and 'vh' in APP_CSS)
+chk('栏内小按钮样式存在', '.term-btn{' in APP_CSS)
+chk('标题栏有清屏按钮', 'id="ws-clearbar"' in APP_JS)
+chk('标题栏有回到底部按钮', 'id="ws-tobottom"' in APP_JS)
+chk('定义了 wsSyncTailBtn', 'function wsSyncTailBtn(' in APP_JS)
+chk('滚动时同步尾部按钮', "addEventListener('scroll', wsSyncTailBtn" in APP_JS)
+
+# 阈值只能有一份：wsAutoScroll（要不要继续跟随）和 wsSyncTailBtn（要不要显示
+# 按钮）若各写各的，就会出现「按钮没出现、输出也不跟着滚了」的死角。
+chk('跟随阈值只有一个定义', APP_JS.count('const WS_TAIL_GAP') == 1)
+# pick() 走 ast，只能喂 Python 源码（app.js 里带 em dash，会解析失败）。
+# 这里要的是「函数体」这段文本，直接按偏移切片即可。
+_i = APP_JS.find('function wsAutoScroll(')
+chk('wsAutoScroll 存在', _i >= 0)
+_autos_src = APP_JS[_i:_i + 700] if _i >= 0 else ''
+chk('wsAutoScroll 用同一个阈值', 'WS_TAIL_GAP' in _autos_src and '< 40' not in _autos_src)
+
+# 历史遗留：旧的一套终端样式（.tdot/.tt/.term-in/.tk-*）已被完全取代，
+# 留在文件里会让人改错地方。加了新样式后也不要把它带回来。
+# 匹配带 `{` 的选择器而不是裸类名 —— 上面那段说明注释里就写着这些名字，
+# 用裸子串会命中注释，得到「明明删干净了却报失败」的假警报。
+for dead in ('.tdot{', ' .tt{', '.term-in{', '.tk-dir{', '.tk-cmd{', '.tk-prompt{'):
+    chk('已清掉失效样式 %s' % dead.rstrip('{').strip(), dead not in APP_CSS)
+# 同一个选择器只允许出现一次。之前 .term-wrap / .term-body 各有两条声明
+# （后一条只是补一个属性），改样式时极易只改到其中一条。
+for sel in ('.term-wrap{', '.term-body{', '.term-bar{'):
+    chk('%s 只定义一次' % sel.rstrip('{'), APP_CSS.count(sel) == 1)
+
 print('\n结果: %s' % ('全部通过' if fails == 0 else '%d 项失败' % fails))
 sys.exit(1 if fails else 0)

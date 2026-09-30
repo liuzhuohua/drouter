@@ -64,11 +64,71 @@ MAX_READ = 262144
 READ_HOLD_MAX = 5.0
 READ_HOLD_STEP = 0.02
 
-_lock = threading.Lock()
+# 必须是 RLock 而不是 Lock：connect 需要「检查是否满员 → 满了就回收 → 再检查」
+# 这个序列，天然会在持锁时调用到内部也要拿锁的 _reap_idle()。
+# 用普通 Lock 会把自己锁死（同线程二次 acquire 永久阻塞）—— 表现为
+# 「连到第 9 个会话时永久卡住」，而不是干净地报「已达上限」。
+_lock = threading.RLock()
 _SESSIONS = {}
 # 会话编号的自增序列。不能只用时间戳：同一秒内连两次会生成相同 sid，
 # 后一个会话把前一个顶掉，表现为「刚开的终端突然不动了」。
 _seq = itertools.count(1)
+
+
+def ensure_ptmx():
+    """确保 /dev/ptmx 可用；缺了就补回符号链接。
+
+    为什么需要这个：
+      pty.openpty() 走的是 /dev/ptmx。标准 Debian 上 /dev/ptmx 是指向
+      /dev/pts/ptmx 的符号链接，由 devtmpfs + udev 在开机时建立。
+      但在容器/虚拟化环境（LXC、某些 PVE 配置）里，/dev 可能被重新挂载，
+      这个符号链接会**丢失**。此时 /dev/pts/ptmx 仍然是好的，只是没有
+      那个入口 —— 表现就是 openpty() 抛 "out of pty devices"，
+      而 sysctl kernel.pty.nr 显示 0（明明一个都没用），特别迷惑。
+
+      修法就是补一条符号链接。这里做成幂等 + 自愈，避免用户要 SSH 进去
+      手工处理（路由器出问题时恰恰进不去）。
+
+    返回 (ok, detail)。
+    """
+    ptmx = '/dev/ptmx'
+    if os.path.exists(ptmx):
+        return True, 'ok'
+    try:
+        # /dev/pts/ptmx 存在就优先链它（devpts 实例里的那一份）
+        if os.path.exists('/dev/pts/ptmx'):
+            os.symlink('pts/ptmx', ptmx)
+            return True, 'symlink created'
+        # 退路：直接 mknod 一个 5,2（老式 devfs 行为，现代内核仍认）
+        os.mknod(ptmx, 0o666 | 0o020000, os.makedev(5, 2))
+        return True, 'device node created'
+    except OSError as e:
+        return False, str(e)
+
+
+def _pty_diagnose():
+    """PTY 建立失败时，给出一句人能看懂的原因，而不是原始 errno 天书。"""
+    diag = []
+    if not os.path.exists('/dev/ptmx'):
+        diag.append('/dev/ptmx 缺失')
+    try:
+        mount = open('/proc/mounts', encoding='utf-8').read()
+        if ' /dev/pts ' not in mount:
+            diag.append('/dev/pts 未挂载 devpts')
+    except Exception:
+        pass
+    try:
+        nr = open('/proc/sys/kernel/pty/nr').read().strip()
+        mx = open('/proc/sys/kernel/pty/max').read().strip()
+        if nr == mx:
+            diag.append('PTY 配额已满（%s/%s）' % (nr, mx))
+    except Exception:
+        pass
+    live = len(_SESSIONS)
+    if live >= MAX_SESSIONS:
+        diag.append('本服务会话已达上限（%d）' % live)
+    return '；'.join(diag) if diag else '未知原因'
+
 
 
 def log(level, code, msg_cn, detail=None):
@@ -85,6 +145,29 @@ def log(level, code, msg_cn, detail=None):
         pass
 
 
+def _open_pty():
+    """申请一对 PTY。首次失败时先尝试自愈 /dev/ptmx，再重试一次。
+
+    pty.openpty() 抛的 OSError 文案就是一句 "out of pty devices"，
+    对用户毫无指导意义 —— 明明一个 PTY 都没用，却说"用完了"。
+    根因八成是 /dev/ptmx 这个入口没了。先补入口再试，还不行就把
+    真实原因（见 _pty_diagnose）包进异常里往上抛。
+    """
+    try:
+        return pty.openpty()
+    except OSError as first:
+        ok, detail = ensure_ptmx()
+        if ok:
+            try:
+                m, s = pty.openpty()
+                log('warn', 'PTY_HEAL', '/dev/ptmx 缺失，已自动补回后恢复',
+                    {'detail': detail})
+                return m, s
+            except OSError:
+                pass
+        raise OSError('%s（诊断：%s）' % (first, _pty_diagnose()))
+
+
 class Session(object):
     """一个 PTY 会话：master fd + 子进程 + 输出缓冲 + 读线程。"""
 
@@ -97,7 +180,7 @@ class Session(object):
         self.buf = bytearray()
         self.buf_lock = threading.Lock()
 
-        self.master, slave = pty.openpty()
+        self.master, slave = _open_pty()
         _set_winsize(self.master, rows, cols)
 
         env = dict(os.environ)
@@ -235,19 +318,28 @@ def _set_winsize(fd, rows, cols):
 
 
 def _reap_idle():
-    """回收超时会话；顺带清掉已退出的僵尸子进程。"""
+    """回收超时会话；顺带清掉已退出的僵尸子进程。返回回收的会话数。
+
+    锁内只做「登记摘除」，真正的 close() 放到锁外做 ——
+    close() 要等子进程退出（SIGHUP 后最多轮询 3 秒），持锁做会把
+    所有并发请求堵死：表现为「9 个会话时新连接超时、老终端也卡住」。
+    """
     now = time.time()
+    victims = []
     with _lock:
         for sid, s in list(_SESSIONS.items()):
             if now - s.last > IDLE_TIMEOUT:
                 log('info', 'SHELL_IDLE', '终端会话闲置超时，已自动回收：%s' % sid)
-                s.close()
                 del _SESSIONS[sid]
+                victims.append(s)
             elif s.proc.poll() is not None and not s.alive:
                 # 用户敲了 exit：保留一小段时间让前端把最后的输出读完
                 if now - s.last > 60:
-                    s.close()
                     del _SESSIONS[sid]
+                    victims.append(s)
+    for s in victims:
+        s.close()
+    return len(victims)
 
 
 def _pick_shell(user):
@@ -263,9 +355,14 @@ def handle(req):
     sid = req.get('sid') or ''
 
     if op == 'connect':
+        # 满员时先回收一轮闲置会话再决定是否拒绝。
+        # 注意这里不能把 _reap_idle() 放在 with _lock 里面：它要等子进程
+        # 退出（最长 3 秒），持锁调用会把所有并发 read/write 一起堵死。
         with _lock:
-            if len(_SESSIONS) >= MAX_SESSIONS:
-                _reap_idle()
+            full = len(_SESSIONS) >= MAX_SESSIONS
+        if full:
+            _reap_idle()
+        with _lock:
             if len(_SESSIONS) >= MAX_SESSIONS:
                 return {'ok': False, 'code': 'BUSY',
                         'msg_cn': '终端会话已达上限（%d），请先断开不用的会话' % MAX_SESSIONS}
@@ -279,6 +376,9 @@ def handle(req):
         try:
             s = Session(sid, user, shell, cols, rows, req.get('cwd') or '/root')
         except Exception as e:
+            # 把日志也写一份 —— 用户看到界面报错时的同一个信息必须留在
+            # 服务端日志里，否则事后排查只能靠猜。
+            log('error', 'PTY_FAIL', '创建终端失败：%s' % e, {'user': user})
             return {'ok': False, 'code': 'PTY_FAIL',
                     'msg_cn': '创建终端失败：%s' % e}
         with _lock:
@@ -406,6 +506,18 @@ def main():
     except Exception:
         pass
     os.umask(0o177)          # 保证 socket 创建出来就是 0600
+
+    # 启动即自愈 /dev/ptmx。这个守护的唯一职责就是开 PTY，如果入口都没有，
+    # 后面每次连接都会失败 —— 与其让用户点一次踩一次坑，不如开机就修好。
+    ok, detail = ensure_ptmx()
+    if not ok:
+        log('error', 'PTY_UNAVAILABLE',
+            'PTY 入口不可用，Web 终端将无法使用',
+            {'detail': detail, 'diag': _pty_diagnose()})
+    else:
+        if detail != 'ok':
+            log('warn', 'PTY_HEAL', '/dev/ptmx 缺失，启动时已自动补回', {'detail': detail})
+
     srv = Server(SOCK_PATH, Handler)
     os.chmod(SOCK_PATH, 0o600)
     log('info', 'SHELLD_UP', 'Web 终端守护已启动：%s' % SOCK_PATH)
