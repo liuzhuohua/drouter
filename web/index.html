@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>Drouter · Debian 13 主路由管理</title>
+<link rel="icon" href="/logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+<!-- 主题之家（#12）：由后端根据「当前生效主题」动态生成，覆盖 app.css 里的 CSS 变量。
+     文件不存在时后端返回空样式，页面自动回落到内置默认配色。 -->
+<link rel="stylesheet" href="/theme.css" id="theme-css">
+</head>
+<body>
+
+<!-- ===================== Logo 定义（可被各处 <use> 引用） ===================== -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <!-- Drouter 标识：外圈 = 数据包环路；内部 = 路由跳转路径（三个节点 + 方向箭头）
+         底部横线 = 网口/接地；整体像一枚沿环流转的路由符号 -->
+    <symbol id="drouter-logo" viewBox="0 0 48 48">
+      <circle cx="24" cy="24" r="21" fill="none" stroke="currentColor" stroke-width="2.4"
+              stroke-linecap="round" stroke-dasharray="96 36"
+              transform="rotate(-42 24 24)" opacity=".55"/>
+      <path d="M11 31.5 20.5 22 27 27.5 37 15.5" fill="none" stroke="currentColor"
+            stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="11" cy="31.5" r="3.1" fill="currentColor"/>
+      <circle cx="20.5" cy="22" r="2.4" fill="currentColor"/>
+      <circle cx="27" cy="27.5" r="2.4" fill="currentColor"/>
+      <path d="M33.2 12.6h4.6v4.6" fill="none" stroke="currentColor"
+            stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M12 38.5h24" fill="none" stroke="currentColor" stroke-width="2.4"
+            stroke-linecap="round" opacity=".45"/>
+    </symbol>
+  </defs>
+</svg>
+
+<div id="login" class="login-wrap">
+  <div class="login-glow" aria-hidden="true"></div>
+  <div class="login-box">
+    <div class="login-logo"><svg class="lg-mark" width="56" height="56"><use href="#drouter-logo"/></svg></div>
+    <h1>Drouter</h1>
+    <p class="sub">Debian 13 主路由 · 本地管理台</p>
+    <label>管理员用户名<input id="lg-user" autocomplete="username" value="admin"></label>
+    <label>密码<input id="lg-pass" type="password" autocomplete="current-password"></label>
+    <button id="lg-btn" class="primary">登 录</button>
+    <div id="lg-msg" class="msg"></div>
+    <p class="hint">首次使用默认账号 admin / admin123，登录后请立即修改密码。</p>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <svg class="brand-mark" width="30" height="30" aria-hidden="true"><use href="#drouter-logo"/></svg>
+      <div class="brand-txt">
+        <b>Drouter</b>
+        <span id="host-tag"></span>
+      </div>
+    </div>
+    <div class="nav-search">
+      <input id="nav-filter" placeholder="搜索菜单…" autocomplete="off">
+    </div>
+    <nav id="nav"></nav>
+    <div class="side-foot">
+      <div id="vnc-dot" class="dot-line"></div>
+      <!-- 左下角退出：显示当前登录账号，点一下即登出 -->
+      <button id="btn-logout" class="side-logout" title="退出系统" aria-label="退出系统">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+          <path d="M16 17l5-5-5-5"/><path d="M21 12H9"/>
+        </svg>
+        <span class="sl-txt">退出系统</span>
+      </button>
+    </div>
+  </aside>
+  <!-- 手机端抽屉遮罩（#14）：点它可关闭菜单；桌面端由 CSS 隐藏 -->
+  <div class="m-mask" id="m-mask" aria-hidden="true"></div>
+
+  <main>
+    <header class="topbar">
+      <div class="tb-left">
+        <button id="btn-side" class="icon-btn" title="折叠/展开菜单" aria-label="折叠或展开菜单">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+        </button>
+        <h2 id="page-title">概览</h2>
+      </div>
+      <div class="tb-right">
+        <!-- 右上角刷新：重新加载当前页面数据（旋转动画表示正在刷新） -->
+        <button id="btn-refresh" class="icon-btn" title="刷新当前页面" aria-label="刷新当前页面">
+          <svg id="btn-refresh-ico" width="17" height="17" viewBox="0 0 24 24" fill="none"
+               stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>
+          </svg>
+        </button>
+        <div id="clock-box" class="clockbox" title="点击切换 12/24 小时制">
+          <span id="clock-time" class="ck-time">--:--:--</span>
+          <span id="clock-date" class="ck-date">加载中…</span>
+          <span id="clock-lunar" class="ck-lunar"></span>
+        </div>
+      </div>
+    </header>
+    <div id="newiface-tip" class="banner hidden"></div>
+    <section id="view" class="view"></section>
+    <div id="actionbar" class="actionbar hidden">
+      <div id="ab-msg" class="ab-msg"></div>
+      <div class="ab-btns">
+        <button id="ab-save" class="ghost">仅保存</button>
+        <button id="ab-apply" class="primary">保存并应用</button>
+      </div>
+    </div>
+    <footer class="site-footer">
+      <span>Drouter · Debian 13 主路由管理系统</span>
+      <span class="sep">·</span>
+      <span>火麒麟 (ajeef)</span>
+      <span class="sep">·</span>
+      <a href="https://github.com/liuzhuohua" target="_blank" rel="noopener noreferrer">https://github.com/liuzhuohua</a>
+      <span class="sep">·</span>
+      <span>遵循 GNU GPL v3 开源协议</span>
+    </footer>
+  </main>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<div id="modal" class="modal hidden"><div class="modal-box" id="modal-box"></div></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

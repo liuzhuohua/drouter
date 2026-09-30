@@ -1,0 +1,12 @@
+[Unit]
+Description=drouter 自动配置快照
+After=network.target
+
+[Service]
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 /opt/drouter/backend/drouter-snapshotd.py
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,28 @@
+#!/bin/bash
+# drouter —— 卸载/升级前停止服务
+set -e
+case "$1" in
+  remove|upgrade|deconfigure)
+    # 必须覆盖**随包发布的每一个单元**。漏掉一个的后果：升级/卸载后
+    # 那个守护还在跑，而它指向的代码已经被换成新版本/删掉了 ——
+    # 典型症状是「卸载完 drouter-web 还在响应」或「旧守护 crash loop」。
+    # 末尾的 drouter-logd.timer / drouter-qos.service 是 helper 在运行时
+    # 动态生成的，这里一并停掉，不存在也不会报错。
+    for u in drouter-rescue drouter-web drouter-helpd drouter-shelld \
+             drouter-snapshot.timer drouter-snapshot.service \
+             drouter-logd.timer drouter-logd.service drouter-qos.service \
+             drouter-cleanup.timer; do
+      systemctl stop "$u"    >/dev/null 2>&1 || true
+      systemctl disable "$u" >/dev/null 2>&1 || true
+    done
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    ;;
+  failed-upgrade)
+    ;;
+  *)
+    echo "prerm called with unknown argument \`$1'" >&2
+    exit 1
+    ;;
+esac
+#DEBHELPER#
+exit 0

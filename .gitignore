@@ -1,0 +1,56 @@
+# ── Python ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ── 构建产物 ────────────────────────────────────────────
+# dist/ 里是 .deb / tar.gz / docker tar，体积以百 MB 计。
+# 这些走 GitHub Releases 发布，不进版本库 —— 否则 clone 一次要下 250MB+，
+# 而且每次重新构建都会产生巨大的二进制 diff。
+# 需要留档的只有源码和构建脚本。
+dist/*
+!dist/.gitkeep
+
+# 离线依赖暂存区（make-offline-deps.sh 的输出）
+offline-deps/
+*.deb
+# 但打包用的元数据要留
+!packaging/deb/**
+
+# ── 构建中间态 ──────────────────────────────────────────
+# .solveroot 是依赖求解用的空 apt 根（见 make-offline-deps.sh 注释），
+# .closure / .allpkgs 是包名中间列表，都不该进库。
+.solveroot/
+.closure
+.allpkgs
+.sim.txt
+.sim.err
+.aptlists/
+.offline-stage/
+.snapshots/
+*.tmp
+
+# ── 测试与验收的运行时残留 ──────────────────────────────
+_dev/.tmp/
+_dev/live-*.log
+*.log
+!docs/**/*.log
+
+# ── 编辑器 / 系统 ───────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── 凭据（绝不能进库）──────────────────────────────────
+*.pem
+*.key
+!docs/**/*.key
+id_rsa*
+.credentials
+.env
+.env.*

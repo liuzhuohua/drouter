@@ -1,0 +1,46 @@
+# 行尾策略固化在仓库里，不依赖每个人的本地 core.autocrlf 设置。
+#
+# 背景：这个项目是「Windows 上开发 → Linux 上部署」。如果 shell 脚本被
+# 自动转成 CRLF，Linux 上会报 `$'\r': command not found`，而且 deploy.sh
+# 会**静默**跑成一堆错误（它不检查每条命令的退出码）。
+# 所以：所有要进 Linux 的文本一律 LF。
+
+# 默认：文本文件入库时统一为 LF
+* text=auto eol=lf
+
+# 明确声明为 LF（这些文件一旦变 CRLF 就会真的坏掉）
+*.sh        text eol=lf
+*.py        text eol=lf
+*.js        text eol=lf
+*.css       text eol=lf
+*.html      text eol=lf
+*.svg       text eol=lf
+*.md        text eol=lf
+*.service   text eol=lf
+*.timer     text eol=lf
+*.conf      text eol=lf
+*.list      text eol=lf
+*.rules     text eol=lf
+LICENSE     text eol=lf
+.gitignore  text eol=lf
+.gitattributes text eol=lf
+
+# Windows 用的批处理保留 CRLF
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+# 二进制：不作任何转换
+*.deb       binary
+*.tar       binary
+*.gz        binary
+*.xz        binary
+*.zst       binary
+*.png       binary
+*.jpg       binary
+*.ico       binary
+*.woff      binary
+*.woff2     binary
+
+# 让 `git diff` 能认出 .deb 是二进制，不要尝试渲染
+*.deb       -diff -merge -text

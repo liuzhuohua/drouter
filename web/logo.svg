@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
+  <title>Drouter</title>
+  <!-- 外圈：数据包环路（缺口 + 方向感），象征流量在接口间循环转发 -->
+  <circle cx="24" cy="24" r="21" fill="none" stroke="#1f6feb" stroke-width="2.4"
+          stroke-linecap="round" stroke-dasharray="96 36"
+          transform="rotate(-42 24 24)" opacity=".55"/>
+  <!-- 内部：三个路由节点 + 跳转路径 + 出口箭头 -->
+  <path d="M11 31.5 20.5 22 27 27.5 37 15.5" fill="none" stroke="#1f6feb"
+        stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="11" cy="31.5" r="3.1" fill="#1f6feb"/>
+  <circle cx="20.5" cy="22" r="2.4" fill="#1f6feb"/>
+  <circle cx="27" cy="27.5" r="2.4" fill="#1f6feb"/>
+  <path d="M33.2 12.6h4.6v4.6" fill="none" stroke="#1f6feb"
+        stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- 底部：网口/接地横线 -->
+  <path d="M12 38.5h24" fill="none" stroke="#1f6feb" stroke-width="2.4"
+        stroke-linecap="round" opacity=".45"/>
+</svg>

@@ -1,0 +1,28 @@
+[Unit]
+Description=drouter 特权动作常驻执行守护
+Documentation=file:/opt/drouter/docs/
+After=network.target
+
+[Service]
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Type=simple
+User=root
+Group=root
+# 刻意不用 RuntimeDirectory：见 drouter-shelld.service 里的说明。
+# /run/drouter 由守护自己 mkdir 并 chmod 0755（drouter-web 要能进目录连
+# helper.sock，而 socket 自身是 0660 root:drouter，权限并没有放宽）。
+ExecStart=/usr/bin/python3 /opt/drouter/backend/drouter-helpd.py
+Restart=on-failure
+RestartSec=2
+# 常驻 import 了整套 helper，比其它守护占得多；上限防内存泄漏拖垮路由器
+MemoryMax=300M
+# 故意不设 CPUQuota：它要跑格式化大硬盘这类子进程，限 CPU 会把这些操作拖慢
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=drouter-helpd
+ProtectHome=read-only
+PrivateTmp=false
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

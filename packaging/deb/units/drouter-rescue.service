@@ -1,0 +1,19 @@
+[Unit]
+Description=drouter 紧急救援通道（独立于 WAN/LAN 的应急恢复入口）
+After=network.target
+Wants=network.target
+
+[Service]
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /opt/drouter/backend/drouter-rescue.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=false
+ProtectSystem=false
+
+[Install]
+WantedBy=multi-user.target

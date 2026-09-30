@@ -1,0 +1,11 @@
+[Unit]
+Description=drouter 自动快照定时器
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+Persistent=true
+Unit=drouter-snapshot.service
+
+[Install]
+WantedBy=timers.target

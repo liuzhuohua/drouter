@@ -1,0 +1,30 @@
+[Unit]
+Description=drouter Web 终端 PTY 会话守护
+Documentation=file:/opt/drouter/docs/
+After=network.target
+
+[Service]
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Type=simple
+User=root
+Group=root
+# 刻意不用 RuntimeDirectory=drouter：systemd 会在「最后一个声明它的单元停止」
+# 时把整个目录删掉重建。两个守护共用 /run/drouter，于是 restart helpd 的瞬间
+# systemd 重建目录，把 shelld 的 shell.sock 一起删了 —— shelld 依旧 active，
+# socket 却没了，用户点终端只看到「守护未运行」。改成两个守护各自 mkdir。
+ExecStart=/usr/bin/python3 /opt/drouter/backend/drouter-shelld.py
+Restart=on-failure
+RestartSec=3
+# 只是转字节流，用不了多少内存；上限是防异常输出把内存吃光
+MemoryMax=80M
+CPUQuota=15%
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=drouter-shelld
+# 安全加固：不碰系统目录、不给新特权（它本身就以 root 跑，靠 socket 0600 收口）
+ProtectHome=read-only
+PrivateTmp=false
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

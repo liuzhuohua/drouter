@@ -1,0 +1,92 @@
+#!/bin/bash
+# drouter —— 安装后配置
+#
+# 安全红线：本脚本只启动 drouter-web（管理后台）与 drouter-snapshot.timer（快照）。
+# 绝不启动 dnsmasq / radvd / miniupnpd —— 它们会抢 53/67/546 端口或向局域网发 DHCP，
+# 在已经有路由器的网络里会立刻造成冲突。
+set -e
+export DEBIAN_FRONTEND=noninteractive
+
+case "$1" in
+  configure)
+    # 进入构建保护模式：让后端在此期间拒绝一切可能改网络的动作
+    mkdir -p /etc/drouter
+    printf 'build' > /etc/drouter/BUILD_MODE
+
+    # 阻止 apt/包管理期间服务自动启动
+    printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+    chmod +x /usr/sbin/policy-rc.d
+
+    # deploy.sh 会以 /opt/drouter 为「源码目录」把文件安装到位（幂等，可重复执行）
+    if [ -f /opt/drouter/scripts/deploy.sh ]; then
+      DROUTER_SRC=/opt/drouter bash /opt/drouter/scripts/deploy.sh || {
+        echo "drouter: 部署失败，请查看上面的输出" >&2
+      }
+    fi
+
+    # 安装一键运维命令
+    if [ -f /opt/drouter/scripts/drouter-ctl.sh ]; then
+      install -m 0755 /opt/drouter/scripts/drouter-ctl.sh /usr/local/bin/drouter-ctl
+    fi
+
+    rm -f /usr/sbin/policy-rc.d
+    rm -f /etc/drouter/BUILD_MODE
+
+    systemctl daemon-reload || true
+
+    # 启用/启动服务。为什么不能只靠上面的 deploy.sh：
+    # deploy.sh 是「源码部署」路径的脚本，.deb 里虽然也带了它，但一旦它
+    # 执行失败（或将来被裁掉），单元文件就只躺在 /lib/systemd/system 里没人管，
+    # 用户装完发现「一个服务都没起来」。这里对**随包发布的每个单元**都显式兜底。
+    #
+    # 安全红线不变：只碰 drouter 自己的单元。
+    # dnsmasq / radvd / miniupnpd / dhcpcd 一律不 enable、不 start。
+    # drouter-rescue.service 是紧急救援通道，默认关闭，绝不自动启动。
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-system-running >/dev/null 2>&1; then
+      systemctl enable drouter-web >/dev/null 2>&1 || true
+      systemctl restart drouter-web >/dev/null 2>&1 || true
+
+      # 常驻守护：让面板请求免去每次 spawn python3+sudo 的固定开销
+      systemctl enable drouter-helpd >/dev/null 2>&1 || true
+      systemctl restart drouter-helpd >/dev/null 2>&1 || true
+
+      # Web 终端守护：预启动，用户点「终端」时能立刻进 shell
+      systemctl enable drouter-shelld >/dev/null 2>&1 || true
+      systemctl restart drouter-shelld >/dev/null 2>&1 || true
+
+      # 自动快照：默认开启（每 6 小时）
+      systemctl enable drouter-snapshot.timer >/dev/null 2>&1 || true
+      systemctl start  drouter-snapshot.timer >/dev/null 2>&1 || true
+
+      # 救援通道：刻意**不** enable、**不** start（需用户在界面显式开启）
+    else
+      echo "drouter: 未检测到运行中的 systemd，跳过服务启用。" >&2
+      echo "drouter: 请手动执行 —— systemctl enable --now drouter-web drouter-helpd drouter-shelld" >&2
+    fi
+
+    # 复核红线：这几个服务必须是「未启用」状态
+    for s in dnsmasq radvd miniupnpd; do
+      if systemctl is-enabled "$s" 2>/dev/null | grep -qx enabled; then
+        echo "drouter: 注意 —— $s 处于 enabled 状态，为避免与现有网络冲突请自行确认" >&2
+      fi
+    done
+
+    PORT=8443
+    [ -f /etc/drouter/web-port ] && PORT=$(head -1 /etc/drouter/web-port)
+    echo ""
+    echo "  drouter 安装完成"
+    echo "  管理地址：https://<本机 LAN IP>:${PORT}/"
+    echo "  默认账号：admin / admin123（请登录后立即修改）"
+    echo "  一键运维：drouter-ctl status | repair | uninstall"
+    echo ""
+    ;;
+  abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+  *)
+    echo "postinst called with unknown argument \`$1'" >&2
+    exit 1
+    ;;
+esac
+
+#DEBHELPER#
+exit 0

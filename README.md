@@ -1,0 +1,855 @@
+<div align="center">
+
+<img src="web/logo.svg" width="96" height="96" alt="Drouter">
+
+# Drouter
+
+**Debian 13 软路由管理系统 · Web 管理面板**
+
+*不接管你的网络，直到你亲手点下「应用」。*
+
+[![Platform](https://img.shields.io/badge/平台-Debian%2013%20trixie-A80030?style=flat-square)](https://www.debian.org/)
+[![Arch](https://img.shields.io/badge/架构-amd64%20%7C%20arm64-2f6feb?style=flat-square)](#-安装)
+[![Backend](https://img.shields.io/badge/后端-Python%203%20标准库-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![Frontend](https://img.shields.io/badge/前端-原生%20JS%20·%20无构建-F7DF1E?style=flat-square&logo=javascript&logoColor=black)](#-设计取舍)
+[![License](https://img.shields.io/badge/许可-MIT-green?style=flat-square)](LICENSE)
+
+</div>
+
+---
+
+## 目录
+
+- [这是什么](#-这是什么)
+- [特色](#-特色)
+- [截图](#-截图)
+- [功能](#-功能)
+- [推荐配置](#-推荐配置)
+- [安装](#-安装)
+- [快速上手](#-快速上手)
+- [注意事项](#-注意事项)
+- [项目结构](#-项目结构)
+- [设计与安全取舍](#-设计与安全取舍)
+- [常见问题](#-常见问题)
+- [参与贡献](#-参与贡献)
+
+---
+
+## 📖 这是什么
+
+Drouter 是一套跑在 **Debian 13 (trixie)** 上的软路由管理系统。它提供了 43 个功能页面的 Web 面板，覆盖一台家用 / 小型办公路由器需要的一切：WAN 接入、PPPoE 多拨、DHCP/DNS、IPv6、防火墙、QoS 限速、访问控制、DDNS、文件共享、Docker 管理……
+
+但它的**核心设计目标和别人不一样**：
+
+> **它不重新实现任何协议。**
+
+PPPoE 交给 `ppp`，DHCP 交给 `dnsmasq`，IPv6 RA 交给 `radvd`，NAT 交给 `nftables`，时间同步交给 `chrony`。
+Web 面板只做三件事：**渲染原生配置文件 → 语法预检 → 原子写入并 reload**。
+
+这样做的好处是，你的路由器上跑的永远是发行版维护的、有安全更新的上游服务，
+而不是某个"自己写了一套 DHCP 服务端"的黑盒。面板哪天不想要了，删掉它，
+系统仍是一台配置完好的 Debian 路由器。
+
+### 它和 OpenWrt / RouterOS / iStoreOS 有什么不同
+
+| | Drouter | OpenWrt | RouterOS |
+|---|---|---|---|
+| **底座** | 原版 Debian 13 | 自建发行版 | 自有内核 |
+| **包管理** | `apt`（25,000+ 包直接可用） | `opkg`（软件包有限） | 无 |
+| **配置来源** | 原生服务配置文件（可读可改） | UCI 数据库 | 二进制配置 |
+| **进系统的方式** | SSH / 本地桌面 / Web | SSH / LuCI | WinBox |
+| **Docker** | 原生 `docker.io` | 需自建，限制多 | 容器支持受限 |
+| **适合谁** | 有 Linux 基础、想要可审计可迁移 | 想要开箱即用 | 想要稳定商用 |
+
+---
+
+## ✨ 特色
+
+### 🛡️ 一、默认不接管你的网络
+
+这是整个项目的**第一原则**，也是最花功夫的部分。
+
+装完 Drouter，你的网络**不会有任何变化**：
+
+- `ip_forward` 仍是 `0` —— 不做路由转发
+- 默认网关仍是原来的 —— 不抢网关
+- `dnsmasq` / `radvd` / `kea` **不会**被启动 —— 不抢 53 / 67 / 547 端口
+- `nftables` 规则集为空 —— 不动防火墙
+
+你可以在一台**正在被使用的机器**上装它、慢慢配它、反复预览渲染结果，
+直到某个你准备好的时刻，才让它真正生效。
+
+所有会改变网络状态的动作，都遵循同一条链路：
+
+```
+配置入库  →  渲染预览（看清会写出什么）  →  语法预检  →  自动快照  →  原子写入  →  reload
+             ↑                                                    ↑
+        这一步就可以停下来                                  出问题一键回滚
+```
+
+> **为什么坚持这个设计？**
+> 因为我见过太多"装个软路由结果全家断网、还得摸黑进机房"的事故。
+> 一台路由器大半时间里是家里的**唯一**网络出口 —— 它不该有"试试看"这种操作。
+
+### 🔍 二、能看见每一步在做什么
+
+- **渲染预览**：保存前能看到渲染出的真实配置文件内容，不是"相信系统会处理"
+- **依赖自检**：43 项功能依赖逐个探测，缺什么、装什么、影响哪个功能，一目了然
+- **实时监控**：CPU / 内存 / 磁盘 / 进程 / 网速 / 延迟 / 抖动，2 秒刷新
+- **统一日志**：系统日志、防火墙日志（IPv4+IPv6）、连接跟踪流日志、PPPoE 拨号日志集中可查
+- **保存 ≠ 应用**：改配置和让它生效是**两个按钮**，中间隔着一次确认
+
+### 🪶 三、轻到能在 2 核 3.8G 上跑
+
+| 指标 | 数值 |
+|---|---|
+| 后端常驻内存 | **< 25 MB** |
+| 依赖 | **Python 3 标准库**（`http.server` + `ssl` + `sqlite3`） |
+| 前端构建 | **无**（原生 HTML/CSS/JS，改完刷新即可） |
+| npm / node_modules | **零** |
+| 首次启动到可用 | **< 3 秒** |
+
+没有 Flask、没有 FastAPI、没有 gunicorn、没有 Redis、没有 Node 运行时。
+一台 2 核 3.8G 的小主机能把内存全留给 PPPoE 转发和 Docker。
+
+### 🧩 四、配置可以带走
+
+所有配置都存在 SQLite 里，但**SQLite 不是唯一配置源**：
+
+每次「应用」都会渲染出**真正的原生配置文件**落盘。
+这意味着——把面板删掉，配置还在；把 `/etc` 打包拷到另一台 Debian，直接就能用。
+
+没有"只有它自己看得懂的配置格式"这种锁定。
+
+### 🧯 五、有三个层次的"救命"机制
+
+1. **快照回滚**：每次应用前自动快照，出问题回退到上一个已知良好状态
+2. **紧急救援通道**：`drouter-rescue` 提供独立于主配置的最小网络恢复（默认关闭，可一键启用）
+3. **构建保护模式**：`/etc/drouter/BUILD_MODE` 存在时，后端拒绝一切改网络 / 抢端口的动作
+
+第三点是给"在正在使用的机器上装机"这个场景准备的 —— 装的时候保护，配好了再解除。
+
+---
+
+## 📸 截图
+
+> 目前 `docs/screenshots/` 里放的是**同尺寸的 SVG 占位图**（不是真实界面截图）。
+> 这样做是为了让 README 在仓库刚建好时也能完整渲染、不留死链。
+> 装好之后按下面的步骤产出真图替换即可。
+
+<div align="center">
+
+| 系统概览 | 网卡与桥接 |
+|---|---|
+| ![概览](docs/screenshots/01-dash.svg) | ![网卡](docs/screenshots/02-iface.svg) |
+
+| 防火墙 IPv4 | 智能限速 QoS |
+|---|---|
+| ![防火墙](docs/screenshots/03-fw4.svg) | ![QoS](docs/screenshots/04-qos.svg) |
+
+| 连接与流日志 | Web 终端 |
+|---|---|
+| ![流日志](docs/screenshots/05-flowlog.svg) | ![终端](docs/screenshots/06-webshell.svg) |
+
+</div>
+
+<details>
+<summary><b>怎么补上真实的截图（点开）</b></summary>
+
+装好之后按下面步骤产出截图，替换 `docs/screenshots/` 下的同名文件即可：
+
+1. 浏览器打开 `https://<路由器IP>:8443/`，用 `admin` / `admin123` 登录
+2. 按 `F11` 全屏，让窗口宽度 ≥ 1440px（移动端截图用手机或 DevTools 的设备模拟）
+3. 依次进入上面表格中的页面，用系统截图工具截取整页
+4. 存成 `01-dash.svg`、`02-iface.svg`……
+   —— 或者存成 `.png` 后把 README 里那几行的扩展名一并改掉，两种都行
+
+建议格式：PNG，宽度 1600px 左右，单张 < 500 KB（README 加载才快）。
+
+占位图本身是可再生的，不需要手工维护：
+
+```bash
+python3 devtools/make-placeholder-shots.py     # 重新生成 6 张占位 SVG
+```
+
+</details>
+
+---
+
+## 🎛️ 功能
+
+43 个功能页面，分 8 组。
+
+### 概览
+
+| 页面 | 做什么 |
+|---|---|
+| **新手向导** | 四个步骤把一台裸 Debian 配成能上网的路由器：外网 → 内网 → DNS → IPv6，每步都有独立可读的成败结论 |
+| **系统概览** | 硬件仪表盘（CPU / 内存 / 磁盘 / 负载 / 温度 / 虚拟化 / BIOS）+ 网络状态 + 服务状态 + IPv6 状态，含实时网速与历史累计流量 |
+| **网络状态 / 加速** | 路由表（IPv4/IPv6）、接口地址、nftables flowtable 软加速开关 |
+
+### 接口
+
+| 页面 | 做什么 |
+|---|---|
+| **网卡与桥接** | 以 **MAC 为主键**管理网卡（改名后角色自动跟随），标注备注 / 角色 / 链路 / 速率 / MTU / 驱动；支持多口桥接 |
+| **WAN 口** | DHCP / 静态 / PPPoE / 其它接入方式，含实时状态与拨号日志 |
+| **PPPoE 多拨** | 多会话并发拨号、聚合、负载均衡策略 |
+| **LAN 口** | LAN 网段与地址配置 |
+| **VLAN / IPTV** | 802.1Q VLAN 子接口创建 / 删除，用于光猫 IPTV 单线复用 |
+| **网络唤醒 (WOL)** | 向局域网内机器发魔术包唤醒 |
+
+### 寻址与路由
+
+| 页面 | 做什么 |
+|---|---|
+| **DHCP 服务** | 地址池、静态绑定、Option 下发；含租约表（在线设备）与「转静态 / 回收」操作 |
+| **DNS 服务** | 上游 DNS 模式（运营商 / 自定义 / 合并）、自定义规则、静态解析 |
+| **IPv6 / RA** | radvd 前缀 / RDNSS 配置与状态 |
+| **DHCPv6 / 前缀委派** | DHCPv6 服务端与 PD 获取 |
+| **动态域名 DDNS** | IPv4 + IPv6 双栈，国内（阿里 / 腾讯 / DNSPod…）与国外服务商 |
+| **真·公网 IP 判定** | 判断本机拿到的是不是真公网地址（含 NAT 类型自动检测） |
+
+### 安全
+
+| 页面 | 做什么 |
+|---|---|
+| **防火墙 IPv4** | nftables 规则编辑、实时日志滚动查看（带开关） |
+| **防火墙 IPv6** | 同上，IPv6 独立规则集 |
+| **端口转发 / DMZ** | nftables DNAT，简洁稳定的端口映射 |
+| **UPnP / NAT-PMP** | miniupnpd 开关与状态 |
+| **访问控制 / 时间组** | Firewalla 风格：按设备 / 时间组 / 应用维度管控（复用 QoS + DPI 链路） |
+
+### 服务
+
+| 页面 | 做什么 |
+|---|---|
+| **智能限速 QoS** | CAKE / HTB 队列算法、DSCP 优先级（含「视频优先」规则）、按 IP / 端口流控 |
+| **应用识别 DPI** | nDPI 识别库管理，多前缀代理下载更新 |
+| **NTP 时间同步** | chrony 上游与状态 |
+| **文件共享 SMB/NFS** | 跨平台预设模板、权限管理，支持外置设备挂载与格式化 |
+| **打印服务** | CUPS 打印服务器 / USB 打印机 RAW 直通（互斥二选一），共享给手机与电脑 |
+| **AC/AP 管理中心** | OpenSOHO 无线控制器：集中管理 OpenWRT AP 的 Wi-Fi / VLAN / PoE |
+
+### 工具
+
+| 页面 | 做什么 |
+|---|---|
+| **Web 终端 / 文件** | 浏览器内的 SSH 终端与文件管理器（实时输入输出回显） |
+| **通用 API 接口** | 对外通用 REST API，带 OpenAPI 文档与调用范例 |
+| **网络诊断工具** | ping / traceroute / mtr / iperf3 / DNS 查询 |
+| **IPv6 连通性测试** | 分阶段诊断 IPv6 通不通、卡在哪一步 |
+| **Docker / Compose** | 容器 / 镜像 / 网络 / 卷的日常运维 + Compose 项目管理，附 `docker run` → `docker-compose.yml` 转换 |
+| **Docker 引擎配置** | `daemon.json` 可视化配置：IPv6 一键开启、国内镜像源切换与测速、日志滚动、默认网桥网段 |
+
+### 日志与审计
+
+| 页面 | 做什么 |
+|---|---|
+| **系统日志** | journal / syslog 查看与过滤 |
+| **连接与流日志** | conntrack 连接表与流量日志（统一日志系统） |
+
+### 系统
+
+| 页面 | 做什么 |
+|---|---|
+| **依赖自检与安装** | 43 项依赖逐项探测 + 一键安装（区分必需 / 推荐 / 可选） |
+| **磁盘与日志清理** | 回收日志 / 缓存 / 临时文件，可设阈值自动清理 |
+| **内核转发与加速** | IP 转发 · 出向伪装 · MSS 钳制 · BBR · SNMP，五项内核开关，每项附说明与联动影响 |
+| **证书 / SSL** | 自建 CA · 签发服务器证书 · 导入 · 部署给管理后台，附 SSL/TLS 握手体检 |
+| **电源控制** | 重启 / 关机 / 定时任务 |
+| **用户与密钥** | 系统用户增删改 + SSH 公钥管理（粘贴或上传 `.pub`） |
+| **系统设置** | Web 端口、时区、主机名、审计日志 |
+| **主题之家** | Web 主题设计与离线预览，支持 ZIP 导入导出 |
+| **升级与保护** | 系统升级与构建保护模式开关 |
+
+---
+
+## 💻 推荐配置
+
+### 最低配置
+
+| | 要求 |
+|---|---|
+| CPU | 1 核 x86-64 |
+| 内存 | 1 GB |
+| 硬盘 | 8 GB |
+| 网卡 | 1 个（先做 LAN + 管理口） |
+| 系统 | Debian 13 (trixie) |
+
+### 推荐配置
+
+| | 建议 | 说明 |
+|---|---|---|
+| CPU | **2 核以上** | 单核也能跑，但开着 PPPoE + QoS + Docker 时会明显吃紧 |
+| 内存 | **4 GB** | 2 GB 可用，但 Docker 跑起来后余量紧张 |
+| 硬盘 | **16 GB SSD** | 日志和 Docker 镜像会持续增长，机械盘会让面板变卡 |
+| 网卡 | **2 个千兆以上** | WAN + LAN 分开，物理隔离最省心；单口也能用 |
+| 网卡芯片 | **Intel i210 / i225 / i226** | Linux 驱动成熟，支持多队列与硬件 offload |
+| 供电 | 无风扇低功耗平台 (N100 / J4125) | 7×24 跑，功耗和静音比峰值性能重要 |
+
+### 部署形态
+
+Drouter 是普通 Debian 软件包，跑在哪都行：
+
+- **物理机**：直接装 Debian 13，最推荐 —— 没有虚拟化开销，网卡直通无损耗
+- **PVE 虚拟机**：需要开 `net.ipv4.ip_forward` 之外，还要给 VM 开 **混杂模式**，
+  否则桥接的 VLAN 包会被 PVE 丢掉
+- **旧笔记本 / 迷你主机**：换上 SSD 就是一台安静的路由器
+
+### 网卡数量的选择
+
+| 网卡数 | 拓扑 | 适用 |
+|---|---|---|
+| 1 | 单臂路由（LAN = WAN 同接口，靠 VLAN 或子网区分） | 最小可行，配置略绕 |
+| **2** | **WAN + LAN** | **推荐**，物理隔离，最直观 |
+| 3+ | WAN + LAN + IPTV / DMZ | 有 IPTV 或要隔离 IoT 设备时 |
+
+---
+
+## 📦 安装
+
+### ⭐ 方式一：离线自包含包（推荐，Release 主推）
+
+> **目标机可以完全断网 —— 没有外网、没有内网源、DNS 都不通，照样一次装完。**
+> 这是本项目对「路由器系统」这个使用场景的默认交付形态。
+
+路由器往往出现在**不方便接外网**的地方：机房、弱电箱、隔离网段、
+或者一台你根本不想让它联网的机器。所以 Release 里的
+`drouter-1.0.0-offline-amd64.tar.gz` 不是「只发一个 `.deb`」，
+而是把 **Drouter 本体 + 它跑起来需要的全部 Debian 依赖**一起打成了一个包。
+
+解包出来是这样：
+
+```bash
+# 1) 把 tar.gz 拷到目标机（U 盘 / scp / 内网共享都行）
+# 2) 解包
+tar xzf drouter-1.0.0-offline-amd64.tar.gz
+cd drouter-1.0.0-offline-amd64
+
+# 3) 一条命令装完（会自动 sudo）
+sudo bash install.sh
+```
+
+装完访问 `https://<目标机IP>:8443/`。**全程不碰网络。**
+
+它到底自包含到什么程度：
+
+| | |
+|---|---|
+| **依赖包数量** | **236 个 `.deb`**（Drouter 直接依赖 + 全部传递依赖） |
+| **覆盖范围** | 从 `nftables` / `dnsmasq` / `radvd` / `ppp` / `chrony` 一路递归到最底层 `libc6` / `zlib1g` / `dash` / `diffutils` / `libc-bin` |
+| **本地仓库** | 附 `debs/Packages` + `Packages.gz`，apt 直接当本地 `file:` 源用 |
+| **完整性校验** | `SHA256SUMS`，237 条（236 依赖 + 本体） |
+| **包体积** | 约 **83 MB**（tar.gz 压缩后） |
+| **系统服务** | 本体 `.deb` 内含 6 个 systemd 单元，`postinst` 自动 enable |
+
+<details>
+<summary><b>包里到底装了什么（点开看）</b></summary>
+
+```
+drouter-1.0.0-offline-amd64/
+├── install.sh                 安装脚本（自动提权 + 本地 file: 源，零外网）
+├── README-离线安装.md          给不熟悉 Linux 的人看的逐步说明
+├── SHA256SUMS                 237 条校验和（236 依赖 + 本体）
+├── drouter_1.0.0_all.deb      Drouter 本体（含 6 个 systemd 单元）
+└── debs/                      236 个依赖 .deb
+    ├── nftables_*.deb         ├─ 直接依赖
+    ├── dnsmasq_*.deb
+    ├── radvd_*.deb
+    ├── ppp_*.deb
+    ├── chrony_*.deb
+    ├── ...
+    ├── libc6_*.deb            └─ 最底层传递依赖
+    ├── zlib1g_*.deb
+    ├── dash_*.deb                 （Essential 包，最容易被漏掉）
+    ├── diffutils_*.deb
+    ├── libc-bin_*.deb
+    ├── Packages                  本地仓库索引
+    └── Packages.gz               （同上，gzip 版）
+```
+
+`install.sh` 做的事情很简单，但每一步都有原因：
+
+1. **把 `debs/` 注册成一个临时 `file:` 源**，然后 `apt-get install` 里
+   所有包名。这样 apt 会**自己算依赖顺序**。
+   —— 比 `dpkg -i debs/*.deb` 一通乱装可靠得多：`dpkg` 不看顺序，
+   装到一半就会因为「依赖还没满足」而大面积失败。
+2. **只挂本地源**（`sourceparts` 指向 `/dev/null`），避免系统里原有的
+   外网源被读进来、apt 跑去联网找「更新的版本」而卡死。
+3. 装完报告服务状态和访问地址。
+
+**为什么不能只发一个 `.deb` 让用户自己解决依赖：**
+`.deb` 的 `Depends` 只**声明**依赖，真正把依赖装上的是 `apt`。
+目标机没外网时 apt 无源可用，用户就得自己凑齐 236 个包 ——
+还得算对传递依赖、别漏掉 `Essential: yes` 的包（它们**不会**出现在
+`apt-cache depends --recurse` 的输出里）、版本还得跟 `trixie` 对得上。
+这些坑我们已经在打包脚本里踩完了，所以直接帮你打好。
+
+</details>
+
+**想要更小的包？** 如果你的目标机有网（哪怕是内网自建 apt 镜像），
+可以只拿 `drouter_1.0.0_all.deb`（约 421 KB），见下方「方式二」。
+
+**已经装过依赖、只想升级本体？** 同样只用那个 421 KB 的 `.deb`
+`dpkg -i` 覆盖安装即可，不必重新走离线包。
+
+### 方式二：在线安装（目标机有网）
+
+如果目标机能连上 Debian 官方源（或内网 apt 镜像），只需要本体那一个文件：
+
+```bash
+sudo apt install ./drouter_1.0.0_all.deb
+sudo drouter-ctl status
+```
+
+> `apt install ./xxx.deb` 会自动把 `Depends` 交给 apt 去网上补齐 ——
+> 这正是它能「只发一个 421 KB 文件」的前提。
+> 目标机没网时请走**方式一**，否则 apt 会卡在拉依赖上。
+
+### 方式三：Docker（体验用）
+
+项目提供 `drouter-1.0.0-docker.tar`（约 169 MB，已含完整根文件系统）：
+
+```bash
+docker load -i drouter-1.0.0-docker.tar
+
+docker run -d --name drouter \
+  --cap-add NET_ADMIN --cap-add NET_RAW \
+  --network host \
+  -v /etc/drouter:/etc/drouter \
+  localhost/drouter:1.0.0
+```
+
+访问 `https://<宿主IP>:8443/`，账号 `admin` / `admin123`。
+
+关于这几个参数，实测结论如下：
+
+| 参数 | 必要性 | 说明 |
+|---|---|---|
+| `--network host` | **必需** | 容器要直接读写宿主的网络接口和 nftables 规则，不能用 bridge |
+| `--cap-add NET_ADMIN` | **必需** | 否则 `nft` 操作报 `Operation not permitted`，防火墙页会失效 |
+| `--cap-add NET_RAW` | 建议 | 部分探测类功能（ping / traceroute）需要 |
+| `-v /etc/drouter:...` | 建议 | 挂出来配置才不会随容器销毁而丢失 |
+
+> **用 `localhost/drouter:1.0.0` 这个全限定名**，别用裸的 `drouter:1.0.0` ——
+> 后者会被 Docker/Podman 当成 `docker.io/library/drouter` 去远端拉取，然后报
+> `pull access denied`。这是本地 `docker load` 出来的镜像，它不存在于任何仓库。
+
+> Docker 形态只建议用来**体验界面和 API**。容器里没有 systemd，
+> 所以「服务管理」页会显示 `active: unknown`（这是预期的优雅降级，不是故障）；
+> 真正当路由器用请走 deb 安装。
+
+### 从源码构建
+
+```bash
+git clone https://github.com/liuzhuohua/drouter.git
+cd drouter
+
+# 本体 deb（→ dist/drouter_1.0.0_all.deb，约 421 KB）
+bash packaging/build-deb.sh 1.0.0
+
+# 离线依赖库（→ dist/offline-deps/，236 个 .deb + Packages 索引）
+bash scripts/make-offline-deps.sh
+
+# 自包含离线包（→ dist/drouter-1.0.0-offline-amd64.tar.gz，约 83 MB）
+bash packaging/build-offline-bundle.sh 1.0.0
+
+# Docker 镜像（→ dist/drouter-1.0.0-docker.tar，约 169 MB）
+bash packaging/build-docker.sh 1.0.0
+```
+
+构建顺序上，`build-offline-bundle.sh` 会**自己**先调 `build-deb.sh`
+和 `make-offline-deps.sh`，所以想一步到位只跑它就行。
+
+> **构建环境要求**：Debian 13 (trixie) / amd64。
+> 依赖闭包是在**空 dpkg status** 的临时 apt 根里求解的（而不是用当前机器的
+> 已装状态），否则「开发机上恰好装过」的包会被 apt 判为"已满足"而漏收 ——
+> 到了干净目标机上就变成 `Depends: xxx but it is not installable`。
+> 这个坑在 `make-offline-deps.sh` 里有详细注释。
+
+---
+
+## 🚀 快速上手
+
+装好之后的**第一小时**，建议按这个顺序来：
+
+### 第 1 步：打开面板
+
+浏览器访问 `https://<路由器IP>:8443/`
+
+> ⚠️ 用的是**自签证书**，浏览器会报「不安全」。这是正常的 —— 点「高级」→「继续访问」。
+> 想要不报警，去**证书 / SSL** 页面签发一张自己的证书并部署。
+
+默认账号：`admin` / `admin123`
+**第一件事就是改掉它**（系统设置 → 改密码）。
+
+### 第 2 步：走一遍新手向导
+
+左侧菜单第一项就是**新手向导**。它会带你确认四件事：
+
+1. **外网**通不通（有默认路由 + 能 ping 通国内地址）
+2. **内网**在不在发地址（DHCP 开着吗？地址池有没有把自己圈进去？）
+3. **DNS** 能不能解析
+4. **IPv6** 需不需要开
+
+每一步都会给出**独立的成败结论**，而不是一个笼统的总分 ——
+因为新手真正需要知道的是"哪一步还没做"，不是"你得了 60 分"。
+
+### 第 3 步：认一下你的网卡
+
+进**网卡与桥接**，给每张网卡标注：
+
+- **备注**：这是哪个口（电信光猫 / 客厅交换机 / 书房墙插）
+- **角色**：WAN / LAN / 未分配
+
+> 角色是按 **MAC 地址**记的。以后网卡改名（`ens18` → `enp1s0`）角色不会丢。
+
+### 第 4 步：配 WAN
+
+进 **WAN 口**，选你的接入方式：
+
+- **PPPoE**：填宽带账号密码（运营商光猫桥接时用这个）
+- **DHCP**：光猫已经拨号，路由器拿地址即可
+- **静态**：有固定 IP 的专线
+
+点**保存** → 点**应用** → 看**拨号日志**确认连上。
+
+### 第 5 步：（可选）让它真正接管路由
+
+到这一步为止，Drouter 都还只是个"旁观者"。要让它接管，需要：
+
+1. 确认 **WAN 口** 通了、**LAN 口** 配好了
+2. 进**内核转发与加速**，开启 **IP 转发** 和 **出向伪装**
+3. 关掉原路由器的 DHCP，或把 Drouter 的 LAN 口接到交换机上
+4. 把客户端的网关指向 Drouter
+
+> ⚠️ 第 3、4 步会**切断现有网络**。建议留一个能进物理控制台的方式（显示器 + 键盘，
+> 或者确保 RealVNC 会话可用），万一配错了还能救回来。
+
+---
+
+## ⚠️ 注意事项
+
+### 🔴 安装前必读
+
+| 事项 | 说明 |
+|---|---|
+| **不要在唯一出口上直接试** | 第一次装建议装在一台**没在承担路由**的机器上，配好了再切 |
+| **RealVNC 用户注意** | 本项目所有动作都避开了 **5900 端口**，也不会动 X 会话 / LightDM。如果你跑着 VNC，它不会受影响 |
+| **端口冲突** | 装完**不会**自动启动 `dnsmasq` / `radvd` / `kea`。但如果这些服务**本来就在跑**，请先停掉再让 Drouter 接管 |
+| **PVE 虚拟机** | 需要给 VM 网卡开**混杂模式**，否则桥接 / VLAN 的包会被宿主丢掉 |
+| **系统时间** | 面板和证书校验都依赖正确时间。裸装 Debian 若时间不对，先 `sudo timedatectl set-ntp true` |
+| **离线安装前** | 确认目标机是 **amd64**、剩余磁盘 **≥ 1.5 GB**。离线包里的依赖是按 **Debian 13 (trixie)** 下载的，装到别的版本上可能出现版本不匹配 |
+
+### 📴 关于离线安装（目标机无外网）
+
+这一节单独说，因为它是本项目**默认推荐**的交付方式。
+
+**能保证什么**
+
+- 目标机**无外网、无内网源、DNS 不可达**也能完整装好 —— 全部 236 个依赖
+  已随包提供，`install.sh` 走的是本地 `file:` 源，不发起任何网络请求。
+- 安装过程**不需要**目标机上有 `apt` 之外的工具（`install.sh` 只用
+  POSIX shell + `df`/`cut`，连 `awk` 都不依赖 —— 它不一定在最小系统里）。
+- 包内 `SHA256SUMS` 可离线校验完整性：
+  ```bash
+  sha256sum -c SHA256SUMS
+  ```
+
+**必须知道的约束**
+
+| 约束 | 原因 |
+|---|---|
+| **架构必须匹配** | 包名带 `-amd64`，里面是 x86_64 的二进制。arm64 目标机请按文档自行重建 |
+| **发行版必须匹配** | 依赖来自 `trixie` 仓库。跨版本（如 bookworm）会出现 `libc6` 版本冲突 |
+| **磁盘 ≥ 1.5 GB** | 236 个 deb 解包 + 安装要占几百 MB；`install.sh` 会在低于 1.5 GB 时告警 |
+| **装完要手动改密码** | 默认 `admin` / `admin123`，离线环境下尤其要第一时间改 |
+
+**装完不会发生什么**（这点很重要）
+
+`install.sh` **只安装软件**，不会：
+
+- ❌ 启动 `dnsmasq` / `radvd` / `kea` 等会发 DHCP 的服务
+- ❌ 修改默认路由或打开 IP 转发
+- ❌ 改动任何现有网络配置
+
+装完之后这台机器**仍然是一台普通主机**，直到你打开面板、亲手点「应用」。
+这是整个项目的核心设计原则，离线安装同样遵守。
+
+### 🟡 使用中的注意点
+
+- **保存 ≠ 应用**。改了配置只点「保存」，重启后不会生效。要生效必须点「应用」。
+- **默认只写盘不生效**。「应用」时会先渲染预览，确认没问题再下发。
+- **快照会占空间**。自动快照默认保留最近若干份，硬盘小时去**磁盘与日志清理**里调阈值。
+- **构建保护模式**。如果 `/etc/drouter/BUILD_MODE` 存在，所有改网络的动作会被拒绝。
+  这是给"在正在使用的机器上装机"准备的，配好后去**升级与保护**页面解除。
+- **Web 端口改动要重启面板**。改完 `8443` 后记得用新端口访问；改错了可以用
+  `sudo drouter-ctl webport 8443` 从命令行改回来。
+- **API 接口无鉴权时不要暴露**。**通用 API 接口**页面默认只监听本机，
+  如果要对内网开放，请自行在防火墙里加来源限制。
+
+### 🟢 兼容性
+
+| 项目 | 支持情况 |
+|---|---|
+| Debian 13 (trixie) | ✅ 主要目标，全功能验证 |
+| Debian 12 (bookworm) | ⚠️ 可用，但 `docker-compose` 包名不同，nftables 版本较老 |
+| Ubuntu 24.04 | ⚠️ 大体可用，`docker-compose-v2` 是 Ubuntu 的叫法 |
+| Debian 11 及更早 | ❌ 不支持（Python 版本与 nftables 语法不兼容） |
+| 架构 | amd64 已充分验证；arm64 理论可用（`Architecture: all`，依赖需自行确认） |
+
+---
+
+## 🗂️ 项目结构
+
+```
+drouter/
+├── backend/                     Python 3 后端（标准库，无第三方依赖）
+│   ├── drouter-web.py           HTTP/HTTPS 服务、路由层、静态文件与 gzip 缓存
+│   ├── drouter-helper.py        业务逻辑主体：动作分发、43 个功能实现、渲染调用
+│   ├── drouter-helpd.py         常驻执行守护（避免每次请求 fork 一个 helper）
+│   ├── render.py                配置渲染器：settings → 原生配置文件
+│   ├── theme.py                 主题之日：主题解析、离线预览、导入导出
+│   ├── drouter-logd.py          统一日志采集
+│   ├── drouter-snapshotd.py     自动快照
+│   ├── drouter-rescue.py        紧急救援通道
+│   └── drouter-shelld.py        Web 终端的 shell 会话
+├── web/                         前端（原生，无构建）
+│   ├── index.html               入口页
+│   ├── app.js                   单文件 SPA：43 个视图 + 路由 + 状态管理
+│   ├── app.css                  样式
+│   └── logo.svg                 标识
+├── _dev/                        测试与探测
+│   ├── t-*.py                   40 套单元测试（预检链里全跑）
+│   ├── live-*.py                真机验收脚本（需在目标机上执行）
+│   └── *.js                     前端契约测试
+├── devtools/                    开发工具
+│   ├── sync.sh                  一键部署：预检 → 打包 → 上传 → 部署
+│   ├── check-views.js           菜单 ↔ 视图映射检查
+│   ├── check-render.js          35+ 视图离线渲染检查
+│   └── check-mobile.js          手机适配检查
+├── scripts/                     运维脚本
+│   ├── deploy.sh                部署脚本（被 sync.sh 调用）
+│   ├── drouter-ctl.sh           命令行管理工具
+│   ├── make-offline-deps.sh     离线依赖打包
+│   └── install-base.sh          底座安装
+├── packaging/                   打包
+│   ├── build-deb.sh             deb 构建
+│   ├── build-docker.sh          Docker 镜像构建
+│   ├── deb/                     control / postinst / prerm / postrm
+│   └── docker/                  Dockerfile / docker-init.sh
+└── docs/                        文档
+```
+
+### 后端运行时模型
+
+```
+浏览器
+  │  HTTPS (8443)
+  ▼
+drouter-web.py           ThreadingHTTPServer，单进程多线程
+  │  Unix socket IPC
+  ▼
+drouter-helpd.py         常驻守护（socketserver.ThreadingUnixStreamServer）
+  │  run_action() 无全局锁，可并发
+  ▼
+drouter-helper.py        75 个 ACTIONS 动作
+  │
+  ├─ render.py           渲染原生配置
+  └─ 系统调用            nft / systemctl / pppd / dnsmasq ...
+```
+
+关键设计：
+
+- **常驻守护**：Web 层先试 `helpd` 快路径，失败才回退 fork 一个新 helper。
+  否则每个 API 请求都要 fork 一个 1.6 万行的 Python —— 在 2 核机器上不可接受。
+- **无全局锁**：`run_action()` 不加锁，多个请求可以并发执行（读操作占绝大多数）。
+- **零 fork 读接口**：`read_sysinfo` / `read_metrics` 这类"每次切页面都调"的接口，
+  全部直读 `/proc` 与 `os.statvfs()`，不 fork `df` / `hostname` / `uname`。
+- **批量取服务状态**：`read_services` 用一次 `systemctl show` 取回 18 个单元的状态，
+  而不是 18 × 2 = 36 次 `systemctl is-active/is-enabled`。
+
+---
+
+## 🔐 设计与安全取舍
+
+这一节解释几个**看起来奇怪但故意这么做**的决定。
+
+### 为什么默认不启动 DHCP / 不接管路由
+
+因为最容易出事的场景是：在一台**正在提供服务**的机器上装路由系统，
+装完发现 DHCP 服务端起来了，整个局域网开始抢地址。
+
+所以所有"抢端口"的行为都需要用户**显式**触发。这不是偷懒，是设计。
+
+### 为什么把 `smartmontools` 放在 Suggests 而不是 Recommends
+
+因为 apt 默认会装 `Recommends`，而 `smartmontools` 装完会自动拉起 `smartd` 常驻。
+对一台路由器来说这是个意料之外的常驻服务。
+
+同理，`samba` / `nfs-kernel-server` / `docker.io` 也都降级到 `Suggests` ——
+它们装完会启用文件共享服务和 Docker 守护，在 4GB 机器上很重。
+用户需要时在**依赖自检与安装**页面上逐项装。
+
+### 为什么 `.deb` 里的 `DEBIAN/control` 没有注释
+
+因为 `control` 是 **deb822 格式，不保证支持 `#` 注释行**。
+某些 dpkg 工具遇到注释会解析失败。所以所有说明都写在 `build-deb.sh` 里。
+
+### `ifb-drouter` 是什么
+
+它是 **QoS 智能限速**创建的 IFB 虚拟网卡。
+
+Linux 的流量整形（tc）**只能管出向流量**。要限速入向流量，得先把入向包
+重定向到一块 IFB 设备上，再在那上面做整形。
+
+所以看到 `ifb-drouter` 时不用担心 —— 它不是紧急通道，也不用给它指派角色。
+
+### 为什么前端不用框架
+
+单文件 SPA + 原生 JS，11200 行，没有构建步骤。
+
+因为目标是"改完刷新就能看到"，而不是"改完等 30 秒 webpack"。
+对于这个规模的面板，框架带来的收益（组件复用、状态管理）
+抵不过构建链带来的复杂度。
+
+代价是：定时器清理、事件解绑、DOM 判空这些事**得自己记住**。
+项目里用 40 套单测 + 3 个前端检查脚本（菜单映射 / 离线渲染 / 手机适配）守住这些点。
+
+---
+
+## ❓ 常见问题
+
+<details>
+<summary><b>装完打不开 8443 端口？</b></summary>
+
+```bash
+sudo drouter-ctl status          # 看服务状态
+sudo journalctl -u drouter-web -n 50   # 看报错
+sudo ss -tlnp | grep 8443        # 看端口有没有在听
+```
+
+常见原因：
+1. **服务没起来** —— 看 `journalctl` 报什么
+2. **防火墙挡了** —— 检查 `nft list ruleset` 有没有放行 8443
+3. **浏览器拒绝自签证书** —— 换 Firefox 或手动点「继续访问」
+
+</details>
+
+<details>
+<summary><b>改错了配置，网络不通了怎么办？</b></summary>
+
+按严重程度依次尝试：
+
+1. **回滚快照** —— 有本地控制台的话，`sudo drouter-ctl rollback`
+2. **救援通道** —— `sudo systemctl start drouter-rescue`，它会起一个最小可用的网络配置
+3. **物理控制台** —— 接显示器和键盘，直接改 `/etc/network/interfaces` 或 `nmcli`
+
+> 这也是为什么**装之前一定要留一个备用进系统的方式**。
+
+</details>
+
+<details>
+<summary><b>为什么我的 `<某个包>` 装不上？</b></summary>
+
+大概率是**包名在你那个发行版上不一样**。这个项目主要在 Debian 13 上测。
+
+最典型的例子：
+
+| 功能 | Debian 13 | Ubuntu |
+|---|---|---|
+| Compose v2 | `docker-compose` | `docker-compose-v2` |
+
+去**依赖自检与安装**页面看它探测的是哪个包名，然后对照你系统的实际包名。
+
+> 💡 一个已实测的 apt 行为：`apt-get install a b c` 里只要有**一个**包名查不到，
+> 整体就会中止，同命令里的其它包**一个都不装**。所以批量安装失败时，
+> 先单独 `apt-cache policy <包名>` 确认每个包都存在。
+
+</details>
+
+<details>
+<summary><b>能当旁路由用吗？</b></summary>
+
+能。这正是它的设计场景之一 —— 先作为旁路由跑起来（不接管主路由的 DHCP），
+把 QoS、DPI、DDNS、Docker 这些"附加能力"先接上，
+等你觉得稳了，再决定要不要把它提到主路由位置。
+
+</details>
+
+<details>
+<summary><b>怎么升级？</b></summary>
+
+```bash
+# 下载新版 deb
+sudo apt install ./drouter_1.0.1_all.deb    # 直接覆盖安装，配置保留
+```
+
+配置在 `/etc/drouter/` 和 SQLite 里，`apt remove` 也会保留（`purge` 才删）。
+
+</details>
+
+<details>
+<summary><b>怎么完全卸载？</b></summary>
+
+```bash
+sudo apt remove drouter       # 删程序，保留配置
+sudo apt purge  drouter       # 连配置一起删
+```
+
+注意：**已经应用过的原生配置**（`/etc/nftables.conf`、`/etc/dnsmasq.conf` 等）
+不会自动还原 —— 它们是系统配置，不是软件包的一部分。
+要还原请用快照回滚，或手动改。
+
+</details>
+
+---
+
+## 🤝 参与贡献
+
+欢迎 Issue 和 PR。
+
+### 开发环境
+
+```bash
+git clone https://github.com/liuzhuohua/drouter.git
+cd drouter
+
+# 本地跑测试（不需要目标机）
+python3 _dev/t-*.py              # 40 套单元测试
+node devtools/check-views.js     # 菜单映射检查
+node devtools/check-render.js    # 视图渲染检查
+node devtools/check-mobile.js    # 手机适配检查
+```
+
+### 提交前请确认
+
+1. **全部单测通过**（40 套）
+2. **前端三查通过**（check-views / check-render / check-mobile）
+3. **文件是 LF 换行**（用 Windows 编辑容易写成 CRLF，Linux 上会执行失败）
+4. 新增功能请**同时加测试** —— 这个项目的复杂度已经到了"不能靠肉眼保证"的程度
+
+### 部署到测试机
+
+```bash
+bash devtools/sync.sh
+```
+
+这条命令会依次做：跑全部预检 → 打包 → 上传 → 部署。预检不过就不会上传。
+
+### 代码风格
+
+- 后端：Python 3 标准库，不用第三方包
+- 前端：原生 JS，`function viewXxx()` 必须是**函数声明**（因为 `const VIEWS` 在模块顶层求值，靠的是变量提升）
+- 注释：解释**为什么**这么做，而不是**做了什么**。特别是那些"看起来可以简化但其实是踩过坑"的地方
+
+---
+
+<div align="center">
+
+**Drouter** · 让 Debian 成为一台你可以完全掌控的路由器
+
+MIT License · 作者 [火麒麟 (ajeef)](https://github.com/liuzhuohua)
+
+</div>

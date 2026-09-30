@@ -1,0 +1,57 @@
+Package: drouter
+Version: __VERSION__
+Section: net
+Priority: optional
+Architecture: all
+Maintainer: 火麒麟 (ajeef) <https://github.com/liuzhuohua>
+Homepage: https://github.com/liuzhuohua
+Description: Debian 13 主路由管理系统（Web 管理面板）
+ Drouter 是一套面向 Debian 13 的软路由管理系统，提供 Web 管理界面：
+ WAN/LAN 接入、PPPoE 多拨、QoS、DPI 识别、访问控制与家长控制、
+ IPv6、端口转发与 DMZ、DDNS、SMB/NFS 文件共享、Docker 与 Compose 管理、
+ 连接跟踪与统一日志、防火墙日志、自动快照与回滚、紧急救援通道、主题之家。
+ .
+ 设计上严格区分「保存配置」与「应用到系统」，任何下发前都可预览渲染结果；
+ 默认不会自动启动 DHCP/DNS 服务，避免与现有局域网冲突。
+Depends: python3 (>= 3.9),
+ python3-venv | python3-minimal,
+ nftables,
+ dnsmasq,
+ radvd,
+ ppp,
+ pppoe,
+ pppoeconf,
+ miniupnpd,
+ chrony,
+ ethtool,
+ iperf3,
+ mtr-tiny,
+ traceroute,
+ dnsutils,
+ conntrack,
+ bridge-utils,
+ iproute2,
+ sqlite3,
+ logrotate,
+ rsyslog,
+ curl,
+ wget,
+ procps,
+ sudo,
+ openssl,
+ ipset,
+ kmod,
+ systemd,
+ adduser,
+ ca-certificates,
+ dhcpcd-base,
+ util-linux,
+ coreutils,
+ hostname,
+ tar
+Recommends: tcpdump, jq, htop, iotop, nvme-cli, lm-sensors, dmidecode,
+ e2fsprogs, exfatprogs, ntfs-3g, dosfstools, xfsprogs, btrfs-progs, f2fs-tools,
+ usbutils, etherwake, zip, unzip, p7zip-full, iputils-ping, vim-tiny
+Suggests: smartmontools, suricata, xtables-addons-common,
+ samba, samba-common-bin, nfs-kernel-server, docker.io, docker-compose,
+ cups, cups-client, snmpd, snmp

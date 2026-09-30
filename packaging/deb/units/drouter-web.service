@@ -1,0 +1,44 @@
+[Unit]
+Description=drouter 主路由管理后台
+Documentation=file:/opt/drouter/docs/
+After=network-online.target
+Wants=network-online.target
+Before=shutdown.target
+
+[Service]
+Type=simple
+User=drouter
+Group=drouter
+WorkingDirectory=/opt/drouter
+# systemd 默认 PATH 不含 /usr/sbin，而 nft/dnsmasq/radvd 都在那儿。
+# 后端虽已自行归一化 PATH，这里再显式声明一次，避免任何遗漏路径静默失败。
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/python3 /opt/drouter/backend/drouter-web.py
+Restart=on-failure
+RestartSec=5
+# 资源限制：适配 2 核 / 3.9G 小内存环境
+MemoryMax=160M
+MemoryHigh=120M
+CPUQuota=40%
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=5
+# 安全加固
+# 说明：后端以低权用户 drouter 运行，写 /etc 由 root helper 完成（白名单 action）。
+# 注意：这里必须 ProtectSystem=false —— 「依赖自检 / 一键安装」需要通过 apt/dpkg
+# 往 /usr/bin、/var/cache/apt、/var/lib/dpkg 写入；若把 /usr 挂为只读，
+# apt 会报 "只读文件系统" 而安装失败。安全边界由 helper 的 action 白名单保证：
+# 非白名单动作一律拒绝，且所有参数逐个强校验。
+NoNewPrivileges=false
+PrivateTmp=false
+ProtectSystem=false
+ProtectHome=read-only
+ReadWritePaths=/opt/drouter/data /opt/drouter/snapshots /opt/drouter/certs /var/log/drouter
+# 额外保护：这些路径不给写（即使 helper 被滥用也改不到）
+InaccessiblePaths=/boot
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=drouter-web
+
+[Install]
+WantedBy=multi-user.target

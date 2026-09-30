@@ -1,0 +1,39 @@
+#!/bin/bash
+# drouter —— 卸载后清理
+#
+# 只有 purge 才删除配置、快照与日志。普通 remove 一律保留，
+# 避免用户辛苦配好的规则被误删（重装即可直接恢复）。
+set -e
+case "$1" in
+  purge)
+    rm -rf /etc/drouter
+    rm -rf /var/log/drouter
+    rm -rf /var/lib/drouter
+    rm -rf /run/drouter-helper
+    rm -f /etc/systemd/system/drouter-*.service /etc/systemd/system/drouter-*.timer
+    rm -f /etc/sudoers.d/drouter /etc/logrotate.d/drouter
+    rm -f /usr/local/bin/drouter-ctl
+    rm -f /etc/nftables.d/drouter*.nft
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if id drouter >/dev/null 2>&1; then
+      userdel drouter >/dev/null 2>&1 || true
+    fi
+    echo "drouter: 已彻底清除（含配置、快照与日志）"
+    ;;
+  remove)
+    # 普通卸载：保留 /etc/drouter 与 /var/log/drouter
+    rm -f /etc/systemd/system/drouter-*.service /etc/systemd/system/drouter-*.timer
+    rm -f /etc/sudoers.d/drouter
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    echo "drouter: 已卸载；配置保留在 /etc/drouter，日志在 /var/log/drouter"
+    echo "        彻底清除请用：apt purge drouter"
+    ;;
+  upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+    ;;
+  *)
+    echo "postrm called with unknown argument \`$1'" >&2
+    exit 1
+    ;;
+esac
+#DEBHELPER#
+exit 0
