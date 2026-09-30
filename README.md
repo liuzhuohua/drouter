@@ -133,44 +133,163 @@ Web 面板只做三件事：**渲染原生配置文件 → 语法预检 → 原�
 
 ## 📸 截图
 
-> 目前 `docs/screenshots/` 里放的是**同尺寸的 SVG 占位图**（不是真实界面截图）。
-> 这样做是为了让 README 在仓库刚建好时也能完整渲染、不留死链。
-> 装好之后按下面的步骤产出真图替换即可。
+> 以下全部是**真实运行界面**的截图（不是效果图），取自一台 2 核 4G 的 Debian 13 虚拟机。
+> 共 78 张，按功能分组放在折叠块里 —— 点开对应分组即可查看。
 
 <div align="center">
 
-| 系统概览 | 网卡与桥接 |
+| 系统概览 | 防火墙 IPv4 |
 |---|---|
-| ![概览](docs/screenshots/01-dash.svg) | ![网卡](docs/screenshots/02-iface.svg) |
+| ![系统概览](docs/screenshots/02-overview.jpg) | ![防火墙 IPv4](docs/screenshots/05-fw4.jpg) |
 
-| 防火墙 IPv4 | 智能限速 QoS |
+| 网络状态 / 加速 | 智能限速 QoS |
 |---|---|
-| ![防火墙](docs/screenshots/03-fw4.svg) | ![QoS](docs/screenshots/04-qos.svg) |
+| ![网络状态](docs/screenshots/02-netstat.jpg) | ![QoS](docs/screenshots/06-qos.jpg) |
 
-| 连接与流日志 | Web 终端 |
+| 网卡与桥接 | Web 终端 / 文件 |
 |---|---|
-| ![流日志](docs/screenshots/05-flowlog.svg) | ![终端](docs/screenshots/06-webshell.svg) |
+| ![网卡与桥接](docs/screenshots/03-iface.jpg) | ![Web 终端](docs/screenshots/07-webshell.jpg) |
+
+| 连接与流日志 | Docker / Compose |
+|---|---|
+| ![流日志](docs/screenshots/08-flowlog.jpg) | ![Docker](docs/screenshots/07-docker.jpg) |
 
 </div>
 
+### 完整图集（78 张 · 点击分组展开）
+
 <details>
-<summary><b>怎么补上真实的截图（点开）</b></summary>
+<summary><b>① 登入</b> —— 1 张</summary>
+<br>
 
-装好之后按下面步骤产出截图，替换 `docs/screenshots/` 下的同名文件即可：
+| | |
+|---|---|
+| ![登录页](docs/screenshots/01-login.jpg) | |
 
-1. 浏览器打开 `https://<路由器IP>:8443/`，用 `admin` / `admin123` 登录
-2. 按 `F11` 全屏，让窗口宽度 ≥ 1440px（移动端截图用手机或 DevTools 的设备模拟）
-3. 依次进入上面表格中的页面，用系统截图工具截取整页
-4. 存成 `01-dash.svg`、`02-iface.svg`……
-   —— 或者存成 `.png` 后把 README 里那几行的扩展名一并改掉，两种都行
+</details>
 
-建议格式：PNG，宽度 1600px 左右，单张 < 500 KB（README 加载才快）。
+<details>
+<summary><b>② 概览</b> —— 6 张</summary>
+<br>
 
-占位图本身是可再生的，不需要手工维护：
+| | |
+|---|---|
+| ![系统概览](docs/screenshots/02-overview.jpg)<br>系统概览 | ![硬件仪表盘](docs/screenshots/02-overview-2.jpg)<br>硬件仪表盘 |
+| ![网络与服务状态](docs/screenshots/02-overview-3.jpg)<br>网络与服务状态 | ![网络状态 / 加速](docs/screenshots/02-netstat.jpg)<br>网络状态 / 加速 |
+| ![路由表与接口地址](docs/screenshots/02-netstat-2.jpg)<br>路由表与接口地址 | ![flowtable 软加速](docs/screenshots/02-netstat-3.jpg)<br>flowtable 软加速 |
 
-```bash
-python3 devtools/make-placeholder-shots.py     # 重新生成 6 张占位 SVG
-```
+</details>
+
+<details>
+<summary><b>③ 接口</b> —— 9 张</summary>
+<br>
+
+| | |
+|---|---|
+| ![网卡与桥接](docs/screenshots/03-iface.jpg)<br>网卡与桥接 | ![WAN 口](docs/screenshots/03-wan.jpg)<br>WAN 口 · 接入方式 |
+| ![WAN 口实时状态](docs/screenshots/03-wan-2.jpg)<br>WAN 口 · 实时状态 | ![WAN 口拨号日志](docs/screenshots/03-wan-3.jpg)<br>WAN 口 · 拨号日志 |
+| ![PPPoE 多拨](docs/screenshots/03-pppoe.jpg)<br>PPPoE 多拨 | ![PPPoE 会话状态](docs/screenshots/03-pppoe-2.jpg)<br>PPPoE · 会话状态 |
+| ![LAN 口](docs/screenshots/03-lan.jpg)<br>LAN 口 | ![VLAN / IPTV](docs/screenshots/03-vlan.jpg)<br>VLAN / IPTV 单线复用 |
+| ![网络唤醒 WOL](docs/screenshots/03-wol.jpg)<br>网络唤醒 WOL | |
+
+</details>
+
+<details>
+<summary><b>④ 寻址与路由</b> —— 12 张</summary>
+<br>
+
+| | |
+|---|---|
+| ![DHCP 服务](docs/screenshots/04-dhcp.jpg)<br>DHCP 服务 | ![DHCP 租约表](docs/screenshots/04-dhcp-2.jpg)<br>DHCP · 租约表 |
+| ![DNS 服务](docs/screenshots/04-dns.jpg)<br>DNS 服务 | ![IPv6 / RA](docs/screenshots/04-ipv6ra.jpg)<br>IPv6 / RA |
+| ![IPv6 前缀与 RDNSS](docs/screenshots/04-ipv6ra-2.jpg)<br>IPv6 / RA · 前缀与 RDNSS | ![IPv6 运行状态](docs/screenshots/04-ipv6ra-3.jpg)<br>IPv6 / RA · 运行状态 |
+| ![DHCPv6 / 前缀委派](docs/screenshots/04-dhcpv6.jpg)<br>DHCPv6 / 前缀委派 | ![动态域名 DDNS](docs/screenshots/04-ddns.jpg)<br>动态域名 DDNS |
+| ![DDNS IPv6 记录](docs/screenshots/04-ddns-2.jpg)<br>DDNS · IPv6 记录 | ![DDNS 解析结果](docs/screenshots/04-ddns-3.jpg)<br>DDNS · 解析结果 |
+| ![真·公网 IP 判定](docs/screenshots/04-publicip.jpg)<br>真·公网 IP 判定 | ![NAT 类型检测](docs/screenshots/04-publicip-2.jpg)<br>真·公网 IP · NAT 类型 |
+
+</details>
+
+<details>
+<summary><b>⑤ 安全</b> —— 7 张</summary>
+<br>
+
+| | |
+|---|---|
+| ![防火墙 IPv4](docs/screenshots/05-fw4.jpg)<br>防火墙 IPv4 | ![防火墙 IPv4 规则与日志](docs/screenshots/05-fw4-2.jpg)<br>防火墙 IPv4 · 规则与日志 |
+| ![防火墙 IPv6](docs/screenshots/05-fw6.jpg)<br>防火墙 IPv6 | ![防火墙 IPv6 规则与日志](docs/screenshots/05-fw6-2.jpg)<br>防火墙 IPv6 · 规则与日志 |
+| ![端口转发 / DMZ](docs/screenshots/05-dnat.jpg)<br>端口转发 / DMZ | ![UPnP / NAT-PMP](docs/screenshots/05-upnp.jpg)<br>UPnP / NAT-PMP |
+| ![访问控制 / 时间组](docs/screenshots/05-acl.jpg)<br>访问控制 / 时间组 | |
+
+</details>
+
+<details>
+<summary><b>⑥ 服务</b> —— 14 张</summary>
+<br>
+
+| | |
+|---|---|
+| ![智能限速 QoS](docs/screenshots/06-qos.jpg)<br>智能限速 QoS | ![QoS 队列与规则](docs/screenshots/06-qos-2.jpg)<br>QoS · 队列与规则 |
+| ![应用识别 DPI](docs/screenshots/06-dpi.jpg)<br>应用识别 DPI | ![DPI 识别结果](docs/screenshots/06-dpi-2.jpg)<br>DPI · 识别结果 |
+| ![NTP 时间同步](docs/screenshots/06-ntp.jpg)<br>NTP 时间同步 | ![文件共享 SMB / NFS](docs/screenshots/06-smb.jpg)<br>文件共享 SMB / NFS |
+| ![共享目录](docs/screenshots/06-smb-2.jpg)<br>文件共享 · 共享目录 | ![打印服务 CUPS](docs/screenshots/06-cups.jpg)<br>打印服务 CUPS |
+| ![打印队列](docs/screenshots/06-cups-2.jpg)<br>打印服务 · 打印队列 | ![USB 直通](docs/screenshots/06-cups-3.jpg)<br>打印服务 · USB 直通 |
+| ![打印共享设置](docs/screenshots/06-cups-4.jpg)<br>打印服务 · 共享设置 | ![AC / AP 管理中心](docs/screenshots/06-acap.jpg)<br>AC / AP 管理中心 |
+| ![AC / AP 无线与 VLAN](docs/screenshots/06-acap-2.jpg)<br>AC / AP · 无线与 VLAN | |
+
+</details>
+
+<details>
+<summary><b>⑦ 工具</b> —— 11 张</summary>
+<br>
+
+| | |
+|---|---|
+| ![Web 终端 / 文件](docs/screenshots/07-webshell.jpg)<br>Web 终端 / 文件 | ![通用 API 接口](docs/screenshots/07-api.jpg)<br>通用 API 接口 |
+| ![OpenAPI 文档](docs/screenshots/07-api-2.jpg)<br>通用 API · OpenAPI 文档 | ![网络诊断工具](docs/screenshots/07-diag.jpg)<br>网络诊断工具 |
+| ![IPv6 连通性测试](docs/screenshots/07-ipv6test.jpg)<br>IPv6 连通性测试 | ![Docker / Compose](docs/screenshots/07-docker.jpg)<br>Docker / Compose |
+| ![Docker 容器与镜像](docs/screenshots/07-docker-2.jpg)<br>Docker · 容器与镜像 | ![Docker Compose 项目](docs/screenshots/07-docker-3.jpg)<br>Docker · Compose 项目 |
+| ![Docker 引擎配置](docs/screenshots/07-dockerconf.jpg)<br>Docker 引擎配置 | ![镜像源测速](docs/screenshots/07-dockerconf-2.jpg)<br>Docker 引擎 · 镜像源测速 |
+| ![daemon.json](docs/screenshots/07-dockerconf-3.jpg)<br>Docker 引擎 · daemon.json | |
+
+</details>
+
+<details>
+<summary><b>⑧ 日志与审计</b> —— 3 张</summary>
+<br>
+
+| | |
+|---|---|
+| ![系统日志](docs/screenshots/08-syslog.jpg)<br>系统日志 | ![连接与流日志](docs/screenshots/08-flowlog.jpg)<br>连接与流日志 |
+| ![conntrack 连接表](docs/screenshots/08-flowlog-2.jpg)<br>连接与流日志 · conntrack | |
+
+</details>
+
+<details>
+<summary><b>⑨ 系统</b> —— 15 张</summary>
+<br>
+
+| | |
+|---|---|
+| ![依赖自检与安装](docs/screenshots/09-deps.jpg)<br>依赖自检与安装 | ![依赖探测结果](docs/screenshots/09-deps-2.jpg)<br>依赖自检 · 探测结果 |
+| ![磁盘与日志清理](docs/screenshots/09-cleanup.jpg)<br>磁盘与日志清理 | ![占用明细](docs/screenshots/09-cleanup-2.jpg)<br>磁盘清理 · 占用明细 |
+| ![内核转发与加速](docs/screenshots/09-kernel.jpg)<br>内核转发与加速 | ![内核开关与联动](docs/screenshots/09-kernel-2.jpg)<br>内核转发 · 开关与联动 |
+| ![证书 / SSL](docs/screenshots/09-tls.jpg)<br>证书 / SSL | ![证书签发与部署](docs/screenshots/09-tls-2.jpg)<br>证书 / SSL · 签发与部署 |
+| ![SSL 握手体检](docs/screenshots/09-tls-3.jpg)<br>证书 / SSL · 握手体检 | ![电源控制](docs/screenshots/09-power.jpg)<br>电源控制 |
+| ![用户与密钥](docs/screenshots/09-user.jpg)<br>用户与密钥 | ![SSH 公钥](docs/screenshots/09-user-2.jpg)<br>用户与密钥 · SSH 公钥 |
+| ![系统设置](docs/screenshots/09-settings.jpg)<br>系统设置 | ![时区与主机名](docs/screenshots/09-settings-2.jpg)<br>系统设置 · 时区与主机名 |
+| ![Web 端口](docs/screenshots/09-settings-3.jpg)<br>系统设置 · Web 端口 | ![审计日志](docs/screenshots/09-settings-4.jpg)<br>系统设置 · 审计日志 |
+
+</details>
+
+<details>
+<summary><b>关于截图本身（点开）</b></summary>
+<br>
+
+- 原始分辨率 **1272 × 900**（「Web 终端 / 文件」一张为 1280 × 1024），未做压缩裁剪
+- 仓库里以 **ASCII 文件名**入库（`docs/screenshots/02-overview.jpg` 这种），
+  避免中文名 + `&` 在 URL 编码、CI、shell 里反复出问题
+- 图片版权随项目走 **MIT**，可以自由用于介绍 / 二次分发
+- 想自己重拍：登录后按 `F11` 全屏，把窗口拉到 **1272px 宽**，按本文档的分组顺序截，存成同名文件覆盖即可
 
 </details>
 
@@ -652,6 +771,7 @@ drouter/
 │   └── *.js                     前端契约测试
 ├── devtools/                    开发工具
 │   ├── sync.sh                  一键部署：预检 → 打包 → 上传 → 部署
+│   ├── shots-map.py             截图入库：中文名 → ASCII 名映射与复制
 │   ├── check-views.js           菜单 ↔ 视图映射检查
 │   ├── check-render.js          35+ 视图离线渲染检查
 │   └── check-mobile.js          手机适配检查
@@ -666,6 +786,8 @@ drouter/
 │   ├── deb/                     control / postinst / prerm / postrm
 │   └── docker/                  Dockerfile / docker-init.sh
 └── docs/                        文档
+    ├── *.md                     规格 / 部署 / 测试等中文文档
+    └── screenshots/             78 张真实界面截图（jpg）
 ```
 
 ### 后端运行时模型

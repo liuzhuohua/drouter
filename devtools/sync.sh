@@ -101,6 +101,28 @@ PY
 # 功能测试永远抓不到，必须单独钉住。
 "$PYBIN" _dev/t-perf.py || { echo "❌ 性能回归预检失败"; exit 1; }
 
+# 文档链接：README 是项目的门面，一张图挂了就是一个白框，而且这种问题
+# 只在 GitHub 网页上才看得出来（本地 markdown 预览器很多会静默忽略）。
+# 截图从桌面搬进 docs/screenshots/ 时最容易漏改扩展名或文件名，
+# 所以把「文档里写的路径 → 文件是否真的存在」钉成预检项。
+"$PYBIN" devtools/check-md-links.py || { echo "❌ 文档链接预检失败"; exit 1; }
+
+# 截图清单：shots-map.py 里写了 78 条映射，任何一条与 docs/screenshots/
+# 的实际文件对不上（漏拷 / 多余 / 重名）都要在这里拦住。
+"$PYBIN" - <<'PY' || { echo "❌ 截图清单预检失败"; exit 1; }
+import os, glob, re
+d = 'docs/screenshots'
+have = {os.path.basename(p) for p in glob.glob(d + '/*.jpg')}
+refs = set(re.findall(r'docs/screenshots/([^)\s"]+\.jpg)', open('README.md', encoding='utf-8').read()))
+missing = sorted(refs - have)
+unused  = sorted(have - refs)
+if missing:
+    print('README 引用了但文件不存在：', missing); raise SystemExit(1)
+if unused:
+    print('文件存在但 README 没引用：', unused); raise SystemExit(1)
+print('  截图清单OK: %d 张，README 引用与目录完全对应' % len(have))
+PY
+
 # 换行符检查：Windows 上写出的 CRLF 到了 Linux 会让 bash 报 "$'\r': 未找到命令"，
 # 整个 deploy.sh 会静默跑成一堆错误。必须在打包前拦住。
 # 注意：不能用 grep —— Git Bash 的 grep 在文本模式下会把 LF 读成 CRLF，全是误报。
