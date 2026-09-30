@@ -293,6 +293,30 @@ Web 面板只做三件事：**渲染原生配置文件 → 语法预检 → 原�
 
 </details>
 
+<details>
+<summary><b>还没截图的 3 个页面</b></summary>
+<br>
+
+43 个功能页里已有 **40 个**配了截图，还剩 3 个欢迎补充：
+
+| 功能页 | 说明 |
+|---|---|
+| **新手向导** | 四步配网（外网 → 内网 → DNS → IPv6），新手第一眼就会看到，优先级最高 |
+| **主题之家** | Web 主题设计与离线预览 |
+| **升级与保护** | 系统升级 + 构建保护模式开关 |
+
+补图流程：
+
+```bash
+# 1. 把截图放进 docs/screenshots/，按现有命名规则编号
+#    例如 02-wizard.jpg / 09-theme.jpg / 09-upgrade.jpg
+# 2. 在 README「完整图集」对应分组的折叠块里加一行
+# 3. 跑一下覆盖度检查，确认没有漏登记
+python3 devtools/check-shots.py
+```
+
+</details>
+
 ---
 
 ## 🎛️ 功能
@@ -772,6 +796,8 @@ drouter/
 ├── devtools/                    开发工具
 │   ├── sync.sh                  一键部署：预检 → 打包 → 上传 → 部署
 │   ├── shots-map.py             截图入库：中文名 → ASCII 名映射与复制
+│   ├── check-shots.py           截图覆盖度：功能页 ↔ 截图 ↔ README 三方对账
+│   ├── check-md-links.py        文档本地引用死链检查
 │   ├── check-views.js           菜单 ↔ 视图映射检查
 │   ├── check-render.js          35+ 视图离线渲染检查
 │   └── check-mobile.js          手机适配检查

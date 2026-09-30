@@ -107,41 +107,30 @@ PY
 # 所以把「文档里写的路径 → 文件是否真的存在」钉成预检项。
 "$PYBIN" devtools/check-md-links.py || { echo "❌ 文档链接预检失败"; exit 1; }
 
-# 截图清单：shots-map.py 里写了 78 条映射，任何一条与 docs/screenshots/
-# 的实际文件对不上（漏拷 / 多余 / 重名）都要在这里拦住。
-"$PYBIN" - <<'PY' || { echo "❌ 截图清单预检失败"; exit 1; }
-import os, glob, re
-d = 'docs/screenshots'
-have = {os.path.basename(p) for p in glob.glob(d + '/*.jpg')}
-refs = set(re.findall(r'docs/screenshots/([^)\s"]+\.jpg)', open('README.md', encoding='utf-8').read()))
-missing = sorted(refs - have)
-unused  = sorted(have - refs)
-if missing:
-    print('README 引用了但文件不存在：', missing); raise SystemExit(1)
-if unused:
-    print('文件存在但 README 没引用：', unused); raise SystemExit(1)
-print('  截图清单OK: %d 张，README 引用与目录完全对应' % len(have))
-PY
+# 截图覆盖度：功能页 ↔ 截图 ↔ README 引用 三者必须对得上。
+# 加功能页忘截图、补了图忘登记、重命名漏一张，这三类漂移都是静默的，
+# 必须靠这条预检抓。缺图只提示不拦截（截图本来就可以慢慢补）。
+"$PYBIN" devtools/check-shots.py || { echo "❌ 截图覆盖度预检失败"; exit 1; }
 
 # 换行符检查：Windows 上写出的 CRLF 到了 Linux 会让 bash 报 "$'\r': 未找到命令"，
 # 整个 deploy.sh 会静默跑成一堆错误。必须在打包前拦住。
 # 注意：不能用 grep —— Git Bash 的 grep 在文本模式下会把 LF 读成 CRLF，全是误报。
+#
+# 只扫 git 已追踪的文件：未追踪的本地临时产物（如 _preview-shots.html）
+# 根本不会进仓库、也不会被 deploy.sh 上传，为它们报错是纯噪音。
 "$PYBIN" - <<'PY' || { echo "❌ 换行符预检失败"; exit 1; }
-import glob, sys
-bad = []
-for ext in ('.sh', '.py', '.js', '.css', '.html'):
-    for f in glob.glob('**/*' + ext, recursive=True):
-        if '__pycache__' in f:
-            continue
-        if b'\r' in open(f, 'rb').read():
-            bad.append(f)
+import subprocess, sys
+out = subprocess.run(['git', 'ls-files'], capture_output=True, text=True).stdout
+bad = [f for f in out.splitlines()
+       if f.endswith(('.sh', '.py', '.js', '.css', '.html'))
+       and b'\r' in open(f, 'rb').read()]
 if bad:
     print('以下文件含 CRLF 换行，Linux 上会执行失败：')
     for f in bad:
         print('   ' + f)
     print('修正：python3 -c "open(f,\'wb\').write(open(f,\'rb\').read().replace(b\'\\r\\n\',b\'\\n\'))"')
     sys.exit(1)
-print('  换行符OK: 全部为 LF')
+print('  换行符OK: 已追踪的脚本全部为 LF')
 PY
 
 echo "=== 打包源码 ==="
