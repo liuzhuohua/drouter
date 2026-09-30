@@ -6456,7 +6456,7 @@ async function wsConnect() {
   if (!r.ok) {
     if (st) st.innerHTML = '<span class="tag err">连接失败</span>';
     wsNote('连接失败：' + (r.msg_cn || '未知错误'));
-    if (r.code === 'NO_SHELLD') wsNote('请确认终端守护在运行：systemctl start drouter-shelld');
+    if (r.code === 'NO_SHELLD') wsNote('终端守护没起来：systemctl start drouter-shelld（容器形态无 systemd，重启容器即可）');
     // PTY_FAIL 里最坑的一种是 /dev/ptmx 入口丢失：明明一个终端都没开，
     // 内核却报「out of pty devices」。守护会尝试自愈；还失败的话给条
     // 能照着敲的命令，别让用户对着 errno 干瞪眼。

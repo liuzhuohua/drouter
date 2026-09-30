@@ -14705,17 +14705,51 @@ def act_fs(p):
 # ③ 会话开启/关闭与输入都写审计日志；④ 30 分钟空闲自动回收；⑤ 界面明确提示是 root shell。
 SHELL_SOCK = '/run/drouter/shell.sock'
 SHELL_UNIT = 'drouter-shelld.service'
+SHELL_DAEMON = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            'drouter-shelld.py')
+
+
+def _shelld_spawn():
+    """不经 init 系统，直接把终端守护拉起来（回退路径）。
+
+    容器形态里没有 systemd，`systemctl start` 必然失败、socket 永远不出现，
+    用户在界面上只会看到「终端守护未运行」—— 而那条提示还让人去执行
+    systemctl，在容器里根本无从执行。这里补一条不依赖 init 的路径：
+    直接以子进程方式启动守护，并用 start_new_session 让它脱离本进程，
+    helper 退出后它仍然活着（容器里 web 与守护同属容器 cgroup，容器在就都在）。
+
+    真机上这一步不会命中：systemctl 正常时调用方早就返回了。
+    """
+    if not os.path.isfile(SHELL_DAEMON):
+        return False
+    try:
+        subprocess.Popen(
+            [sys.executable, SHELL_DAEMON],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        return False
+    for _ in range(40):
+        if os.path.exists(SHELL_SOCK):
+            return True
+        time.sleep(0.25)
+    return os.path.exists(SHELL_SOCK)
 
 
 def _shelld_start():
     """守护没跑时拉起一次。否则用户只会看到一句看不懂的「连接失败」。"""
+    if os.path.exists(SHELL_SOCK):
+        return True
     sh(['systemctl', 'start', SHELL_UNIT], timeout=30)
     # 等 socket 出现（systemd 起来后守护自己还要创建 socket）
     for _ in range(40):
         if os.path.exists(SHELL_SOCK):
             return True
         time.sleep(0.25)
-    return os.path.exists(SHELL_SOCK)
+    if os.path.exists(SHELL_SOCK):
+        return True
+    # systemctl 拉不起来（典型的：容器里没有 systemd）→ 直接起守护进程
+    return _shelld_spawn()
 
 
 def _shelld_call(req, timeout=25):
@@ -14759,7 +14793,8 @@ def _shelld_call(req, timeout=25):
         if attempt == 0:
             _shelld_start()
     return {'ok': False, 'code': 'NO_SHELLD',
-            'msg_cn': '%s。可在目标机执行 systemctl start %s 后重试。'
+            'msg_cn': '%s。可执行 systemctl start %s 后重试'
+                      '（容器形态没有 systemd，重启容器即可）。'
                       % (last, SHELL_UNIT)}
 
 

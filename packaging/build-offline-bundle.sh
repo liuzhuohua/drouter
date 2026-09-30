@@ -27,7 +27,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="${1:-1.0.0}"
+VERSION="${1:-1.0.1}"
 OUTDIR="${2:-$HERE/dist}"
 ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 

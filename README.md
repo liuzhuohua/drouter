@@ -31,6 +31,7 @@
 - [项目结构](#-项目结构)
 - [设计与安全取舍](#-设计与安全取舍)
 - [常见问题](#-常见问题)
+- [更新日志](#-更新日志)
 - [参与贡献](#-参与贡献)
 
 ---
@@ -459,7 +460,7 @@ Drouter 是普通 Debian 软件包，跑在哪都行：
 
 路由器往往出现在**不方便接外网**的地方：机房、弱电箱、隔离网段、
 或者一台你根本不想让它联网的机器。所以 Release 里的
-`drouter-1.0.0-offline-amd64.tar.gz` 不是「只发一个 `.deb`」，
+`drouter-1.0.1-offline-amd64.tar.gz` 不是「只发一个 `.deb`」，
 而是把 **Drouter 本体 + 它跑起来需要的全部 Debian 依赖**一起打成了一个包。
 
 解包出来是这样：
@@ -467,8 +468,8 @@ Drouter 是普通 Debian 软件包，跑在哪都行：
 ```bash
 # 1) 把 tar.gz 拷到目标机（U 盘 / scp / 内网共享都行）
 # 2) 解包
-tar xzf drouter-1.0.0-offline-amd64.tar.gz
-cd drouter-1.0.0-offline-amd64
+tar xzf drouter-1.0.1-offline-amd64.tar.gz
+cd drouter-1.0.1-offline-amd64
 
 # 3) 一条命令装完（会自动 sudo）
 sudo bash install.sh
@@ -491,11 +492,11 @@ sudo bash install.sh
 <summary><b>包里到底装了什么（点开看）</b></summary>
 
 ```
-drouter-1.0.0-offline-amd64/
+drouter-1.0.1-offline-amd64/
 ├── install.sh                 安装脚本（自动提权 + 本地 file: 源，零外网）
 ├── README-离线安装.md          给不熟悉 Linux 的人看的逐步说明
 ├── SHA256SUMS                 237 条校验和（236 依赖 + 本体）
-├── drouter_1.0.0_all.deb      Drouter 本体（含 6 个 systemd 单元）
+├── drouter_1.0.1_all.deb      Drouter 本体（含 6 个 systemd 单元）
 └── debs/                      236 个依赖 .deb
     ├── nftables_*.deb         ├─ 直接依赖
     ├── dnsmasq_*.deb
@@ -532,9 +533,9 @@ drouter-1.0.0-offline-amd64/
 </details>
 
 **想要更小的包？** 如果你的目标机有网（哪怕是内网自建 apt 镜像），
-可以只拿 `drouter_1.0.0_all.deb`（约 421 KB），见下方「方式二」。
+可以只拿 `drouter_1.0.1_all.deb`（约 427 KB），见下方「方式二」。
 
-**已经装过依赖、只想升级本体？** 同样只用那个 421 KB 的 `.deb`
+**已经装过依赖、只想升级本体？** 同样只用那个 427 KB 的 `.deb`
 `dpkg -i` 覆盖安装即可，不必重新走离线包。
 
 ### 方式二：在线安装（目标机有网）
@@ -542,24 +543,24 @@ drouter-1.0.0-offline-amd64/
 如果目标机能连上 Debian 官方源（或内网 apt 镜像），只需要本体那一个文件：
 
 ```bash
-sudo apt install ./drouter_1.0.0_all.deb
+sudo apt install ./drouter_1.0.1_all.deb
 sudo drouter-ctl status
 ```
 
 > `apt install ./xxx.deb` 会自动把 `Depends` 交给 apt 去网上补齐 ——
-> 这正是它能「只发一个 421 KB 文件」的前提。
+> 这正是它能「只发一个 427 KB 文件」的前提。
 > 目标机没网时请走**方式一**，否则 apt 会卡在拉依赖上。
 
 ### 方式三：Docker（体验用）
 
-项目提供 `drouter-1.0.0-docker.tar`（约 169 MB，已含完整根文件系统）。
+项目提供 `drouter-1.0.1-docker.tar`（约 169 MB，已含完整根文件系统）。
 
 **方式 A：docker compose（推荐）**
 
 Release 里附了现成的 `docker-compose.yml`，直接下下来用：
 
 ```bash
-docker load -i drouter-1.0.0-docker.tar
+docker load -i drouter-1.0.1-docker.tar
 
 # 把 docker-compose.yml 放到当前目录
 docker compose up -d
@@ -569,7 +570,7 @@ docker compose ps          # 等 health 变 healthy
 **方式 B：docker run**
 
 ```bash
-docker load -i drouter-1.0.0-docker.tar
+docker load -i drouter-1.0.1-docker.tar
 
 docker run -d --name drouter --restart unless-stopped \
   --network host \
@@ -579,11 +580,11 @@ docker run -d --name drouter --restart unless-stopped \
   -v drouter-data:/opt/drouter/data \
   -v drouter-snapshots:/opt/drouter/snapshots \
   -v drouter-log:/var/log/drouter \
-  drouter:1.0.0
+  drouter:1.0.1
 ```
 
-两种方式加载后镜像标签都是 **`drouter:1.0.0`**（另有一个
-`liuzhuohua/drouter:1.0.0` 别名，同一个镜像）。
+两种方式加载后镜像标签都是 **`drouter:1.0.1`**（另有一个
+`liuzhuohua/drouter:1.0.1` 别名，同一个镜像）。
 
 访问 `https://<宿主IP>:8443/`，账号 `admin` / `admin123`。
 
@@ -615,17 +616,17 @@ docker run -d --name drouter --restart unless-stopped \
 git clone https://github.com/liuzhuohua/drouter.git
 cd drouter
 
-# 本体 deb（→ dist/drouter_1.0.0_all.deb，约 421 KB）
-bash packaging/build-deb.sh 1.0.0
+# 本体 deb（→ dist/drouter_1.0.1_all.deb，约 427 KB）
+bash packaging/build-deb.sh 1.0.1
 
 # 离线依赖库（→ dist/offline-deps/，236 个 .deb + Packages 索引）
 bash scripts/make-offline-deps.sh
 
-# 自包含离线包（→ dist/drouter-1.0.0-offline-amd64.tar.gz，约 83 MB）
-bash packaging/build-offline-bundle.sh 1.0.0
+# 自包含离线包（→ dist/drouter-1.0.1-offline-amd64.tar.gz，约 83 MB）
+bash packaging/build-offline-bundle.sh 1.0.1
 
-# Docker 镜像（→ dist/drouter-1.0.0-docker.tar，约 169 MB）
-bash packaging/build-docker.sh 1.0.0
+# Docker 镜像（→ dist/drouter-1.0.1-docker.tar，约 169 MB）
+bash packaging/build-docker.sh 1.0.1
 ```
 
 构建顺序上，`build-offline-bundle.sh` 会**自己**先调 `build-deb.sh`
@@ -977,6 +978,31 @@ sudo apt purge  drouter       # 连配置一起删
 要还原请用快照回滚，或手动改。
 
 </details>
+
+---
+
+## 📝 更新日志
+
+### v1.0.1 — Web 终端可用性修复
+
+纯修复版本，无新增功能，不改动任何配置格式。
+
+- **修：Web SSH 终端任何账号都连不上（`out of pty devices`）。**
+  真因不是伪终端耗尽（`kernel.pty.nr` 为 0），而是 `/dev/ptmx` 这个符号链接丢失。
+  现在守护进程启动时与每次创建失败时都会自愈（补链接 → `mknod` 兜底），
+  并给出可照抄的修复提示，不再只抛一句误导性的系统报错。
+- **修：终端并发满员后整个服务被冻死。** 会话锁不可重入，而「满员 → 回收空闲会话」
+  会在持锁状态下二次取同一把锁，同线程永久阻塞且不报错、不写日志。
+  改为可重入锁 + 回收动作移出锁外。实测第 9 个连接 0.01 秒返回 `BUSY`，
+  8 个会话 0.87 秒全部清理、残留 0，无 fd 泄漏。
+- **改：终端外观。** 隐藏右侧滚动条（保留滚动能力）、高度随视口自适应并跟随最新输出、
+  新增「清屏」与「↓ 最新」按钮。
+- **修：页脚协议标注错误。** 原先写「GNU GPL v3」，与仓库实际的 MIT `LICENSE` 不符。
+
+### v1.0.0 — 首个正式版
+
+43 个功能页面、9 个纯标准库后端模块、6 个 systemd 单元、自包含离线安装包
+（本体 + 236 个依赖）、Docker 镜像与 compose 编排。
 
 ---
 

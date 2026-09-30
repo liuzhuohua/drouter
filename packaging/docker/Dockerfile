@@ -10,7 +10,7 @@
 #         --network host --cap-add NET_ADMIN --cap-add NET_RAW \
 #         -v drouter-data:/opt/drouter/data \
 #         -v drouter-etc:/etc/drouter \
-#         drouter:1.0.0
+#         drouter:1.0.1
 # =============================================================================
 FROM debian:trixie-slim
 
@@ -50,7 +50,9 @@ RUN mkdir -p /opt/drouter/backend /opt/drouter/web /opt/drouter/docs \
              /var/log/drouter /run/drouter-helper
 COPY backend/*.py    /opt/drouter/backend/
 COPY web/            /opt/drouter/web/
-COPY docs/           /opt/drouter/docs/
+# 只拷顶层 .md：docs/screenshots/ 是给 GitHub README 用的 78 张截图，
+# 进镜像纯属白白撑大体积
+COPY docs/*.md       /opt/drouter/docs/
 COPY scripts/*.sh    /opt/drouter/scripts/
 COPY packaging/docker/docker-init.sh /opt/drouter/bin/docker-init.sh
 RUN chmod +x /opt/drouter/bin/docker-init.sh /opt/drouter/scripts/*.sh

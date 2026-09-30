@@ -298,6 +298,45 @@ def main():
     ck("返回回收条数", n == 1, str(n))
     ck("空表调用返回 0 且不抛", ns['_reap_idle']() == 0)
 
+    print("\n十、无 systemd 时的回退：直接拉起终端守护（容器形态）")
+    # 背景：容器里没有 systemd，helper 的 `systemctl start drouter-shelld` 必然
+    # 失败，socket 永远不出现 —— Web 终端在 Docker 形态下 100% 打不开，
+    # 而界面给的提示还是「去执行 systemctl」。这里补一条不依赖 init 的回退。
+    HS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                      'backend', 'drouter-helper.py')
+    hsrc = open(HS, encoding='utf-8').read()
+    ck("helper 定义了 _shelld_spawn()", 'def _shelld_spawn(' in hsrc)
+
+    spawn_src = hsrc.split('def _shelld_spawn')[1].split('\ndef ')[0]
+    ck("子进程脱离本进程（start_new_session）",
+       'start_new_session=True' in spawn_src,
+       "不加的话 helper 一退出，守护会被连带收走")
+    ck("三路标准流全部丢弃（不继承调用方管道）",
+       spawn_src.count('subprocess.DEVNULL') >= 3,
+       "继承管道会让 ssh / sudo 调用方一直挂着不返回")
+    ck("启动前确认守护脚本存在", 'os.path.isfile(SHELL_DAEMON)' in spawn_src)
+
+    start_src = hsrc.split('def _shelld_start')[1].split('\ndef ')[0]
+    ck("_shelld_start 里有 _shelld_spawn() 回退", '_shelld_spawn()' in start_src)
+    ck("socket 已存在时不再折腾 systemctl",
+       'if os.path.exists(SHELL_SOCK):\n        return True' in start_src)
+
+    # 行为：socket 已在 → 直接 True，一次 systemctl 都不调
+    calls3 = []
+    ns3 = {
+        'os': type('O', (), {'path': type('p', (), {
+            'exists': staticmethod(lambda p: True)})()})(),
+        'time': __import__('time'),
+        'sh': lambda cmd, **k: calls3.append(list(cmd)),
+        'SHELL_SOCK': '/run/drouter/shell.sock',
+        'SHELL_UNIT': 'drouter-shelld.service',
+        '_shelld_spawn': lambda: (calls3.append('spawn'), True)[1],
+    }
+    exec(compile('def _shelld_start' + start_src, '<s>', 'exec'), ns3)
+    ck("socket 已存在时 _shelld_start 直接返回 True",
+       ns3['_shelld_start']() is True)
+    ck("且没有调用 systemctl", calls3 == [], str(calls3))
+
     print("\n" + "=" * 56)
     print("结果：%d 项，失败 %d 项" % (_ck[1], _ck[1] - _ck[0]))
     return 1 if _ck[0] != _ck[1] else 0

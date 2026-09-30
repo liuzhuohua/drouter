@@ -13,7 +13,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="${1:-1.0.0}"
+VERSION="${1:-1.0.1}"
 DIST="$HERE/dist"
 PKG="drouter"
 STAGE="$DIST/${PKG}_${VERSION}_all"
@@ -34,7 +34,14 @@ mkdir -p "$DIST"
 echo "== 2/6 复制程序文件 =="
 install -m 0644 "$HERE"/backend/*.py          "$STAGE/opt/drouter/backend/"
 install -m 0644 "$HERE"/web/*                 "$STAGE/opt/drouter/web/"
-install -m 0644 "$HERE"/docs/*                "$STAGE/opt/drouter/docs/"
+# 文档只装顶层文件，**不能写 `docs/*`**：`docs/screenshots/` 是个目录，
+# GNU install 遇到目录会报 "略过目录" 并**返回非 0**，在 set -e 下直接中断整个打包。
+# （截图是给 GitHub README 用的，也没必要塞进 deb 里白白撑大体积。）
+# 逐项 `[ -f ]` 过滤的写法与 scripts/deploy.sh 保持一致。
+for d in "$HERE"/docs/*; do
+  [ -f "$d" ] || continue
+  install -m 0644 "$d" "$STAGE/opt/drouter/docs/"
+done
 install -m 0755 "$HERE"/scripts/*.sh          "$STAGE/opt/drouter/scripts/"
 # 一键运维命令：直接随包提供，postinst 里再做一次兜底安装
 install -m 0755 "$HERE/scripts/drouter-ctl.sh" "$STAGE/usr/local/bin/drouter-ctl"
