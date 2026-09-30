@@ -30,21 +30,37 @@ command -v node >/dev/null 2>&1 && node --check web/app.js && echo "  OK: web/ap
 echo "== 2/3 构建镜像 drouter:$TAG =="
 docker build -f "$HERE/packaging/docker/Dockerfile" -t "drouter:$TAG" "$HERE"
 
+# 同时打一个带用户名的别名，方便日后直推 Docker Hub / 私有仓库。
+# 两个标签指向同一个 image id，不额外占空间。
+docker tag "drouter:$TAG" "liuzhuohua/drouter:$TAG"
+
 echo "== 3/3 产物 =="
-docker images drouter:"$TAG"
+docker images --filter "reference=drouter" --filter "reference=liuzhuohua/drouter"
 echo ""
-cat <<'RUN'
-运行示例：
-  docker run -d --name drouter --restart unless-stopped \
-    --network host \
-    --cap-add NET_ADMIN --cap-add NET_RAW \
-    -e DROUTER_WEB_PORT=8443 \
-    -v drouter-data:/opt/drouter/data \
-    -v drouter-etc:/etc/drouter \
-    drouter:1.0.0
+cat <<RUN
+运行示例（详见 packaging/docker/DOCKER-使用说明.md）：
+
+  # 方式 A：docker compose（Release 里附了 docker-compose.yml）
+  docker compose up -d
+
+  # 方式 B：docker run
+  docker run -d --name drouter --restart unless-stopped \\
+    --network host \\
+    --cap-add NET_ADMIN --cap-add NET_RAW \\
+    -e TZ=Asia/Shanghai \\
+    -v drouter-etc:/etc/drouter \\
+    -v drouter-data:/opt/drouter/data \\
+    -v drouter-snapshots:/opt/drouter/snapshots \\
+    -v drouter-log:/var/log/drouter \\
+    drouter:$TAG
+
+导出成 tar（用于分发）：
+  docker save drouter:$TAG liuzhuohua/drouter:$TAG \\
+    -o dist/drouter-$TAG-docker.tar
 
 说明：
   --network host  让容器直接看到宿主机网卡（路由类功能的前提）
   NET_ADMIN       允许操作 nftables / 网卡 / 路由表
+  不需要 --privileged：只要 NET_ADMIN + NET_RAW 就够
   默认账号 admin / admin123，登录后请立即修改
 RUN

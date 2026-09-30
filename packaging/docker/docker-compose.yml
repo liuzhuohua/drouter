@@ -1,0 +1,99 @@
+# =============================================================================
+# Drouter —— Docker Compose 编排
+#
+#   用法：
+#     docker load -i drouter-1.0.0-docker.tar
+#     docker compose up -d
+#     浏览器打开 https://<宿主IP>:8443/
+#
+# ⚠️ 先读这三条，否则会踩坑：
+#
+#   1) 必须是 network_mode: host
+#      容器要直接读写宿主网络接口和 nftables 规则，bridge 模式下看到的是
+#      容器自己的网络命名空间，读不到真实网卡，也管不了宿主的 NAT。
+#
+#   2) NET_ADMIN 不能省
+#      少了它 nft 操作会报 "Operation not permitted"，防火墙页直接失效。
+#      实测：加上之后 /api/nft 正常返回真实规则集。
+#
+#   3) 这是「体验 / 调试」形态，不建议当主路由
+#      容器里没有 systemd，服务管理页会显示 active: unknown（优雅降级，不是 bug），
+#      且无法持久化 systemd 单元。真正长期当路由器跑请用 .deb 装到物理机/虚拟机上。
+# =============================================================================
+
+services:
+  drouter:
+    # 镜像从 tar 加载后即为这个名字。若你改过标签，这里同步改。
+    image: drouter:1.0.0
+
+    # 固定容器名，方便 docker exec / logs 直接引用
+    container_name: drouter
+
+    # host 网络是硬要求，见文件头说明
+    network_mode: host
+
+    # ── 权限 ───────────────────────────────────────────────────────────
+    # 这里**不用** privileged（过度授权）。只给真正需要的能力：
+    cap_add:
+      - NET_ADMIN      # nft / iptables / 路由表 / 接口配置
+      - NET_RAW        # ping / traceroute 等原始套接字探测
+      - NET_BIND_SERVICE  # 绑定 8443（<1024 的端口才严格需要，这里保守给上）
+    # 若你想省事、且接受更大权限面，可以注释掉上面三行改用：
+    # privileged: true
+
+    # ── 端口 ───────────────────────────────────────────────────────────
+    # network_mode: host 下 ports 会被忽略，端口由 /etc/drouter/web-port 决定。
+    # 这里写出来只是**文档作用**，让 `docker compose config` 能看出监听什么。
+    expose:
+      - "8443"   # HTTPS 管理面板
+      - "8080"   # 备用 HTTP（默认关闭，可在「系统设置」里开）
+
+    # ── 持久化 ─────────────────────────────────────────────────────────
+    # 这四个目录**必须**挂出来，否则 docker compose down 一次配置就全丢了。
+    volumes:
+      # 配置核心：settings、web-port、active-theme、证书索引
+      - drouter-etc:/etc/drouter
+      # 运行时数据：SQLite 库、流量统计
+      - drouter-data:/opt/drouter/data
+      # 配置快照：出问题时的回滚依据
+      - drouter-snapshots:/opt/drouter/snapshots
+      # 日志
+      - drouter-log:/var/log/drouter
+
+    # ── 环境变量 ───────────────────────────────────────────────────────
+    environment:
+      TZ: Asia/Shanghai
+      # Web 端口只在**首次启动**时播种进 /etc/drouter/web-port。
+      # 之后想改端口，请到「系统设置」界面改 —— 别再改这里的环境变量，
+      # 否则会出现「界面里改了却没生效」的困惑（环境变量优先级高于配置文件）。
+      DROUTER_WEB_PORT: "8443"
+
+    # ── 启动策略 ───────────────────────────────────────────────────────
+    # unless-stopped：重启宿主后自动拉起，但用户手动 stop 后不会自己回来
+    restart: unless-stopped
+
+    # ── 健康检查 ───────────────────────────────────────────────────────
+    # /api/health 是免鉴权接口，适合探活。
+    # ⚠️ 面板走 HTTPS 且用自签证书，curl 必须加 -k，否则永远 unhealthy。
+    healthcheck:
+      test: ["CMD-SHELL", "PORT=$(cat /etc/drouter/web-port 2>/dev/null || echo 8443); curl -fsSk --max-time 4 https://127.0.0.1:${PORT}/api/health >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+    # ── 日志 ───────────────────────────────────────────────────────────
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# =============================================================================
+# 命名卷
+# =============================================================================
+volumes:
+  drouter-etc:
+  drouter-data:
+  drouter-snapshots:
+  drouter-log:

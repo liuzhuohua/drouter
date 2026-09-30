@@ -17,7 +17,7 @@ FROM debian:trixie-slim
 LABEL maintainer="火麒麟 (ajeef) <https://github.com/liuzhuohua>" \
       org.opencontainers.image.title="drouter" \
       org.opencontainers.image.description="Debian 13 主路由管理系统（Web 管理面板）" \
-      org.opencontainers.image.licenses="GPL-3.0"
+      org.opencontainers.image.licenses="MIT"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \

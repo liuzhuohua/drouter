@@ -409,32 +409,58 @@ sudo drouter-ctl status
 
 ### 方式三：Docker（体验用）
 
-项目提供 `drouter-1.0.0-docker.tar`（约 169 MB，已含完整根文件系统）：
+项目提供 `drouter-1.0.0-docker.tar`（约 169 MB，已含完整根文件系统）。
+
+**方式 A：docker compose（推荐）**
+
+Release 里附了现成的 `docker-compose.yml`，直接下下来用：
 
 ```bash
 docker load -i drouter-1.0.0-docker.tar
 
-docker run -d --name drouter \
-  --cap-add NET_ADMIN --cap-add NET_RAW \
-  --network host \
-  -v /etc/drouter:/etc/drouter \
-  localhost/drouter:1.0.0
+# 把 docker-compose.yml 放到当前目录
+docker compose up -d
+docker compose ps          # 等 health 变 healthy
 ```
+
+**方式 B：docker run**
+
+```bash
+docker load -i drouter-1.0.0-docker.tar
+
+docker run -d --name drouter --restart unless-stopped \
+  --network host \
+  --cap-add NET_ADMIN --cap-add NET_RAW \
+  -e TZ=Asia/Shanghai \
+  -v drouter-etc:/etc/drouter \
+  -v drouter-data:/opt/drouter/data \
+  -v drouter-snapshots:/opt/drouter/snapshots \
+  -v drouter-log:/var/log/drouter \
+  drouter:1.0.0
+```
+
+两种方式加载后镜像标签都是 **`drouter:1.0.0`**（另有一个
+`liuzhuohua/drouter:1.0.0` 别名，同一个镜像）。
 
 访问 `https://<宿主IP>:8443/`，账号 `admin` / `admin123`。
 
-关于这几个参数，实测结论如下：
+关于参数，实测结论如下：
 
 | 参数 | 必要性 | 说明 |
 |---|---|---|
-| `--network host` | **必需** | 容器要直接读写宿主的网络接口和 nftables 规则，不能用 bridge |
+| `--network host` | **必需** | 容器要直接读写宿主的网络接口和 nftables 规则，bridge 模式下看不到真实网卡 |
 | `--cap-add NET_ADMIN` | **必需** | 否则 `nft` 操作报 `Operation not permitted`，防火墙页会失效 |
 | `--cap-add NET_RAW` | 建议 | 部分探测类功能（ping / traceroute）需要 |
-| `-v /etc/drouter:...` | 建议 | 挂出来配置才不会随容器销毁而丢失 |
+| 四个命名卷 | **建议** | 配置、数据、快照、日志。不挂出来容器重建就全丢 |
 
-> **用 `localhost/drouter:1.0.0` 这个全限定名**，别用裸的 `drouter:1.0.0` ——
-> 后者会被 Docker/Podman 当成 `docker.io/library/drouter` 去远端拉取，然后报
-> `pull access denied`。这是本地 `docker load` 出来的镜像，它不存在于任何仓库。
+> **不需要 `--privileged`**。网上很多教程图省事都写它，但 Drouter 只需要
+> `NET_ADMIN` + `NET_RAW`。给 `privileged` 等于把宿主机完全敞开 ——
+> 除非在排查权限问题，否则用最小权限就好。
+
+> **端口由配置文件决定，不是环境变量**。`network_mode: host` 下 `ports:` 会被
+> Docker 忽略。端口存在 `/etc/drouter/web-port`，默认 8443，
+> 要改请去界面改（`DROUTER_WEB_PORT` 环境变量只在**首次启动**播种，之后会失效，
+> 这是故意的 —— 见 `packaging/docker/DOCKER-使用说明.md`）。
 
 > Docker 形态只建议用来**体验界面和 API**。容器里没有 systemd，
 > 所以「服务管理」页会显示 `active: unknown`（这是预期的优雅降级，不是故障）；
