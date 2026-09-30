@@ -46,6 +46,9 @@ _dev/live-*.log
 Thumbs.db
 desktop.ini
 
+# 截图画廊的本地预览页（一次性产物，别进库）
+_preview-shots.html
+
 # ── 凭据（绝不能进库）──────────────────────────────────
 *.pem
 *.key
