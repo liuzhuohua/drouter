@@ -462,7 +462,7 @@ Drouter 是普通 Debian 软件包，跑在哪都行：
 
 路由器往往出现在**不方便接外网**的地方：机房、弱电箱、隔离网段、
 或者一台你根本不想让它联网的机器。所以 Release 里的
-`drouter-1.0.2-offline-amd64.tar.gz` 不是「只发一个 `.deb`」，
+`drouter-1.0.3-offline-amd64.tar.gz` 不是「只发一个 `.deb`」，
 而是把 **Drouter 本体 + 它跑起来需要的全部 Debian 依赖**一起打成了一个包。
 
 解包出来是这样：
@@ -470,8 +470,8 @@ Drouter 是普通 Debian 软件包，跑在哪都行：
 ```bash
 # 1) 把 tar.gz 拷到目标机（U 盘 / scp / 内网共享都行）
 # 2) 解包
-tar xzf drouter-1.0.2-offline-amd64.tar.gz
-cd drouter-1.0.2-offline-amd64
+tar xzf drouter-1.0.3-offline-amd64.tar.gz
+cd drouter-1.0.3-offline-amd64
 
 # 3) 一条命令装完（会自动 sudo）
 sudo bash install.sh
@@ -494,11 +494,11 @@ sudo bash install.sh
 <summary><b>包里到底装了什么（点开看）</b></summary>
 
 ```
-drouter-1.0.2-offline-amd64/
+drouter-1.0.3-offline-amd64/
 ├── install.sh                 安装脚本（自动提权 + 本地 file: 源，零外网）
 ├── README-离线安装.md          给不熟悉 Linux 的人看的逐步说明
 ├── SHA256SUMS                 237 条校验和（236 依赖 + 本体）
-├── drouter_1.0.2_all.deb      Drouter 本体（含 6 个 systemd 单元）
+├── drouter_1.0.3_all.deb      Drouter 本体（含 6 个 systemd 单元）
 └── debs/                      236 个依赖 .deb
     ├── nftables_*.deb         ├─ 直接依赖
     ├── dnsmasq_*.deb
@@ -535,9 +535,9 @@ drouter-1.0.2-offline-amd64/
 </details>
 
 **想要更小的包？** 如果你的目标机有网（哪怕是内网自建 apt 镜像），
-可以只拿 `drouter_1.0.2_all.deb`（约 428 KB），见下方「方式二」。
+可以只拿 `drouter_1.0.3_all.deb`（约 430 KB），见下方「方式二」。
 
-**已经装过依赖、只想升级本体？** 同样只用那个 428 KB 的 `.deb`
+**已经装过依赖、只想升级本体？** 同样只用那个 430 KB 的 `.deb`
 `dpkg -i` 覆盖安装即可，不必重新走离线包。
 
 ### 方式二：在线安装（目标机有网）
@@ -545,24 +545,24 @@ drouter-1.0.2-offline-amd64/
 如果目标机能连上 Debian 官方源（或内网 apt 镜像），只需要本体那一个文件：
 
 ```bash
-sudo apt install ./drouter_1.0.2_all.deb
+sudo apt install ./drouter_1.0.3_all.deb
 sudo drouter-ctl status
 ```
 
 > `apt install ./xxx.deb` 会自动把 `Depends` 交给 apt 去网上补齐 ——
-> 这正是它能「只发一个 428 KB 文件」的前提。
+> 这正是它能「只发一个 430 KB 文件」的前提。
 > 目标机没网时请走**方式一**，否则 apt 会卡在拉依赖上。
 
 ### 方式三：Docker（体验用）
 
-项目提供 `drouter-1.0.2-docker.tar`（约 169 MB，已含完整根文件系统）。
+项目提供 `drouter-1.0.3-docker.tar`（约 169 MB，已含完整根文件系统）。
 
 **方式 A：docker compose（推荐）**
 
 Release 里附了现成的 `docker-compose.yml`，直接下下来用：
 
 ```bash
-docker load -i drouter-1.0.2-docker.tar
+docker load -i drouter-1.0.3-docker.tar
 
 # 把 docker-compose.yml 放到当前目录
 docker compose up -d
@@ -572,7 +572,7 @@ docker compose ps          # 等 health 变 healthy
 **方式 B：docker run**
 
 ```bash
-docker load -i drouter-1.0.2-docker.tar
+docker load -i drouter-1.0.3-docker.tar
 
 docker run -d --name drouter --restart unless-stopped \
   --network host \
@@ -582,11 +582,11 @@ docker run -d --name drouter --restart unless-stopped \
   -v drouter-data:/opt/drouter/data \
   -v drouter-snapshots:/opt/drouter/snapshots \
   -v drouter-log:/var/log/drouter \
-  drouter:1.0.2
+  drouter:1.0.3
 ```
 
-两种方式加载后镜像标签都是 **`drouter:1.0.2`**（另有一个
-`liuzhuohua/drouter:1.0.2` 别名，同一个镜像）。
+两种方式加载后镜像标签都是 **`drouter:1.0.3`**（另有一个
+`liuzhuohua/drouter:1.0.3` 别名，同一个镜像）。
 
 访问 `https://<宿主IP>:8443/`，账号 `admin` / `admin123`。
 
@@ -618,17 +618,17 @@ docker run -d --name drouter --restart unless-stopped \
 git clone https://github.com/liuzhuohua/drouter.git
 cd drouter
 
-# 本体 deb（→ dist/drouter_1.0.2_all.deb，约 428 KB）
-bash packaging/build-deb.sh 1.0.2
+# 本体 deb（→ dist/drouter_1.0.3_all.deb，约 430 KB）
+bash packaging/build-deb.sh 1.0.3
 
 # 离线依赖库（→ dist/offline-deps/，236 个 .deb + Packages 索引）
 bash scripts/make-offline-deps.sh
 
-# 自包含离线包（→ dist/drouter-1.0.2-offline-amd64.tar.gz，约 83 MB）
-bash packaging/build-offline-bundle.sh 1.0.2
+# 自包含离线包（→ dist/drouter-1.0.3-offline-amd64.tar.gz，约 83 MB）
+bash packaging/build-offline-bundle.sh 1.0.3
 
-# Docker 镜像（→ dist/drouter-1.0.2-docker.tar，约 169 MB）
-bash packaging/build-docker.sh 1.0.2
+# Docker 镜像（→ dist/drouter-1.0.3-docker.tar，约 169 MB）
+bash packaging/build-docker.sh 1.0.3
 ```
 
 构建顺序上，`build-offline-bundle.sh` 会**自己**先调 `build-deb.sh`
@@ -960,7 +960,7 @@ sudo ss -tlnp | grep 8443        # 看端口有没有在听
 
 ```bash
 # 下载新版 deb
-sudo apt install ./drouter_1.0.2_all.deb    # 直接覆盖安装，配置保留
+sudo apt install ./drouter_1.0.3_all.deb    # 直接覆盖安装，配置保留
 ```
 
 配置在 `/etc/drouter/` 和 SQLite 里，`apt remove` 也会保留（`purge` 才删）。
@@ -984,6 +984,39 @@ sudo apt purge  drouter       # 连配置一起删
 ---
 
 ## 📝 更新日志
+
+### v1.0.3 — 修「部署之后设置莫名回退」与几处静默失败
+
+纯修复版本，无新增功能，**不改动配置存储格式**（老配置直接可用）。
+
+- **修：IPv6 路由通告里填了 IPv4 DNS，就会生成一份 radvd 起不来的配置。**
+  `RDNSS` 字段原先完全不校验（同一段代码里 `prefix` 和 `DNSSL` 都校验了，唯独漏了它）。
+  在「下发 DNS」框里顺手填 `223.5.5.5`（最顺手的写法）会原样写进 `radvd.conf`，
+  radvd 直接 `syntax error` 起不来；界面上只回一句英文，完全指不到是哪个字段。
+  现在逐项按 IPv6 地址校验并给出中文提示，且多值支持逗号/空格两种写法
+  （统一按空格输出 —— 逗号形式 radvd 本来就不认）。顺带修了「DNSSL 生命期」
+  实际读的是 RDNSS 生命期这个张冠李戴。
+- **修：自动清理的「每天 00:00」存不下来，实际跑在 04:00。**
+  前端 `Number(v) || 4` 与后端 `int(cfg.get('hour') or 4)` 都把 0 当成「没填」。
+  另外执行时刻的判定从「正好等于」改成「不早于」：机器在计划时刻恰好在关机/重启时，
+  当天会补做，而不是整天跳过、要等到第二天。
+- **修：重新部署会静默回退用户设置（3 处）。** 这是最烦人的一类问题 ——
+  用户只会觉得「部署完我的设置莫名其妙变回去了」。
+  ① 生效主题被无条件写回 `default`，自定义主题每次部署都被打回；
+  ② `isp-dns.conf` 被无条件覆盖，pppd 已经拿到的运营商 DNS 被擦掉，上游解析变空
+  直到下次拨号；③ 自动清理被无条件 `enabled=true`，用户在界面上**明确关掉**的
+  「自动删文件」策略会被重新打开（清理是本项目唯一真删文件的模块，这条最不该发生）。
+  现在三者都改成「只在不存在时初始化」，并复用容器版 `docker-init.sh` 已有的写法。
+- **修：浏览器切页/关标签会在 journal 里刷一整段 Python traceback。**
+  `BrokenPipeError` / `ConnectionResetError` 属于「对面先挂了」，不是服务端的错，
+  却足以把 journal 刷满、淹掉真正的报错（实测 3 天攒了几十条）。现在只吞这几类。
+- **修：`/etc`、`/opt`、`/var/log` 里残留的名字带 `\r` 的脏条目。**
+  早先 CRLF 的部署脚本在 Linux 上执行时，行尾的 `\r` 粘进了参数，真的建出了
+  `dnsmasq.d\r`、`nftables.d\r`、`active-theme\r`、`/opt/drouter\r` 这类条目 ——
+  `ls` 会出现「同名条目两遍」的重影，配置快照也会反复把它们打包进去。
+  新增 `devtools/fix-crlf-names.py`（默认只预演，加 `--apply` 才删；只删**存在同名
+  正常兄弟**的条目，目录里若有兄弟没有的文件就拒绝删），并把「文件名不得含控制字符」
+  加进发布前预检。
 
 ### v1.0.2 — DHCP 渲染去重 + 预检诊断
 

@@ -15780,11 +15780,19 @@ def _clean_auto():
     if trig in ('schedule', 'both'):
         now = datetime.now()
         st = _clean_state_load()
-        if int(cfg.get('hour') or 4) == now.hour:
+        today = now.strftime('%Y-%m-%d')
+        # 注意别写 int(cfg.get('hour') or 4)：0 是 falsy，用户选「每天 00:00」
+        # 会被悄悄当成没填、改成 04:00 执行。先判 None/'' 再转 int。
+        _raw_hour = cfg.get('hour')
+        plan_hour = 4 if _raw_hour in (None, '') else max(0, min(int(_raw_hour), 23))
+        # 判定用 >= 而不是 ==：定时器虽然每小时醒一次，但机器可能在计划时刻
+        # 正好关机/重启，== 会让这一天彻底漏掉（要等第二天），>= 能在当天晚些
+        # 时候补做。语义上 hour 变成「不早于这个点」。
+        if now.hour >= plan_hour:
             if cfg.get('schedule') == 'weekly':
-                due = (now.weekday() == 0 and st.get('last_date') != now.strftime('%Y-%m-%d'))
+                due = (now.weekday() == 0 and st.get('last_date') != today)
             else:
-                due = (st.get('last_date') != now.strftime('%Y-%m-%d'))
+                due = (st.get('last_date') != today)
     if trig == 'disk':
         go = watermark
     elif trig == 'schedule':

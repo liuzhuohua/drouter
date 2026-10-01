@@ -137,7 +137,18 @@ if bad:
         print('   ' + f)
     print('修正：python3 -c "open(f,\'wb\').write(open(f,\'rb\').read().replace(b\'\\r\\n\',b\'\\n\'))"')
     sys.exit(1)
-print('  换行符OK: 已追踪的脚本全部为 LF')
+# 光查内容不够：CRLF 的 shell 脚本在 Linux 上执行时，行尾的 \r 会粘进参数，
+# 真的会建出名字带 \r 的目录/文件（本机 /etc 里就留下过 dnsmasq.d\r、
+# nftables.d\r、active-theme\r 等 7 个条目，得靠 devtools/fix-crlf-names.py 清）。
+# 所以文件名本身也要查一遍，别让这种名字进仓库。
+badname = [f for f in out.splitlines()
+           if any(ord(c) < 32 or ord(c) == 127 for c in f)]
+if badname:
+    print('以下文件的「文件名」含控制字符（多半是 CRLF 环境下编辑产生的）：')
+    for f in badname:
+        print('   ' + repr(f))
+    sys.exit(1)
+print('  换行符OK: 已追踪的脚本全部为 LF，且文件名无控制字符')
 PY
 
 echo "=== 打包源码 ==="

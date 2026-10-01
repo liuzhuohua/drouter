@@ -906,15 +906,35 @@ def render_radvd(cfg):
             '    };',
         ]
     if r.get('rdnss'):
-        lines.append(f"    RDNSS {r['rdnss'].strip()} {{")
+        # RDNSS 只认 IPv6 地址：RA 通告里根本没有 IPv4 的位置，而且多值必须是
+        # **空格分隔**（逗号形式 radvd 会直接 syntax error）。
+        # 这里原先完全不校验，于是「下发 DNS」框里顺手填了 IPv4（223.5.5.5 最顺手）
+        # 就会渲染出一份 radvd 读不进去的配置 —— 界面只回一句英文 syntax error，
+        # 指不到是哪个字段。实测 IPv4 / 逗号列表 / 域名 三种输入都会踩中。
+        ips = []
+        for item in str(r['rdnss']).replace(',', ' ').split():
+            try:
+                ipaddress.IPv6Address(item)
+            except Exception:
+                raise ValidateError(
+                    f'RDNSS 只能是 IPv6 地址：{item}（RA 通告无法下发 IPv4 DNS，'
+                    f'IPv4 请填在 DHCP 的 option 6 里）', 'rdnss')
+            ips.append(item)
+        lines.append('    RDNSS %s {' % ' '.join(ips))
         lines.append(f"        AdvRDNSSLifetime {v_int(r.get('rdnss_life') or 600, field='RDNSS 生命期', lo=60, hi=9000)};")
         lines.append('    };')
     if r.get('dnssl'):
-        dom = r['dnssl'].strip()
-        if not DOMAIN_RE.match(dom):
-            raise ValidateError(f'DNSSL 域名不合法：{dom}', 'dnssl')
-        lines.append(f'    DNSSL {dom} {{')
-        lines.append(f"        AdvDNSSLLifetime {v_int(r.get('rdnss_life') or 600, field='DNSSL 生命期', lo=60, hi=9000)};")
+        # 同 RDNSS：多个域名用空格分隔（逗号归一成空格），逐个校验，
+        # 免得一个写错的域名让 radvd 整份配置起不来。
+        doms = []
+        for dom in str(r['dnssl']).replace(',', ' ').split():
+            if not DOMAIN_RE.match(dom):
+                raise ValidateError(f'DNSSL 域名不合法：{dom}', 'dnssl')
+            doms.append(dom)
+        lines.append('    DNSSL %s {' % ' '.join(doms))
+        # 生命期优先取 dnssl_life；没这个字段时退回 rdnss_life ——
+        # 直接写 rdnss_life 会让「DNSSL 生命期」这个 label 指向别人的值。
+        lines.append(f"        AdvDNSSLLifetime {v_int(r.get('dnssl_life') or r.get('rdnss_life') or 600, field='DNSSL 生命期', lo=60, hi=9000)};")
         lines.append('    };')
     lines += ['};', '']
     # IPv6 地址池说明块（供人工与后续脚本参考；radvd 本身通过 prefix 段生效）

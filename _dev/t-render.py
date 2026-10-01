@@ -137,5 +137,47 @@ try:
 except render.ValidateError as ex:
     chk('非法网关仍被拒绝', 'IPv4' in str(ex), str(ex))
 
+# ---------------------------------------------------------------- radvd RDNSS
+# RA 通告里根本没有 IPv4 的位置：RDNSS 只能是 IPv6 地址，且多值必须**空格分隔**
+# （逗号形式 radvd 直接 syntax error）。这里原先完全不校验，于是「下发 DNS」
+# 框里顺手填个 223.5.5.5 就会渲染出一份 radvd 读不进去的配置 ——
+# 真机上留下的错误日志就是 "/run/drouter-verify/radvd.conf:18 error: syntax error"，
+# 而界面只回一句英文，完全指不到是哪个字段。
+
+def ra(extra):
+    return render.render_radvd(dict({'iface': 'ens18', 'prefix': 'fd00:7::/64'}, **extra))
+
+for _bad in ('223.5.5.5', '223.5.5.5,119.29.29.29', 'dns.alidns.com',
+             'fd00:7::/64'):
+    try:
+        ra({'rdnss': _bad})
+        chk('RDNSS 拒绝 %r' % _bad, False, '居然通过了')
+    except render.ValidateError as ex:
+        chk('RDNSS 拒绝 %r' % _bad, 'IPv6' in str(ex), str(ex))
+
+_r = ra({'rdnss': 'fd00:7::1 fd00:7::2'})
+chk('RDNSS 多个 IPv6 合并成一行（空格分隔）',
+    re.search(r'^\s*RDNSS fd00:7::1 fd00:7::2 \{$', _r, re.M) is not None)
+_r = ra({'rdnss': 'fd00:7::1,fd00:7::2'})
+chk('RDNSS 逗号列表归一成空格（而不是让 radvd 报 syntax error）',
+    re.search(r'^\s*RDNSS fd00:7::1 fd00:7::2 \{$', _r, re.M) is not None)
+
+_r = ra({'rdnss': 'fd00:7::1', 'dnssl': 'lan,home.lan'})
+chk('DNSSL 支持多域名（空格分隔）',
+    re.search(r'^\s*DNSSL lan home\.lan \{$', _r, re.M) is not None)
+try:
+    ra({'rdnss': 'fd00:7::1', 'dnssl': 'ok.lan,bad@lan'})
+    chk('DNSSL 非法域名被拒绝', False, '居然通过了')
+except render.ValidateError as ex:
+    chk('DNSSL 非法域名被拒绝', 'DNSSL' in str(ex), str(ex))
+
+# DNSSL 生命期原来读的是 rdnss_life —— 「DNSSL 生命期」这个 label 指向别人的值
+chk('DNSSL 生命期优先取 dnssl_life',
+    'AdvDNSSLLifetime 1200;' in ra({'rdnss': 'fd00:7::1', 'dnssl': 'lan',
+                                    'dnssl_life': 1200}))
+chk('没有 dnssl_life 时退回 rdnss_life',
+    'AdvDNSSLLifetime 900;' in ra({'rdnss': 'fd00:7::1', 'dnssl': 'lan',
+                                   'rdnss_life': 900}))
+
 print('\n结果: %s' % ('全部通过' if fails == 0 else '%d 项失败' % fails))
 sys.exit(1 if fails else 0)

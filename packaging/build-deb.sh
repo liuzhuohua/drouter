@@ -13,7 +13,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="${1:-1.0.2}"
+VERSION="${1:-1.0.3}"
 DIST="$HERE/dist"
 PKG="drouter"
 STAGE="$DIST/${PKG}_${VERSION}_all"

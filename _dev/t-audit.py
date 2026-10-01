@@ -249,5 +249,36 @@ chk('helper 暴露了 run_action（供守护复用同一套分发）',
 chk('前端入口破缓存版本号仍在', '?v=' in APP or 'cachebust' in APP.lower()
     or '?v=' in read('web/index.html'))
 
+# ---------------------------------------------------------------- 部署副作用
+# deploy.sh 是唯一会「替用户改机器」的脚本。它最容易犯、也最难被用户归因的错
+# 是**静默回退用户设置** —— 用户只会觉得「部署完之后我的设置莫名其妙变回去了」。
+chk('部署只在「还没有生效主题」时播种 default（不再每次覆写）',
+    'if [ ! -f /etc/drouter/active-theme ]' in DEPLOY
+    and DEPLOY.count('echo "default" > /etc/drouter/active-theme') == 1)
+chk('部署只在 isp-dns.conf 缺失时才补占位（不再擦掉运营商 DNS）',
+    'if [ ! -f /etc/drouter/generated/isp-dns.conf ]' in DEPLOY
+    and DEPLOY.count('cat > /etc/drouter/generated/isp-dns.conf') == 1)
+chk('生效主题指向已不存在的主题时会兜底回退',
+    '_theme_read_active()' in DEPLOY and '_theme_write_active(' in DEPLOY)
+# 清理是本项目唯一会真删文件的模块：无条件传 enabled=true 会把用户在界面上
+# 明确关掉的自动清理重新打开 —— 静默恢复一个「自动删文件」的策略最不该发生。
+chk('部署不再强制打开用户的自动清理开关',
+    'if [ ! -f /etc/drouter/cleanup.conf ]' in DEPLOY)
+chk('清理策略按「已有/新建」分支处理',
+    DEPLOY.count('"op":"save","enabled":true') == 1
+    and "cleanup '{\"op\":\"save\"}'" in DEPLOY)
+
+# ---------------------------------------------------------------- 日志噪声
+# socketserver 默认会把任何异常连整段 traceback 打进 journal（stderr）。
+# 浏览器切页 / 关标签抛的 BrokenPipeError / ConnectionResetError 属于
+# 「对面先挂了」，却足以把 journal 刷满、淹掉真正的报错。
+chk('web 服务用自带 handle_error 的子类',
+    'class _Server(ThreadingHTTPServer)' in WEB
+    and 'super().handle_error(request, client_address)' in WEB)
+chk('不再直接实例化 ThreadingHTTPServer（会把断连打成 traceback）',
+    re.search(r'=\s*ThreadingHTTPServer\(', WEB) is None)
+chk('HTTP 与 HTTPS 两个监听都换成 _Server',
+    'httpd = _Server(' in WEB and 'httpsd = _Server(' in WEB)
+
 print('\n结果: %s' % ('全部通过' if fails == 0 else '%d 项失败' % fails))
 sys.exit(1 if fails else 0)

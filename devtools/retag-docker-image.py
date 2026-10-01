@@ -5,11 +5,11 @@
 
 为什么需要这个脚本
 ------------------
-镜像原本是用 **buildah** 以 root 构建的，标签被钉成 `localhost/drouter:1.0.2`。
+镜像原本是用 **buildah** 以 root 构建的，标签被钉成 `localhost/drouter:1.0.3`。
 `localhost/` 是 Podman 的"本地镜像"约定，Docker 虽然能 load 进来，但这个前缀
 既不好看也容易让人误解（像是某个私服地址）。所以这里把标签改成：
-    主标签  drouter:1.0.2          ← docker load 后直接用这个跑
-    别名    liuzhuohua/drouter:1.0.2  ← 同时打一个带用户名的，方便以后推 Docker Hub
+    主标签  drouter:1.0.3          ← docker load 后直接用这个跑
+    别名    liuzhuohua/drouter:1.0.3  ← 同时打一个带用户名的，方便以后推 Docker Hub
 
 顺带修两个真实缺陷：
 1. 镜像 LABEL 里 `org.opencontainers.image.licenses` 写的是 **GPL-3.0**，
@@ -30,10 +30,10 @@ import os
 import sys
 import tarfile
 
-SRC = sys.argv[1] if len(sys.argv) > 1 else "dist/drouter-1.0.2-docker.tar"
-DST = sys.argv[2] if len(sys.argv) > 2 else "dist/drouter-1.0.2-docker.tar.new"
+SRC = sys.argv[1] if len(sys.argv) > 1 else "dist/drouter-1.0.3-docker.tar"
+DST = sys.argv[2] if len(sys.argv) > 2 else "dist/drouter-1.0.3-docker.tar.new"
 
-NEW_TAGS = ["drouter:1.0.2", "liuzhuohua/drouter:1.0.2"]
+NEW_TAGS = ["drouter:1.0.3", "liuzhuohua/drouter:1.0.3"]
 
 with tarfile.open(SRC, "r:") as tin:
     members = tin.getmembers()

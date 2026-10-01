@@ -290,6 +290,80 @@ def main():
         "('%d KB' % max(1, round(freed / 1024.0)))" in HELPER_SRC)
     chk('试运行文案区别于真删', '试运行，未真正删除' in HELPER_SRC)
 
+    print('\n--- 自动触发的时刻判定（0 点陷阱）---')
+    # 前端 Number(v) || 4 和后端 int(cfg.get('hour') or 4) 都会把用户选的
+    # 「每天 00:00」当成「没填」而改成 04:00 —— 而且前端那条还顺手把 0 也一起吞了，
+    # 于是这个设置在界面上根本存不下来。三处都要锁死。
+    # 注意：要先把注释剥掉再比对 —— 解释「为什么不能这么写」的注释里
+    # 恰恰会引用这段错误写法，直接子串匹配会误报（第一版就踩了）。
+    def code_only(src, marker):
+        return '\n'.join(ln.split(marker, 1)[0] for ln in src.splitlines())
+
+    chk('后端不再用 or 4 取执行小时',
+        "int(cfg.get('hour') or 4)" not in code_only(HELPER_SRC, '#'))
+    chk('后端显式区分 None 与 0', "_raw_hour in (None, '')" in HELPER_SRC)
+    chk('前端回显不再用 c.hour || 4',
+        'c.hour || 4' not in code_only(APP_SRC, '//'))
+    chk('前端保存不再用 Number(...) || 4',
+        "Number($('#cl-hour').value) || 4" not in code_only(APP_SRC, '//'))
+
+    class _Now(object):
+        def __init__(self, hour, today, wd):
+            self.hour = hour
+            self._today = today
+            self._wd = wd
+
+        def weekday(self):
+            return self._wd
+
+        def strftime(self, fmt):
+            return self._today
+
+    class _DT(object):
+        def __init__(self, now):
+            self._now = now
+
+        def now(self):
+            return self._now
+
+    def run_auto(hour, now_hour, last_date, today='2026-10-01', schedule='daily',
+                 trig='both', wd=1, pct=10.0, enabled=True):
+        """返回 (是否真执行了清理, 结果)。today 与 last_date 必须分开传！"""
+        fired = []
+        ns = {
+            'datetime': _DT(_Now(now_hour, today, wd)),
+            'ok': lambda d=None, m='ok': {'ok': True, 'data': d, 'msg_cn': m},
+            '_clean_load': lambda: {'enabled': enabled, 'trigger': trig,
+                                    'disk_percent': 85, 'schedule': schedule,
+                                    'hour': hour, 'max_mb_per_run': 0},
+            '_disk_usage': lambda p: (100, pct, 100 - pct),
+            '_clean_state_load': lambda: {'last_date': last_date},
+            '_clean_do': lambda p, dry=False, auto=False: (fired.append(p), {'ok': True})[1],
+        }
+        ns = build(['_clean_auto'], ns)
+        # 必须先调用再取 fired —— 写成 `return bool(fired), ns['_clean_auto']()`
+        # 的话，元组是从左到右求值的，bool(fired) 会在函数真正执行前就算好。
+        result = ns['_clean_auto']()
+        return bool(fired), result
+
+    chk('hour=0、当前 0 点 → 触发（0 不能被当成没填）',
+        run_auto(0, 0, '2026-09-30')[0])
+    chk('hour=0 且今天跑过 → 不重复触发', not run_auto(0, 0, '2026-10-01')[0])
+    chk('hour=4、当前 3 点 → 未到点不触发', not run_auto(4, 3, '2026-09-30')[0])
+    chk('hour=4、当前 5 点 → 当天补做（关机错过 4 点也不漏）',
+        run_auto(4, 5, '2026-09-30')[0])
+    chk('hour=23、当前 5 点 → 未到点不触发', not run_auto(23, 5, '2026-09-30')[0])
+    # datetime.weekday()：周一=0，周日=6（注意别按「周日=0」的直觉写）
+    chk('每周一：周一 5 点（计划 4 点）补做',
+        run_auto(4, 5, '2026-09-30', schedule='weekly', wd=0)[0])
+    chk('每周一：周二不触发',
+        not run_auto(4, 5, '2026-09-30', schedule='weekly', wd=1)[0])
+    chk('每周一：周三不触发',
+        not run_auto(4, 5, '2026-09-30', schedule='weekly', wd=2)[0])
+    chk('水位触发与时刻无关',
+        run_auto(4, 3, '2026-10-01', trig='disk', pct=90.0)[0])
+    chk('总开关关了就不跑', not run_auto(0, 0, '2026-09-30', enabled=False)[0])
+
     print('\n' + '=' * 60)
     print('通过 %d 项，失败 %d 项' % (PASS, FAIL))
     return 1 if FAIL else 0

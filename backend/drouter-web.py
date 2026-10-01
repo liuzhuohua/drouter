@@ -1811,7 +1811,7 @@ def build_openapi(base):
         'openapi': '3.0.3',
         'info': {
             'title': 'Drouter 通用管理 API',
-            'version': '1.0.2',
+            'version': '1.0.3',
             'description': ('Drouter（Debian 13 拼装主路由）的统一 REST 接口。'
                             '任意语言 / 框架（curl、Python、Node、Go、PHP、Java、.NET、'
                             'Shell、Postman、工单系统、IoT 网关）均可直接调用。'
@@ -2016,6 +2016,27 @@ def _inject_asset_version(raw):
     return _ASSET_RE.sub(sub, text).encode('utf-8')
 
 
+class _Server(ThreadingHTTPServer):
+    """静默掉「客户端自己先断开」这类噪声。
+
+    socketserver 默认的 handle_error 会把**任何**异常连整段 traceback 打到
+    stderr（也就是 journal）。而浏览器切页、关标签、取消长请求时都会抛出
+    BrokenPipeError / ConnectionResetError —— 那不是服务端的错，却足以把
+    journal 刷满，让真正的报错被淹掉（本机实测 3 天攒了几十条）。
+    这里只吞掉这三类「对面先挂了」的异常，其余异常照旧往外抛。
+    """
+
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[0]
+        if exc is not None and issubclass(
+                exc, (BrokenPipeError, ConnectionResetError,
+                      ConnectionAbortedError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = 'drouter/1.0'
     protocol_version = 'HTTP/1.1'
@@ -2202,13 +2223,13 @@ def main():
     crt, key = ensure_cert()
     threading.Thread(target=gc_sessions, daemon=True).start()
 
-    httpd = ThreadingHTTPServer((HOST, PORT_HTTP), Handler)
+    httpd = _Server((HOST, PORT_HTTP), Handler)
     httpd.daemon_threads = True
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     try:
         ctx.load_cert_chain(crt, key)
-        httpsd = ThreadingHTTPServer((HOST, PORT_HTTPS), Handler)
+        httpsd = _Server((HOST, PORT_HTTPS), Handler)
         httpsd.socket = ctx.wrap_socket(httpsd.socket, server_side=True)
         httpsd.daemon_threads = True
         threading.Thread(target=httpsd.serve_forever, daemon=True).start()

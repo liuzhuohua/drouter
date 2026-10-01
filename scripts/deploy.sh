@@ -49,8 +49,27 @@ install -m 0644 $SRC/backend/drouter-helpd.py  $OPT/backend/drouter-helpd.py
 
 # 主题之家（#12）：自定义主题目录 + 生效主题标记
 mkdir -p /etc/drouter/themes
-echo "default" > /etc/drouter/active-theme
+# 只在「还没有生效主题」时播种默认值。
+# 这里原来是无条件 `echo default > active-theme` —— 每次部署都把用户自己
+# 挑的主题打回默认，用户只会看到「部署完样式莫名其妙变回去了」。
+# 容器版 docker-init.sh 一直是「首次为空时才写」，两处行为保持一致。
+if [ ! -f /etc/drouter/active-theme ]; then
+  echo "default" > /etc/drouter/active-theme
+fi
 chmod 644 /etc/drouter/active-theme
+# 记录的生效主题如果指向一个已不存在的主题（自定义主题目录被删/id 写错），
+# 界面会一直挂着一个「不存在」的生效主题，且只能手改文件才出得来。这里兜底回退。
+python3 - <<'PY' || true
+import importlib.util
+spec = importlib.util.spec_from_file_location(
+    'drouter_helper', '/opt/drouter/backend/drouter-helper.py')
+h = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(h)
+tid = h._theme_read_active()
+if h._theme_find(tid) is None:
+    h._theme_write_active('default')
+    print('生效主题 %r 已不存在，已回退 default' % tid)
+PY
 
 echo "=== 3. 安装前端 ==="
 install -m 0644 $SRC/web/index.html $OPT/web/index.html
@@ -306,11 +325,17 @@ SHD
 echo "Web 终端守护单元已就位"
 
 echo "=== 9. 生成 isp-dns 占位文件（dnsmasq resolv-file 引用）==="
+# 只在缺失时补占位。这个文件是 pppd 拨号成功后经 bin/sync-isp-dns.sh 写入的
+# 真实运营商 DNS；无条件覆盖会把已经拿到的 DNS 擦掉，在那之后 dnsmasq 的
+# 上游解析一直空着，直到下一次拨号才会恢复（表现为「重新部署后网页解析变慢」）。
+# 容器版 docker-init.sh 同样是「缺失才写」。
+if [ ! -f /etc/drouter/generated/isp-dns.conf ]; then
 cat > /etc/drouter/generated/isp-dns.conf <<'ISP'
 # 由 drouter 自动维护：运营商 PPPoE 下发的 DNS
 # 拨号成功后由 pppd 的 usepeerdns 写入 /etc/ppp/resolv.conf，
 # 可执行 /opt/drouter/bin/sync-isp-dns.sh 将其同步到此处。
 ISP
+fi
 
 cat > $OPT/bin/sync-isp-dns.sh <<'SYNC'
 #!/bin/bash
@@ -358,10 +383,19 @@ systemctl is-active drouter-snapshot.timer 2>&1 || true
 echo "--- 紧急救援通道（默认关闭）---"
 systemctl is-active drouter-rescue 2>&1 || true
 echo "--- 磁盘与日志清理定时器（默认开启）---"
-# 单元与入口脚本由 helper 的 cleanup save 动作生成（默认参数即推荐值），
-# 这里只负责在部署时把它建立起来 —— 用户之后在界面改策略会重新生成。
-/usr/bin/python3 $OPT/backend/drouter-helper.py cleanup '{"op":"save","enabled":true}' \
-    >/dev/null 2>&1 && echo "清理策略已初始化" || echo "⚠ 清理策略初始化失败（界面保存一次即可恢复）"
+# 单元与入口脚本由 helper 的 cleanup save 动作生成（默认参数即推荐值）。
+# 关键点：**只在新机器上才传 enabled=true**。
+# _clean_save_op 是合并式保存，无条件传 enabled=true 会把用户在界面上明确
+# 关掉的自动清理重新打开 —— 而清理是本项目唯一会真删文件的模块，
+# 静默恢复一个「自动删文件」的策略是所有副作用里最不该发生的。
+if [ ! -f /etc/drouter/cleanup.conf ]; then
+    /usr/bin/python3 $OPT/backend/drouter-helper.py cleanup '{"op":"save","enabled":true}' \
+        >/dev/null 2>&1 && echo "清理策略已按推荐值初始化" || echo "⚠ 清理策略初始化失败（界面保存一次即可恢复）"
+else
+    # 已有策略：只重建单元文件，enabled / trigger / items 全部沿用用户设置
+    /usr/bin/python3 $OPT/backend/drouter-helper.py cleanup '{"op":"save"}' \
+        >/dev/null 2>&1 && echo "清理策略沿用已有设置（未改动用户开关）" || echo "⚠ 清理单元重建失败（界面保存一次即可恢复）"
+fi
 systemctl is-active drouter-cleanup.timer 2>&1 || true
 echo "--- 常驻执行守护 ---"
 # 必须 restart 而不是 enable --now：守护把 helper 代码常驻在内存里，

@@ -3542,8 +3542,10 @@ function cleanupRenderDisk() {
 
 function cleanupRenderPolicy() {
   const c = (CLEAN_DATA && CLEAN_DATA.config) || {};
+  // 0 点是合法值（falsy），不能写 c.hour || 4 —— 配了 00:00 会显示成 04:00
+  const cHour = (c.hour === 0 || c.hour) ? Number(c.hour) : 4;
   const hours = Array.from({ length: 24 }, (_, i) =>
-    `<option value="${i}"${i === Number(c.hour || 4) ? ' selected' : ''}>${String(i).padStart(2, '0')}:00</option>`).join('');
+    `<option value="${i}"${i === cHour ? ' selected' : ''}>${String(i).padStart(2, '0')}:00</option>`).join('');
   const st = (CLEAN_DATA && CLEAN_DATA.state) || {};
   $('#cl-policy').innerHTML = `
     <div class="row" style="align-items:center">
@@ -3640,7 +3642,8 @@ async function cleanupSave() {
     trigger: $('#cl-trigger').value,
     disk_percent: Number($('#cl-pct').value) || 85,
     schedule: $('#cl-sched').value,
-    hour: Number($('#cl-hour').value) || 4,
+    // 同上：0 点是合法值，`Number(v) || 4` 会把 00:00 静默改成 04:00
+    hour: ($('#cl-hour').value === '' ? 4 : Number($('#cl-hour').value)),
     max_mb_per_run: Number($('#cl-max').value) || 0,
     items: items,
   };
