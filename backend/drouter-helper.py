@@ -10933,6 +10933,18 @@ CONFIG_ONLY_MODULES = {
 }
 
 
+def _missing_dev_nodes():
+    """预检依赖的标准设备节点里，哪些缺失。
+
+    这几个节点在任何正常 Linux 上都必然存在。它们由内核的 devtmpfs 创建，
+    但**一旦被 rm 删掉，内核不会自动重建** —— 于是会静默缺很久，直到某个
+    程序用到它才炸。2026-09-30 一次 chroot 的 `mount --bind /dev` 事故就
+    清空过宿主机的整个 /dev（当时只补回了 /dev/null）。
+    """
+    return [p for p in ('/dev/urandom', '/dev/random', '/dev/zero', '/dev/tty')
+            if not os.path.exists(p)]
+
+
 def _verify(module, files):
     """写入临时文件后做语法预检。返回 (ok, msg)"""
     # 校验目录必须是一路 0755 都能 traverse 进来的：radvd 这类守护会降权后读配置，
@@ -10952,7 +10964,20 @@ def _verify(module, files):
         if module == 'dnsmasq':
             rc, _o, e = sh(['dnsmasq', '--test', '-C', tmp])
             if rc != 0:
-                return False, '配置语法检查未通过：%s' % (e or _o or '未知错误')
+                msg = (e or _o or '').strip()
+                # dnsmasq 预检时要读 /dev/urandom 来播种随机数。机器的 /dev
+                # 节点被误删时，它会抛 "failed to seed the random number
+                # generator: 没有那个文件或目录" —— 这句话里完全没有 "dev"
+                # 或 "设备" 的字样，用户只会以为是自己配置写错了。
+                if 'seed the random number generator' in msg:
+                    miss = _missing_dev_nodes()
+                    return False, (
+                        '配置语法检查未通过：dnsmasq 读不到随机数设备。'
+                        '本机缺少 %s —— 这是**系统层面的 /dev 节点缺失**，'
+                        '不是本次配置写错了（节点被删后内核不会自动重建，'
+                        '重启机器或重新 mknod 即可恢复）。'
+                        % ('、'.join(miss) if miss else '/dev/urandom'))
+                return False, '配置语法检查未通过：%s' % (msg or '未知错误')
         elif module == 'radvd':
             rc, _o, e = sh(['radvd', '-c', '-C', tmp])
             if rc != 0:

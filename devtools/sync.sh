@@ -51,6 +51,9 @@ PY
 # 而 kernel.pty.nr 是 0（一个都没用），排查起来极其费时。
 # 这里钉住「启动自愈 + 失败重试 + 可定位的诊断信息」三件事。
 "$PYBIN" _dev/t-pty.py || { echo "❌ PTY 可用性预检失败"; exit 1; }
+# 配置预检分诊：dnsmasq 报「seed the random number generator」时，要翻译成
+# 「本机 /dev 节点缺失」这种能直接定位的提示，而不是把内核英文原样抛出
+"$PYBIN" _dev/t-verify.py || { echo "❌ 配置预检分诊失败"; exit 1; }
 # 终端模拟器行为：ANSI 光标 / 颜色 / 换行 / 分帧中文，在 node 里真跑一遍前端代码
 "$NODEBIN" _dev/t-webterm.js || { echo "❌ 终端模拟器预检失败"; exit 1; }
 # 依赖自检清单：一键安装绝不能把 xfce4 / samba / docker 这类可选大件一起装上
