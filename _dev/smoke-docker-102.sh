@@ -1,14 +1,14 @@
 #!/bin/bash
 # 容器成品镜像冒烟（第二段）：登录 + Web 终端建会话 + 接口抽查
-# 重点验证 1.0.1 的两条修复：
+# 重点验证 1.0.2 的两条修复：
 #   ① 容器里没有 systemd，终端守护仍能被拉起（_shelld_spawn 回退路径）
 #   ② /dev/ptmx 存在，PTY 能开
 # 用 --network none：不碰宿主网络，只在容器内自测 127.0.0.1。
 set -u
 
-TAR=/tmp/drouter-101-final.tar
-NAME=drouter-smoke101
-IMG=drouter:1.0.1
+TAR=/tmp/drouter-102-final.tar
+NAME=drouter-smoke102
+IMG=drouter:1.0.2
 BASE=https://127.0.0.1:8443
 PODMAN="podman"
 

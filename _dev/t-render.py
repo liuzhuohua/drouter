@@ -50,5 +50,92 @@ chk('空模块名被拒绝', (not r5['ok']) and r5['code'] == 'NO_MODULE', '→ 
 r6 = fn({'module': 'nonsense'})
 chk('未知模块返回中文错误', (not r6['ok']) and '未知' in r6['msg_cn'], '→ ' + r6['msg_cn'])
 
+# ---------------------------------------------------------------- dnsmasq
+# code 3 / 6 有专属字段，但「自定义 Options」表也能写同一个 code。
+# 1.0.1 及更早会渲染成**重复的 dhcp-option 行**（dnsmasq 对 3/6 是追加语义），
+# 客户端因此收到重复值、DNS 顺序也被搅乱。这里锁死合并后的行为。
+
+def opt_lines(text, code):
+    """取某个 code 的**非 force** dhcp-option 行的值"""
+    return re.findall(r'^dhcp-option=%s,(.*)$' % code, text, re.M)
+
+
+def dup_codes(text):
+    """被重复下发的 code（只算非 force 行；force 行与普通行共存是合法的）"""
+    codes = re.findall(r'^dhcp-option=(\d+),', text, re.M)
+    return sorted({c for c in codes if codes.count(c) > 1})
+
+
+print('\n--- dnsmasq：code 3 / 6 不得渲染出重复行（1.0.2）---')
+
+# 用户真机上那份配置：专属字段与自定义表都写了 3/6
+CFG_DUP = {
+    'lan_iface': 'ens18', 'domain': 'lan', 'dhcp_enabled': True,
+    'pool_start': '192.168.7.1', 'pool_end': '192.168.7.154',
+    'pool_netmask': '255.255.255.0', 'lease_time': 43200,
+    'option_gateway': '192.168.7.3',
+    'option_dns': '223.5.5.5,119.29.29.29',
+    'options': [
+        {'enabled': True, 'code': '6', 'value': '192.168.7.3'},
+        {'enabled': True, 'code': '3', 'value': '192.168.7.3'},
+    ],
+    'dns_mode': 'custom', 'dns_custom': '223.5.5.5,119.29.29.29',
+}
+t = render.render_dnsmasq(CFG_DUP)
+for _l in t.split('\n'):
+    if _l.startswith('dhcp-'):
+        print('    ', _l)
+chk('没有任何 code 被重复下发', dup_codes(t) == [], str(dup_codes(t)))
+chk('code 3 只有一行', len(opt_lines(t, 3)) == 1, str(opt_lines(t, 3)))
+chk('code 3 的值已去重', opt_lines(t, 3) == ['192.168.7.3'], str(opt_lines(t, 3)))
+chk('code 6 只有一行', len(opt_lines(t, 6)) == 1, str(opt_lines(t, 6)))
+chk('code 6 合并了自定义值', opt_lines(t, 6) == ['223.5.5.5,119.29.29.29,192.168.7.3'],
+    str(opt_lines(t, 6)))
+
+# 专属字段留空时，自定义表里的 3/6 不能被吞掉
+t2 = render.render_dnsmasq(dict(CFG_DUP, option_gateway='', option_dns='',
+    options=[{'enabled': True, 'code': '3', 'value': '192.168.7.1'}]))
+chk('专属字段为空时自定义 3 仍输出', opt_lines(t2, 3) == ['192.168.7.1'], str(opt_lines(t2, 3)))
+chk('专属字段为空时不下发 code 6', opt_lines(t2, 6) == [], str(opt_lines(t2, 6)))
+
+# 去重要保序：先出现的先保留
+t3 = render.render_dnsmasq(dict(CFG_DUP, option_dns='223.5.5.5,1.1.1.1',
+    options=[{'enabled': True, 'code': '6', 'value': '1.1.1.1,8.8.8.8'}]))
+chk('顺序去重且保留首次出现顺序', opt_lines(t3, 6) == ['223.5.5.5,1.1.1.1,8.8.8.8'],
+    str(opt_lines(t3, 6)))
+
+# 带「强制」的 3/6 语义不同（客户端未请求也要下发），不能并进普通行
+t4 = render.render_dnsmasq(dict(CFG_DUP, options=[
+    {'enabled': True, 'code': '3', 'value': '192.168.7.9', 'force': True},
+    {'enabled': True, 'code': '3', 'value': '192.168.7.9'},
+]))
+chk('force 的 3 走 dhcp-option-force', 'dhcp-option-force=3,192.168.7.9' in t4)
+chk('非 force 的 3 合并成一行', opt_lines(t4, 3) == ['192.168.7.3,192.168.7.9'],
+    str(opt_lines(t4, 3)))
+
+# 其它 code 必须完全不受影响
+t5 = render.render_dnsmasq(dict(CFG_DUP, options=[
+    {'enabled': True, 'code': '43', 'value': 'abc.example.com'},
+    {'enabled': True, 'code': '121', 'value': '10.0.0.0/8,192.168.7.3'},
+    {'enabled': True, 'code': '121', 'value': '1.2.3.0/24,192.168.7.3', 'force': True},
+]))
+chk('其它 code 原样输出', 'dhcp-option=43,abc.example.com' in t5)
+chk('其它 code 的 force 保留', 'dhcp-option-force=121,1.2.3.0/24,192.168.7.3' in t5)
+chk('121 两行是允许的（值不同）', len(re.findall(r'^dhcp-option(?:-force)?=121,', t5, re.M)) == 2)
+
+# 预览接口走的是 helper 的 read_render_text，必须与直接渲染一致
+p = fn({'module': 'dnsmasq', 'cfg': CFG_DUP})
+chk('预览路径同样不重复', p['ok'] and dup_codes(p['data']['text']) == [],
+    str(dup_codes(p['data']['text'])) if p['ok'] else p.get('msg_cn'))
+chk('预览里 code 3 也是一行', p['ok'] and opt_lines(p['data']['text'], 3) == ['192.168.7.3'],
+    str(opt_lines(p['data']['text'], 3)) if p['ok'] else '-')
+
+# 校验不能被放松
+try:
+    render.render_dnsmasq(dict(CFG_DUP, option_gateway='1.2.3.999'))
+    chk('非法网关仍被拒绝', False, '居然没抛异常')
+except render.ValidateError as ex:
+    chk('非法网关仍被拒绝', 'IPv4' in str(ex), str(ex))
+
 print('\n结果: %s' % ('全部通过' if fails == 0 else '%d 项失败' % fails))
 sys.exit(1 if fails else 0)

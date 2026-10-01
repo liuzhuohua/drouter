@@ -4961,7 +4961,7 @@ def _dcfg_check_bip(s):
     warn = ''
     if _dcfg_subnet_in_use(net):
         warn = ('这个网段和本机现有网卡的网段重叠，容器网络可能和局域网打架。'
-                '换一个不冲突的私网段（例如 172.31.0.1/16）更保险')
+                '换一个不冲突的私网段（例如 172.31.0.2/16）更保险')
     return True, str(net), '', warn
 
 

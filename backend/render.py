@@ -176,20 +176,45 @@ def render_dnsmasq(cfg):
         netmask = v_ipv4(cfg.get('pool_netmask') or '255.255.255.0', field='子网掩码')
         lease = v_int(cfg.get('lease_time') or 7200, field='租期', lo=120, hi=604800)
         lines.append(f'dhcp-range={pool_start},{pool_end},{netmask},{lease}s')
-        gw = (cfg.get('option_gateway') or '').strip()
-        if gw:
-            lines.append(f'dhcp-option=3,{v_ipv4(gw, field="Option 3 网关")}')
-        dns = (cfg.get('option_dns') or '').strip()
-        if dns:
-            lines.append(f'dhcp-option=6,{",".join(v_ipv4_list(dns, field="Option 6 DNS"))}')
-        # 自定义任意 option
+        # code 3 / 6 有专属字段，但下面的「自定义 Options」表同样可以写这两个 code。
+        # 两处都填时 dnsmasq 会把值**追加**（3/6 是列表型 option），于是下发成
+        #   dhcp-option=3,192.168.7.3        ← 专属字段
+        #   dhcp-option=3,192.168.7.3        ← 自定义表
+        # 客户端因此收到重复值，DNS 列表顺序也会被搅乱。
+        # 这里按 code 归并成**一行**：专属字段在前，自定义值追加在后，顺序去重。
+        # （每处各自仍受 v_ipv4_list 的 8 条上限约束；合并后不再二次限制，
+        #   免得把历史上能保存的配置变成保存失败。）
+        merged = {
+            '3': v_ipv4_list(cfg.get('option_gateway'), field='Option 3 网关'),
+            '6': v_ipv4_list(cfg.get('option_dns'), field='Option 6 DNS'),
+        }
+        forced = []   # 带「强制」的 3/6 行没法并进普通行，保持单独输出
+        others = []   # 其余 code 原样输出
         for opt in cfg.get('options') or []:
             if not v_bool(opt.get('enabled')):
                 continue
             code = v_option_code(opt.get('code'))
             val = v_option_value(opt.get('value'), code)
             force = v_bool(opt.get('force'))
+            key = str(code)
+            if key not in merged:
+                others.append((code, val, force))
+            elif force:
+                forced.append((code, val))
+            else:
+                merged[key].extend(val.split(','))
+        for code in ('3', '6'):
+            seen, vals = set(), []
+            for item in merged[code]:
+                if item not in seen:
+                    seen.add(item)
+                    vals.append(item)
+            if vals:
+                lines.append('dhcp-option=%s,%s' % (code, ','.join(vals)))
+        for code, val, force in others:
             lines.append(f'dhcp-option{"-force" if force else ""}={code},{val}')
+        for code, val in forced:
+            lines.append(f'dhcp-option-force={code},{val}')
         # 静态绑定
         for sl in cfg.get('static_leases') or []:
             if not v_bool(sl.get('enabled')):

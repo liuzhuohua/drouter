@@ -167,12 +167,10 @@ def init_db():
             'domain': 'lan', 'dhcp_enabled': False, 'pool_start': '192.168.7.100',
             'pool_end': '192.168.7.200', 'pool_netmask': '255.255.255.0', 'lease_time': 7200,
             'option_gateway': '192.168.7.3', 'option_dns': '192.168.7.3',
-            'options': [
-                {'enabled': False, 'code': 6, 'value': '223.5.5.5', 'force': False,
-                 'remark': 'DNS 服务器'},
-                {'enabled': False, 'code': 3, 'value': '192.168.7.3', 'force': False,
-                 'remark': '默认网关'},
-            ],
+            # code 3 / 6 由上面的 option_gateway / option_dns 专属字段负责。
+            # 这里**不再预置**同名 code —— 两处并存的写法会渲染出重复的
+            # dhcp-option 行（1.0.1 及更早的默认值就是这样，1.0.2 去掉）。
+            'options': [],
             'static_leases': [],
             'dns_mode': 'custom', 'dns_custom': '223.5.5.5,119.29.29.29',
             'dns_lan_server': '', 'dns_cache_size': 1000, 'dns_negcache': True,
@@ -1813,7 +1811,7 @@ def build_openapi(base):
         'openapi': '3.0.3',
         'info': {
             'title': 'Drouter 通用管理 API',
-            'version': '1.0.1',
+            'version': '1.0.2',
             'description': ('Drouter（Debian 13 拼装主路由）的统一 REST 接口。'
                             '任意语言 / 框架（curl、Python、Node、Go、PHP、Java、.NET、'
                             'Shell、Postman、工单系统、IoT 网关）均可直接调用。'

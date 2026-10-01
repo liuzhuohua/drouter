@@ -10,7 +10,7 @@
 #         --network host --cap-add NET_ADMIN --cap-add NET_RAW \
 #         -v drouter-data:/opt/drouter/data \
 #         -v drouter-etc:/etc/drouter \
-#         drouter:1.0.1
+#         drouter:1.0.2
 # =============================================================================
 FROM debian:trixie-slim
 

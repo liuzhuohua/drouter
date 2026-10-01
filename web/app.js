@@ -1249,10 +1249,11 @@ function viewDhcp() {
     <div class="card">
       <h3>DHCP Options（RouterOS 风格）</h3>
       <p class="desc">对应 <span class="mono">dhcp-option=&lt;code&gt;,&lt;value&gt;</span>。
-      <b>code 3</b> = 默认网关，<b>code 6</b> = DNS 服务器。可自由添加任意 code（如 43、121 等）。</p>
+      <b>code 3</b> = 默认网关，<b>code 6</b> = 客户端该用哪台 DNS（一般填<b>本机</b>地址，由本机再转发到上游，
+      <b>不是</b>填上游 DNS）。可自由添加任意 code（如 43、121 等）。</p>
       <div class="row" style="margin-bottom:12px">
         <label style="flex:0 0 160px">Option code 3 · 网关<input id="op-gw" value="${esc(d.option_gateway || '')}" placeholder="192.168.7.3"></label>
-        <label style="flex:0 0 260px">Option code 6 · DNS<input id="op-dns" value="${esc(d.option_dns || '')}" placeholder="223.5.5.5,119.29.29.29"></label>
+        <label style="flex:0 0 260px">Option code 6 · DNS<input id="op-dns" value="${esc(d.option_dns || '')}" placeholder="192.168.7.3"></label>
       </div>
       <table><thead><tr><th style="width:44px">启用</th><th style="width:90px">Code</th>
         <th>值（Value）</th><th style="width:150px">备注</th><th style="width:88px">强制</th><th style="width:64px"></th></tr></thead>
@@ -1266,7 +1267,9 @@ function viewDhcp() {
         <td><button class="small danger op-del" data-i="${i}">删除</button></td></tr>`).join('')}
       </tbody></table>
       <div style="margin-top:12px"><button class="small" id="op-add">+ 添加自定义 Option</button></div>
-      <p class="hint-inline">提示：勾选「强制」会使用 dhcp-option-force，即使客户端未请求也会下发。</p>
+      <p class="hint-inline">提示：勾选「强制」会使用 dhcp-option-force，即使客户端未请求也会下发。
+      code 3 / 6 请优先用上面的专属字段 —— 下表里重复写同一个 code 不会报错，
+      会与专属字段**合并成一行**（顺序去重），所以不必担心写出重复指令。</p>
     </div>
     <div class="card">
       <h3>静态地址绑定</h3>
