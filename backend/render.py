@@ -94,9 +94,15 @@ def v_int(v, field='值', lo=0, hi=65535, default=None, allow_empty=False):
         if default is not None:
             return default
         raise ValidateError(f'{field}不能为空', field)
-    if not s.isdigit():
+    # 必须先看 ascii 再看 digit：'²'（上标二）、'٣'（阿拉伯数字）这类
+    # Unicode 字符 str.isdigit() 也是 True，但 int('²') 会直接抛 ValueError ——
+    # 那就不走 ValidateError，而是变成一个 500 + traceback，页面只剩「请求失败」。
+    if not (s.isascii() and s.isdigit()):
         raise ValidateError(f'{field}必须是数字：{s}', field)
-    n = int(s)
+    try:
+        n = int(s)
+    except Exception:
+        raise ValidateError(f'{field}必须是数字：{s}', field)
     if n < lo or n > hi:
         raise ValidateError(f'{field}必须在 {lo} ~ {hi} 之间', field)
     return n
@@ -131,6 +137,53 @@ def v_choice(v, choices, field='值'):
     return v
 
 
+CTRL_RE = re.compile(r'[\x00-\x1f\x7f]')
+
+
+def v_text(v, field='值', maxlen=128, allow_empty=False, pattern=None):
+    """渲染进配置文件的自由文本：必须过滤换行与控制字符。
+
+    这类字段看着最无害，风险却最大 —— 配置都是一行一条指令，用户填的值里
+    只要有一个 \\n，后面那一截就会变成新的配置行（往 radvd.conf 里加一个
+    prefix、往 peers 文件里加一个 noauth、往 miniupnpd.conf 里改哪条链，
+    都是灾难），而界面只会回一句英文 syntax error，指不到是哪个输入框。
+    所以凡是「拿用户原话直接拼进配置行」的地方，都必须先过这里。
+    """
+    v = (v or '').strip()
+    if not v:
+        if allow_empty:
+            return ''
+        raise ValidateError(f'{field}不能为空', field)
+    if CTRL_RE.search(v):
+        raise ValidateError(f'{field}不能包含换行或不可见控制字符', field)
+    if len(v) > maxlen:
+        raise ValidateError(f'{field}过长（最多 {maxlen} 个字符）', field)
+    if pattern is not None:
+        m = pattern.match(v) if hasattr(pattern, 'match') else re.match(pattern, v)
+        if not m:
+            raise ValidateError(f'{field}含不支持的字符：{v}', field)
+    return v
+
+
+def v_ipv6_suffix(v, field='IPv6 后缀'):
+    """dhcpcd 的 ia_pd 第 5 段（SLA-ID 后缀），形如 ::1 / 1 / 0:0:0:1。
+
+    页面上的默认值是 ::1，用户也可能只填 1 或写成 0:0:0:2。统一按
+    IPv6 地址校验（不完整的写法补 :: 前缀再解析），既能挡住注入，
+    也能把 SLA-ID 写错导致的 ia_pd 配置失效挡在保存之前。
+    """
+    v = (v or '').strip()
+    if not v:
+        return '::1'
+    if CTRL_RE.search(v) or not re.match(r'^[0-9a-fA-F:]{1,39}$', v):
+        raise ValidateError(f'{field}只能由十六进制数字与冒号组成：{v}', field)
+    cand = v if ':' in v else ('::' + v)
+    try:
+        return str(ipaddress.IPv6Address(cand))
+    except Exception:
+        raise ValidateError(f'{field}不是合法的 IPv6 后缀：{v}（示例 ::1）', field)
+
+
 def v_option_code(v):
     return v_int(v, field='DHCP Option Code', lo=1, hi=254)
 
@@ -154,6 +207,15 @@ def v_option_value(v, code):
 def render_dnsmasq(cfg):
     """cfg 结构见 web 配置：lan_iface / pool / options / dns / static_leases"""
     lan = v_ifname(cfg.get('lan_iface') or '', field='LAN 接口')
+    # domain / log_file 原先是直接取用户原值拼进配置行的：同段的 pool、
+    # option 都有校验，唯独这两个漏了。后果不只是「填错 dnsmasq 起不来」——
+    # 值里带一个换行就能凭空造出一条新指令（比如再插一条 dhcp-range），
+    # 而界面只回一句英文语法错误，看不出是哪个输入框的问题。
+    domain = v_text(cfg.get('domain') or 'lan', field='局域网域名',
+                    maxlen=253, pattern=DOMAIN_RE)
+    log_file = (v_path(cfg.get('log_file'), field='dnsmasq 日志文件')
+                if (cfg.get('log_file') or '').strip()
+                else '/var/log/drouter/dnsmasq.log')
     lines = [
         '# 由 drouter 自动生成，请勿手工修改',
         '# 模块：dnsmasq（DHCPv4 + DNS 转发）',
@@ -164,7 +226,7 @@ def render_dnsmasq(cfg):
         'domain-needed',
         'bogus-priv',
         'expand-hosts',
-        f"domain={cfg.get('domain') or 'lan'}",
+        f'domain={domain}',
         'local=/lan/',
         '',
         '# ---- DHCPv4 地址池 ----',
@@ -242,12 +304,12 @@ def render_dnsmasq(cfg):
             continue
         lines.append(f'server={s}')
     if cfg.get('dns_lan_server'):
-        lines.append(f"server=/{cfg.get('domain') or 'lan'}/{v_ipv4(cfg.get('dns_lan_server'), field='内网 DNS')}")
+        lines.append(f'server=/{domain}/{v_ipv4(cfg.get("dns_lan_server"), field="内网 DNS")}')
     lines += [
         f"cache-size={v_int(cfg.get('dns_cache_size') or 1000, field='DNS 缓存', lo=0, hi=20000)}",
         'no-negcache' if not v_bool(cfg.get('dns_negcache', True)) else '',
         'log-queries' if v_bool(cfg.get('dns_query_log')) else '',
-        f"log-facility={cfg.get('log_file') or '/var/log/drouter/dnsmasq.log'}",
+        f'log-facility={log_file}',
         'dhcp-leasefile=/var/lib/misc/dnsmasq.leases',
     ]
     return '\n'.join([l for l in lines if l != '']) + '\n'
@@ -614,7 +676,9 @@ def _pf_rules(cfg, fam, family_kw):
                 ip = v_ipv4(ip, '端口转发第 %d 条内网 IP' % (i + 1))
             else:
                 ip = v_ipv6(ip, '端口转发第 %d 条内网 IPv6' % (i + 1))
-            name = (r.get('name') or '').replace('"', '')[:40]
+            # 备注整串写进 comment "…"，原先只删了双引号：留下换行同样能
+            # 闭合注释、再起一行任意 nft 指令。这里连同控制字符一起去掉。
+            name = CTRL_RE.sub('', str(r.get('name') or '').replace('"', ''))[:40].strip()
             cmt = name or ('端口转发 %d' % (i + 1))
             protos = ['tcp', 'udp'] if proto == 'tcp/udp' else [proto]
             for pr in protos:
@@ -640,16 +704,34 @@ def _pf_rules(cfg, fam, family_kw):
             host = v_ipv6(host, 'DMZ 主机 IPv6')
         wan = v_ifname(cfg.get('wan_iface') or 'ppp0', field='WAN 接口')
         dest = '[' + host + ']' if fam == '6' else host
-        # 排除到本机自身的流量，避免把管理口也转走
+        # 到本机自身的流量必须先放行，否则 DMZ 会把管理口一并转走。
+        #
+        # 原先写的是 `daddr != <DMZ 主机> dnat to <DMZ 主机>`，这个条件是反的：
+        # 它排除的正是「本来就要发给 DMZ 主机」的包（不 DNAT 也照样走到它），
+        # 而真正需要保护的、发往本机 WAN 地址的流量（SSH 22、面板 8443/8080）
+        # 反而全部命中规则、被丢到内网那台 DMZ 主机上 —— 也就是注释声称要
+        # 避免的那件事，恰好是这条规则在做的事。表现是「一开 DMZ，路由器
+        # 自己就登不上了」，而且很难联想到是 DMZ 干的。
+        #
+        # fib daddr type local 判断目的地址是否属于本机（含本机所有地址），
+        # accept 只结束本条 prerouting 链的后续规则、不再做 DNAT。
         nat_lines.append(
-            '    iifname "%s" %s daddr != %s dnat to %s comment "DMZ 全端口映射"'
-            % (wan, family_kw, dest, dest))
+            '    iifname "%s" fib daddr type local accept comment "到本机自身的流量不进 DMZ"'
+            % wan)
+        nat_lines.append(
+            '    iifname "%s" %s dnat to %s comment "DMZ 全端口映射"'
+            % (wan, family_kw, dest))
         filter_lines.append(
             '    %s daddr %s accept comment "放通 DMZ 主机"' % (family_kw, host))
     return nat_lines, filter_lines
 
 
 # ---------------------------------------------------------------- systemd-networkd
+
+# systemd-networkd 的单元目录。render() 返回的是 **完整路径**，
+# render_network 内部只用文件名拼装，出口再补上这里的前缀。
+NETWORKD_DIR = '/etc/systemd/network'
+
 
 def render_network(cfg):
     """
@@ -719,7 +801,10 @@ def render_network(cfg):
                 'IPv6AcceptRA=yes',
                 '',
                 '[DHCPv4]',
-                'UseDNS=yes',
+                # WAN 页 DHCP 模式下的「使用上级下发的 DNS」开关（pppoe.dhcp_use_dns）
+                # 由前端透传到这里。以前这一项是写死的 yes —— 用户在界面上关掉它，
+                # 照样会被上级的 DNS 覆盖，等于一个改不生效的假开关。
+                'UseDNS=%s' % ('yes' if v_bool(wan.get('use_dns', True)) else 'no'),
                 'UseRoutes=yes',
                 f"RouteMetric={v_int(wan.get('metric') or 100, field='路由优先级', lo=1, hi=9999)}",
                 '',
@@ -799,7 +884,12 @@ def render_network(cfg):
             lines.append(f"Address={lan['ipv6_addr'].strip()}")
         lines.append('')
         out.append({'name': f'30-drouter-lan-{lif}.network', 'content': '\n'.join(lines)})
-    return out
+    # render() 的对外契约是 [(完整路径, 内容)]，其余渲染器都按这个返回。
+    # 这里内部为了方便拼装用了 {name, content} 字典，必须在出口转成契约形态——
+    # 否则 act_migrate_networkd 的 `for path, content in files` 解包 dict 时
+    # 只会拿到它的两个**键名**字符串 'name' 和 'content'，
+    # 于是把字面量 'content' 当成文件内容、写进一个叫 'name' 的文件里。
+    return [('%s/%s' % (NETWORKD_DIR, u['name']), u['content']) for u in out]
 
 
 # ---------------------------------------------------------------- PPPoE
@@ -840,10 +930,20 @@ def render_ppp(cfg):
         raise ValidateError('PPPoE 密码不能包含空格或引号', 'password')
     mtu = v_int(p.get('mtu') or 1492, field='PPPoE MTU', lo=576, hi=9000)
     mru = v_int(p.get('mru') or mtu, field='PPPoE MRU', lo=576, hi=9000)
+    # 这两个字段用户改得很随意，但也有同样的注入面：
+    #   isp            —— 进了注释行，带换行就会变成真的 pppd 选项
+    #   service_name   —— 被写进 servicename "…"，含引号就能闭合引号接着写选项
+    # 用户名/密码早就检查了引号与空格，这里补上缺的那两个（原先只对 caveman
+    # 做了限制，servicename 完全没有）。
+    isp = v_text(p.get('isp') or '自动', field='运营商', maxlen=32,
+                 pattern=r'^[A-Za-z0-9\u4e00-\u9fff ._+-]{1,32}$')
+    svc = v_text(p.get('service_name') or '', field='PPPoE 服务名',
+                 maxlen=64, allow_empty=True,
+                 pattern=r'^[A-Za-z0-9._-]{1,64}$')
 
     peers = [
         '# 由 drouter 自动生成：PPPoE 拨号配置',
-        '# 运营商：' + (p.get('isp') or '自动'),
+        '# 运营商：' + isp,
         f'user "{user}"',
         f'plugin rp-pppoe.so {iface}',
         'noipdefault',
@@ -864,8 +964,8 @@ def render_ppp(cfg):
         'novj',
         'novjccomp',
     ]
-    if (p.get('service_name') or '').strip():
-        peers.append(f"servicename \"{p['service_name'].strip()}\"")
+    if svc:
+        peers.append(f'servicename "{svc}"')
     peers += ['', '']
     secrets = f'"{user}" * "{passwd}"\n'
     return [('/etc/ppp/peers/drouter-wan', '\n'.join([l for l in peers if l != ''])),
@@ -939,15 +1039,43 @@ def render_radvd(cfg):
     lines += ['};', '']
     # IPv6 地址池说明块（供人工与后续脚本参考；radvd 本身通过 prefix 段生效）
     if r.get('pool_enabled', True) is not False:
-        pol = r.get('pool_policy') or []
+        # 整块都是「先取值再原样拼」的写法，池名/前缀/策略三个字段原先一个
+        # 都没校验：填了换行的池名会把注释后面变成真的 radvd 指令，而页面
+        # 只会报一句 radvd.conf 语法错误。这里逐个过一遍。
+        pol = listify(r.get('pool_policy')) or ['recommend']
+        for it in pol:
+            v_text(it, field='IPv6 池策略', maxlen=32,
+                   pattern=r'^[A-Za-z0-9_-]{1,32}$')
+        pool_prefix = v_text(r.get('pool_prefix') or '', field='IPv6 池前缀',
+                             maxlen=45, allow_empty=True,
+                             pattern=r'^[0-9a-fA-F:.]{1,45}$')
+        if pool_prefix and '/' in pool_prefix:
+            try:
+                ipaddress.IPv6Network(pool_prefix, strict=False)
+            except Exception:
+                raise ValidateError(f'IPv6 池前缀不合法：{pool_prefix}（示例 2408:8207:xxxx::/56）',
+                                    'pool_prefix')
+        # 「起始子网 ID」允许 0，别写成 `or 1` —— 0 会被当成没填而悄悄改成 1，
+        # 用户以为从 0 号子网开始分，实际渲染出来是 1（同 _clean_auto 的 hour=0）。
+        _ps, _pe = r.get('pool_start'), r.get('pool_end')
+        if _ps in (None, ''):
+            _ps = 1
+        if _pe in (None, ''):
+            _pe = 254
+        pstart = v_int(_ps, field='起始子网 ID', lo=0, hi=65535)
+        pend = v_int(_pe, field='结束子网 ID', lo=0, hi=65535)
+        if pstart > pend:
+            raise ValidateError(
+                f'IPv6 池分配范围不合法：起始子网 ID（{pstart}）大于结束子网 ID（{pend}）',
+                'pool_start')
         lines += [
             '# ---------------- IPv6 地址池 / 池策略（RouterOS 风格） ----------------',
-            f"# 池名称：{r.get('pool_name') or 'drouter-wan-pool'}",
-            f"# 地址来源：{r.get('pool_from') or 'pool'}",
-            f"# 池前缀：{r.get('pool_prefix') or '（跟随运营商 PD）'}",
+            f"# 池名称：{v_text(r.get('pool_name') or 'drouter-wan-pool', field='IPv6 池名称', maxlen=48, pattern=r'^[A-Za-z0-9._-]{1,48}$')}",
+            f"# 地址来源：{v_text(r.get('pool_from') or 'pool', field='IPv6 池来源', maxlen=32, pattern=r'^[A-Za-z0-9._-]{1,32}$')}",
+            f"# 池前缀：{pool_prefix or '（跟随运营商 PD）'}",
             f"# 子网 ID 长度：{v_int(r.get('pool_subnet_bits') or 8, field='子网 ID 长度', lo=0, hi=64)}",
-            f"# 分配范围：子网 ID {v_int(r.get('pool_start') or 1, field='起始子网 ID', lo=0, hi=65535)}"
-            f" - {v_int(r.get('pool_end') or 254, field='结束子网 ID', lo=0, hi=65535)}",
+            f"# 分配范围：子网 ID {pstart}"
+            f" - {pend}",
             f"# 池策略：{', '.join(pol) if pol else 'recommend'}",
             '# ---------------------------------------------------------------------',
             '',
@@ -983,7 +1111,10 @@ def render_dhcpcd(cfg):
         lines.append('    ipv6rs')
     if v_bool(d.get('request_pd', True)):
         iaid = v_int(d.get('iaid') or 0, field='IAID', lo=0, hi=4294967295)
-        suffix = (d.get('sla_id') or '::1').strip()
+        # sla_id 原先只做了 .strip()，然后直接拼进 ia_pd 的第 5 段：
+        # 一个换行就能在 dhcpcd.conf 里加一行 parameter-like 指令，
+        # 填个非 IPv6 的串则让整个 PD 请求失效（而且只在系统日志里有痕迹）。
+        suffix = v_ipv6_suffix(d.get('sla_id'), field='SLA-ID 后缀')
         lines.append(f'    ia_pd {iaid}/{lan}/0/{plen}/{suffix}')
     if d.get('rapid_commit'):
         lines.append('    option rapid_commit')
@@ -1038,8 +1169,10 @@ def render_miniupnpd(cfg):
         'upnp_nat_chain=prerouting_miniupnpd',
         'upnp_nat_postrouting_chain=postrouting_miniupnpd',
         'system_uptime=yes',
-        f"lease_file={u.get('lease_file') or '/var/run/miniupnpd.leases'}",
-        f"uuid={u.get('uuid') or 'drouter-0001'}",
+        # lease_file / uuid 原先直接用用户的原值，没设在用户表格里就能被外部
+        # 直接调 API 改成带换行的值，从而往 miniupnpd.conf 里追加任意指令。
+        f"lease_file={v_path(u.get('lease_file'), field='UPnP 租约文件') if (u.get('lease_file') or '').strip() else '/var/run/miniupnpd.leases'}",
+        f"uuid={v_text(u.get('uuid') or 'drouter-0001', field='UPnP UUID', maxlen=64, pattern=r'^[A-Za-z0-9._-]{1,64}$')}",
         'force_igd_desc_v1=yes' if v_bool(u.get('igd_v1')) else '',
         '',
         '# UPnP 权限规则：仅允许内网申请临时端口，末尾默认拒绝',
@@ -1061,8 +1194,14 @@ def render_chrony(cfg):
     if not servers:
         servers = ['ntp.aliyun.com', 'time.cloudflare.com']
     for s in servers:
+        # 原先只认「域名」或「IPv4」，于是 IPv6 的 NTP 服务器（2400:3200::1
+        # 这种国内常用的阿里公共 NTP）一律被判非法 —— 用户只能退回填域名。
         if not DOMAIN_RE.match(s) and not IPV4_RE.match(s):
-            raise ValidateError(f'NTP 服务器地址不合法：{s}', 'servers')
+            try:
+                ipaddress.IPv6Address(s.split('%')[0])
+            except Exception:
+                raise ValidateError(
+                    f'NTP 服务器地址不合法：{s}（可填域名、IPv4 或 IPv6 地址）', 'servers')
     lines = ['# 由 drouter 自动生成：NTP 客户端']
     for s in servers:
         lines.append(f'server {s} iburst')
@@ -1155,7 +1294,12 @@ def render_samba(cfg):
     if v_bool(sb.get('disable_netbios')):
         lines += ['   # 关闭 NetBIOS 名称服务（纯本地网段建议开启，减少广播）',
                   '   disable netbios = yes', '']
-    if v_bool(sb.get('wins_enable')) and sb.get('wins_support'):
+    # WINS 原先写成「wins_enable 与 wins_support 必须同时为真」，但页面上只有
+    # 一个开关 —— 它写入的是 wins_enable（sw('#sh-wins','wins_enable')），
+    # wins_support 从来没有任何界面会去写。于是勾上「本机充当 WINS 服务器」
+    # 再保存、应用，smb.conf 里一行都不会多出来，是个彻头彻尾的死开关。
+    # 这里以 wins_enable 为准，wins_support 降级为历史配置里的别名。
+    if v_bool(sb.get('wins_enable')) or v_bool(sb.get('wins_support')):
         lines += ['   # 由本机充当 WINS 服务器',
                   '   wins support = yes',
                   '   local master = yes',
@@ -1273,6 +1417,12 @@ def render_nfs(cfg):
         for c in clients:
             net = (c.get('net') or '').strip()
             preset = (c.get('preset') or 'linux').strip().lower()
+            # 模板名写错时必须报错而不是「静默退回 linux」：no_root_squash 这类的
+            # 差异会让用户以为选的是 macOS 模板，实际拿到一套完全不同的导出参数。
+            if preset not in NFS_OPTS:
+                raise ValidateError(
+                    f'NFS 导出「{path}」的客户端模板不支持：{preset}'
+                    f'（可选：{", ".join(sorted(NFS_OPTS))}）', 'preset')
             if not net:
                 raise ValidateError(f'NFS 导出「{path}」存在空的客户端网段', 'clients')
             # 通配符 * 允许，其余按 CIDR / 单机地址校验
@@ -1288,6 +1438,10 @@ def render_nfs(cfg):
                 continue
             seen.add(net)
             opts = (c.get('options') or '').strip() or NFS_OPTS.get(preset, NFS_OPTS['linux'])
+            # 自定义选项整串会原样写进 /etc/exports 的 (…) 里：带个空格或换行
+            # 就能越过当前共享项去改别的导出（exports 是按行解析的）。
+            v_text(opts, field=f'NFS 导出「{path}」的选项', maxlen=200,
+                   pattern=r'^[A-Za-z0-9_,=:.\-]{1,200}$')
             # 兜底：用户自定义选项里若出现危险组合，给出中文提示
             if 'no_root_squash' in opts and preset != 'legacy':
                 raise ValidateError(
@@ -1295,7 +1449,11 @@ def render_nfs(cfg):
                     f'这会让客户端 root 直接以 root 身份写共享目录，存在安全风险。'
                     f'如确需如此，请把模板选为「兼容旧设备（不安全）」。', 'options')
             rendered.append(f'{net}({opts})')
-        lines.append(f'# {e.get("comment") or path}')
+        # 备注进了注释行，同样要挡换行（smb 那边早就这么做了，这里补上）。
+        cmt = v_text(e.get('comment') or path, field=f'第 {i + 1} 个 NFS 导出的备注',
+                     maxlen=120, allow_empty=False,
+                     pattern=r'^[A-Za-z0-9\u4e00-\u9fff ._/@:-]{1,120}$')
+        lines.append(f'# {cmt}')
         lines.append(f'{path} {" ".join(rendered)}')
         lines.append('')
     return '\n'.join(lines)
@@ -1304,7 +1462,13 @@ def render_nfs(cfg):
 def render_nfs_conf(cfg):
     """渲染 /etc/nfs.conf.d/drouter.conf：线程数 / 版本 / 端口固定。"""
     n = _sub(cfg, 'nfs')
-    threads = int(n.get('threads') or 8)
+    # 原先是裸 int(threads or 8)：填个 abc 会抛 ValueError（500 + traceback），
+    # 而不是「NFS 服务线程数必须是数字」这种能看懂的提示。这里只补上捕获，
+    # 范围提示沿用原文案（页面上的说明写的是「1–128」）。
+    try:
+        threads = int(str(n.get('threads') or 8).strip())
+    except Exception:
+        raise ValidateError('NFS 服务线程数必须是数字', 'threads')
     if not (1 <= threads <= 128):
         raise ValidateError('NFS 服务线程数应在 1–128 之间', 'threads')
     lines = [

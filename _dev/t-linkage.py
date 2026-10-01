@@ -198,5 +198,37 @@ for name, fn, fields in FIELD_CASES:
     miss2 = [f for f in fields if f not in HELPER]
     chk('%s 的字段后端确实会产出' % name, not miss2, '→ 后端无 %s' % miss2)
 
+print('\n--- 孤儿控件：模板渲染了却没有任何 JS 接管的输入控件 ---')
+# 曾经的真实 bug：网桥页的「生成树协议 STP」下拉框（#br-stp）只有模板没有 handler，
+# 用户改完点保存，system.bridge_stp 从未更新 —— 一个改不生效的死控件。
+# 这里把「渲染出来但没人管」当成回归项守住。
+_NO_REF_OK = {
+    # 这三个是 DDNS 表单按服务商动态渲染的字段，由
+    # `$$('#dd-fields input')` 统一按 dataset.f 收集，不需要逐个 id 接管。
+    'dd-fuser', 'dd-ftoken', 'dd-fpass',
+    # 运行时由 caGenCsr 注入的只读文本区（内容来自模板本身，供全选复制）
+    'ca-cs-text',
+    # 只读展示框：复制按钮取的是闭包里的 d.secret，不读这个 input
+    'oh-secret-val',
+}
+_ids = sorted(set(re.findall(r'<(?:input|select|textarea)\b[^>]*\sid="([\w-]+)"', APP)))
+_orphan = []
+for _i in _ids:
+    if _i in _NO_REF_OK:
+        continue
+    # 模板里出现一次是必然；JS 里若一次都没引用过，说明没人接管它
+    if len(re.findall(r"['\"`#]%s\b" % re.escape(_i), APP)) <= 1:
+        _orphan.append(_i)
+chk('输入控件没有孤儿（渲染了但没接线）', not _orphan, '→ 疑似死控件 %s' % _orphan)
+print('   已检查 %d 个输入控件，白名单放行 %d 个' % (len(_ids), len(_NO_REF_OK)))
+
+print('\n--- 主题设计器「一键配色」必须真的接了后端 ---')
+# 这个按钮原先只有模板、没有 handler，后端 palette op 却一直存在 —— 点了毫无反应。
+chk('前端为 #tm-palette 绑了 handler', "palBtn.onclick = async" in APP)
+chk('前端用的是真存在的 op=palette', "op: 'palette'" in APP)
+chk('后端 act_theme 有 palette 分支', "op == 'palette'" in HELPER)
+chk('palette 分支没有重复实现', HELPER.count("op == 'palette'") == 1,
+    '→ 出现 %d 次' % HELPER.count("op == 'palette'"))
+
 print('\n结果: %s' % ('全部通过' if fails == 0 else '%d 项失败' % fails))
 sys.exit(1 if fails else 0)

@@ -422,26 +422,51 @@ def ensure_cert():
     if os.path.isfile(crt) and os.path.isfile(key):
         return crt, key
     ips = set()
+
+    def _add(ip):
+        try:
+            ipaddress.ip_address(ip)
+        except Exception:
+            return
+        ips.add(ip)
+
     try:
         rc = subprocess.run(['hostname', '-I'], capture_output=True, text=True, timeout=5)
         for x in (rc.stdout or '').split():
-            try:
-                ipaddress.ip_address(x)
-                ips.add(x)
-            except Exception:
-                pass
+            _add(x)
     except Exception:
         pass
-    ips.update({'127.0.0.1', '192.168.7.3'})
-    san = ','.join('IP:%s' % i for i in sorted(ips)) + ',DNS:localhost'
+    if not ips or ips <= {'127.0.0.1', '::1'}:
+        # hostname -I 不可用或还没拿到地址时，退回「默认路由的源地址」——
+        # 也就是本机真正在局域网上用的那张脸。写得这么绕是为了不再把某个
+        # 具体的 192.168.x.x 钉死在代码里：那台是他自己家的机器，装到别人
+        # 家里证书里却带着一个不属于对方的 IP。
+        try:
+            rc = subprocess.run(['ip', '-o', 'route', 'get', '1.1.1.1'],
+                                capture_output=True, text=True, timeout=5)
+            m = re.search(r'\bsrc\s+(\S+)', rc.stdout or '')
+            if m:
+                _add(m.group(1))
+        except Exception:
+            pass
+    _add('127.0.0.1')
+    san = ','.join('IP:%s' % i for i in sorted(ips)) + ',DNS:localhost,DNS:drouter.local'
     config = os.path.join(CERT_DIR, 'openssl.cnf')
     with open(config, 'w') as f:
         f.write('[req]\ndistinguished_name=dn\nx509_extensions=v3\nprompt=no\n'
                 '[dn]\nCN=drouter.local\nO=drouter\n'
                 '[v3]\nsubjectAltName=%s\nbasicConstraints=CA:FALSE\n' % san)
-    subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
-                    '-keyout', key, '-out', crt, '-days', '3650',
-                    '-config', config], capture_output=True, timeout=60)
+    rc = subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+                         '-keyout', key, '-out', crt, '-days', '3650',
+                         '-config', config], capture_output=True, timeout=60)
+    # 原先完全不看返回值：openssl 没装 / 失败时只是静默留下两个不存在的文件，
+    # 报错要等到后面 SSLContext.load_cert_chain 才炸，而且完全看不出是签发失败。
+    if rc.returncode != 0 or not (os.path.isfile(crt) and os.path.isfile(key)):
+        err = ((rc.stderr or b'') if isinstance(rc.stderr, bytes) else (rc.stderr or ''))
+        raise RuntimeError(
+            '自签证书生成失败（openssl 未安装或被拒绝？）。'
+            '管理面板的 HTTPS 需要一张证书：请先 apt-get install -y openssl 后重启'
+            ' drouter-web。openssl 输出：%s' % str(err)[-400:])
     try:
         os.chmod(key, 0o600)
     except Exception:
@@ -1811,7 +1836,7 @@ def build_openapi(base):
         'openapi': '3.0.3',
         'info': {
             'title': 'Drouter 通用管理 API',
-            'version': '1.0.3',
+            'version': '1.0.4',
             'description': ('Drouter（Debian 13 拼装主路由）的统一 REST 接口。'
                             '任意语言 / 框架（curl、Python、Node、Go、PHP、Java、.NET、'
                             'Shell、Postman、工单系统、IoT 网关）均可直接调用。'

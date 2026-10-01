@@ -1,14 +1,16 @@
 #!/bin/bash
 # 容器成品镜像冒烟（第二段）：登录 + Web 终端建会话 + 接口抽查
-# 1.0.3 本轮无容器相关改动，这里主要当**回归**用；顺带验证 1.0.2 的两条修复还在：
+# 1.0.4 本轮改动集中在渲染器与 Web 面板，容器形态同样受影响 -> 回归 + 针对性验证：
 #   ① 容器里没有 systemd，终端守护仍能被拉起（_shelld_spawn 回退路径）
 #   ② /dev/ptmx 存在，PTY 能开
+#   ③ 1.0.4 新：自签证书的 SAN 取自本机地址，不得再出现作者写死的内网 IP
+#      （过去直接硬编码 192.168.7.3，任何机器上签出来都带着它）
 # 用 --network none：不碰宿主网络，只在容器内自测 127.0.0.1。
 set -u
 
-TAR=/tmp/drouter-103-final.tar
-NAME=drouter-smoke103
-IMG=drouter:1.0.3
+TAR=/tmp/drouter-104-final.tar
+NAME=drouter-smoke104
+IMG=drouter:1.0.4
 BASE=https://127.0.0.1:8443
 PODMAN="podman"
 
@@ -120,6 +122,22 @@ for ep in sysinfo ifaces metrics; do
   R=$($PODMAN exec "$NAME" curl -sk --max-time 10 -H "X-Token: $TOKEN" "$BASE/api/$ep" 2>&1)
   grep -qE '"ok": *true' <<<"$R" && { echo "ok ✔"; pass=$((pass+1)); } || { echo "✘ $(head -c 120 <<<"$R")"; fail=$((fail+1)); }
 done
+
+echo
+echo "=== 9. 自签证书 SAN（1.0.4：不得再写死作者内网 IP）==="
+CERT=$($PODMAN exec "$NAME" sh -c 'C=$(ls /opt/drouter/certs/server.crt 2>/dev/null); [ -n "$C" ] || exit 1; openssl x509 -in "$C" -noout -text 2>/dev/null' 2>&1)
+if [ -n "$CERT" ]; then
+  echo "  SAN: $(grep -A1 -i 'Subject Alternative Name' <<<"$CERT" | tail -1 | head -c 200)"
+  ck "证书 SAN 含 loopback 127.0.0.1" '127\.0\.0\.1' "$CERT"
+  # 反向断言：写死的作者内网 IP 绝不能出现（ck 只能做「包含」判断，这里手写）
+  if grep -q '192\.168\.7\.3' <<<"$CERT"; then
+    echo "  ✘ 证书里仍写着硬编码的 192.168.7.3"; fail=$((fail+1))
+  else
+    echo "  ✔ 证书 SAN 不含写死的 192.168.7.3"; pass=$((pass+1))
+  fi
+else
+  echo "  ✘ 读不到 /opt/drouter/certs/server.crt（$CERT）"; fail=$((fail+1))
+fi
 
 echo
 echo "================================================"

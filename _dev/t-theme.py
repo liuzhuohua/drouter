@@ -583,6 +583,38 @@ for x in bt:
     has('内置 %s 无 < 字符' % x['id'], '<' not in css)
 
 print()
+print('== 12. 主题 meta 不得把内容注出 CSS 注释 ==')
+
+
+def _strip_comments(css):
+    """按 CSS 规范扫注释，返回注释之外的「有效 CSS」。"""
+    out, i, n = [], 0, len(css)
+    while i < n:
+        if css.startswith('/*', i):
+            j = css.find('*/', i + 2)
+            if j < 0:
+                break          # 未闭合：剩余全是注释
+            i = j + 2
+        else:
+            out.append(css[i])
+            i += 1
+    return ''.join(out)
+
+
+_META_ATTACKS = [
+    ('名称里塞规则体', {'name': 'x*/}body{display:none}/*', 'version': '1.0'}, 'body{display:none}'),
+    ('版本号里塞 @import', {'name': 'a', 'version': '1*/@import url(evil)/*'}, '@import'),
+    ('换行 + 提前闭合', {'name': 'n\n*/}\n*{background:url(//x)}\n/*', 'version': '2'}, 'background:url'),
+    ('中文混合注入', {'name': '中*/}html{filter:invert(1)}/*文', 'version': ''}, 'filter:invert'),
+]
+for _label, _meta, _needle in _META_ATTACKS:
+    _t = dict(_meta, vars={'--pri': '#111'}, css='', dark=False)
+    _eff = _strip_comments(theme.theme_to_css(_t))
+    has('%s → 攻击串留在注释内' % _label, _needle not in _eff, _eff[:80])
+    has('%s → 有效结构仍然完好' % _label,
+        '--pri:#111' in _eff and 'color-scheme:light' in _eff, _eff[:80])
+
+print()
 print('=' * 56)
 print('通过 %d 项，失败 %d 项' % (PASS, FAIL))
 if MSG:

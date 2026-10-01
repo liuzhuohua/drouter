@@ -1,6 +1,6 @@
 # Drouter · Docker 使用说明
 
-> 适用镜像：`drouter:1.0.3`（`drouter-1.0.3-docker.tar`，约 169 MB）
+> 适用镜像：`drouter:1.0.4`（`drouter-1.0.4-docker.tar`，约 169 MB）
 
 ---
 
@@ -20,7 +20,7 @@
 不过 **Web 终端不受 systemd 缺失影响** —— 1.0.1 起终端守护会绕开 init
 系统直接启动，容器里一样能开出 root shell（见第六节第 4 条自测）。
 
-**真正当路由器跑** → 用 `drouter-1.0.3-offline-amd64.tar.gz` 装到 Debian 13 物理机/虚拟机上。
+**真正当路由器跑** → 用 `drouter-1.0.4-offline-amd64.tar.gz` 装到 Debian 13 物理机/虚拟机上。
 那才是这个项目的主路径，也是它被设计出来的场景。
 
 **想快速看看界面长什么样、试试 API** → 用 Docker，一分钟就能跑起来。
@@ -30,14 +30,14 @@
 ## 一、加载镜像
 
 ```bash
-docker load -i drouter-1.0.3-docker.tar
+docker load -i drouter-1.0.4-docker.tar
 ```
 
 加载完会看到两个标签（同一个镜像）：
 
 ```
-drouter:1.0.3
-liuzhuohua/drouter:1.0.3
+drouter:1.0.4
+liuzhuohua/drouter:1.0.4
 ```
 
 验证：
@@ -48,11 +48,11 @@ docker images | grep drouter
 
 > **为什么有两个标签？**
 > 带用户名的那个是给将来推 Docker Hub 用的。
-> 日常用短的 `drouter:1.0.3` 就行。
+> 日常用短的 `drouter:1.0.4` 就行。
 
 > **如果你用的是 Podman**：本镜像最初用 buildah 构建，内部标签曾为
-> `localhost/drouter:1.0.3`。发布版已统一改成 `drouter:1.0.3`
-> （另有别名 `liuzhuohua/drouter:1.0.3`），`podman load` 和 `docker load`
+> `localhost/drouter:1.0.4`。发布版已统一改成 `drouter:1.0.4`
+> （另有别名 `liuzhuohua/drouter:1.0.4`），`podman load` 和 `docker load`
 > 都能直接加载。若你手上是更早期的 tar 包，引用时才需要 `localhost/` 前缀。
 
 ---
@@ -103,7 +103,7 @@ docker run -d \
   -v drouter-data:/opt/drouter/data \
   -v drouter-snapshots:/opt/drouter/snapshots \
   -v drouter-log:/var/log/drouter \
-  drouter:1.0.3
+  drouter:1.0.4
 ```
 
 就这几行。参数含义与 compose 里**完全一致**，逐个对应。
@@ -385,8 +385,8 @@ docker inspect --format '{{json .Mounts}}' drouter | python3 -m json.tool
 
 ```bash
 # 目标机上
-tar xzf drouter-1.0.3-offline-amd64.tar.gz
-cd drouter-1.0.3-offline-amd64
+tar xzf drouter-1.0.4-offline-amd64.tar.gz
+cd drouter-1.0.4-offline-amd64
 sudo bash install.sh
 
 # 恢复你在容器里试出来的配置
@@ -402,7 +402,7 @@ sudo systemctl restart drouter-web drouter-helpd drouter-shelld
 |---|---|
 | 基础镜像 | `debian:trixie-slim` |
 | 架构 | amd64 / linux |
-| 标签 | `drouter:1.0.3`、`liuzhuohua/drouter:1.0.3` |
+| 标签 | `drouter:1.0.4`、`liuzhuohua/drouter:1.0.4` |
 | 入口 | `/opt/drouter/bin/docker-init.sh` |
 | 默认命令 | `/usr/bin/python3 /opt/drouter/backend/drouter-web.py` |
 | 暴露端口 | 8443（HTTPS 面板）、8080（备用 HTTP，默认关） |

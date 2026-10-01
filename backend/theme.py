@@ -313,9 +313,15 @@ def theme_to_css(theme):
     同时输出一份深/浅色标记注释，便于排查。
     """
     lines = []
+    # 主题 meta（名称 / 版本）是自由文本，原样拼进 /* */ 注释时，一个 "*/"
+    # 就能提前闭合注释，让后面的内容变成真正的 CSS 规则（主题名写成
+    # `x*/}body{display:none}/*` 即可注入）。先剥掉注释终止符与换行。
+    def _cmt(s):
+        return str(s or '').replace('*/', '').replace('\r', ' ').replace('\n', ' ')
+
     lines.append('/* Drouter 主题：%s%s —— 由「主题之家」生成，请勿手工编辑 */'
-                 % (theme.get('name') or '未命名',
-                    (' v' + theme['version']) if theme.get('version') else ''))
+                 % (_cmt(theme.get('name') or '未命名'),
+                    (' v' + _cmt(theme['version'])) if theme.get('version') else ''))
     lines.append('/* 生成时间：%s */' % time.strftime('%Y-%m-%d %H:%M:%S'))
     lines.append(':root{')
     for k in sorted(theme.get('vars') or {}):

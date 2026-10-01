@@ -825,6 +825,13 @@ async function viewIface() {
   });
   $('#br-en').onchange = e => { S.cfg.system = Object.assign($w('system'), { bridge_enabled: e.target.checked }); setActionMsg('已修改，请点击保存并应用'); };
   $('#br-name').oninput = e => { S.cfg.system = Object.assign($w('system'), { bridge_name: e.target.value }); setActionMsg('已修改，请点击保存并应用'); };
+  // STP 下拉框原先只有模板、没有任何 handler —— 改了之后点保存，
+  // system.bridge_stp 压根不会被更新，等于一个改不生效的死控件。
+  const stp = $('#br-stp');
+  if (stp) stp.onchange = e => {
+    S.cfg.system = Object.assign($w('system'), { bridge_stp: e.target.value === '1' });
+    setActionMsg('已修改，请点击保存并应用');
+  };
   $$('.brm').forEach(c => c.onchange = () => {
     const sel = $$('.brm').filter(x => x.checked).map(x => x.value);
     S.cfg.system = Object.assign($w('system'), { bridge_members: sel });
@@ -1786,7 +1793,14 @@ function viewIpv6() {
         <label>前缀首选生命期<input id="ra-pl" type="number" value="${r.pref_life || 14400}"></label>
         <label>RDNSS（下发 DNS）<input id="ra-rdnss" value="${esc(r.rdnss || '')}" placeholder="2400:3200::1"></label>
         <label>DNSSL（域名）<input id="ra-dnssl" value="${esc(r.dnssl || '')}" placeholder="lan"></label>
+        <label>RDNSS 生命期（秒）<input id="ra-rdnss-life" type="number" min="60" max="9000"
+               value="${Number(r.rdnss_life || 600)}"></label>
+        <label>DNSSL 生命期（秒）<input id="ra-dnssl-life" type="number" min="60" max="9000"
+               value="${Number(r.dnssl_life || r.rdnss_life || 600)}"></label>
       </div>
+      <p class="hint-inline">两个生命期决定客户端保留这份 DNS 多久。DNSSL 没填时跟随 RDNSS 的值；
+      注意不要写成 <span class="mono">r.rdnss_life || 600</span> 之外的省略形式 —— 它们是数字输入框，
+      0 不会被使用，这里给的都是合法默认值。</p>
       <label class="switch"><input type="checkbox" id="ra-mg" ${r.managed ? 'checked' : ''}><i></i>M 标志（客户端用 DHCPv6 取地址）</label>
       <label class="switch"><input type="checkbox" id="ra-oc" ${r.other_config ? 'checked' : ''}><i></i>O 标志（客户端用 DHCPv6 取其他配置）</label>
     </div>
@@ -1838,6 +1852,8 @@ function viewIpv6() {
       lifetime: Number($('#ra-life').value), hop_limit: Number($('#ra-hop').value),
       valid_life: Number($('#ra-vl').value), pref_life: Number($('#ra-pl').value),
       rdnss: $('#ra-rdnss').value, dnssl: $('#ra-dnssl').value,
+      rdnss_life: Number($('#ra-rdnss-life').value) || 600,
+      dnssl_life: Number($('#ra-dnssl-life').value) || Number($('#ra-rdnss-life').value) || 600,
       managed: $('#ra-mg').checked, other_config: $('#ra-oc').checked,
     });
     S.cfg.dhcpv6 = Object.assign($w('dhcpv6'), {
@@ -1849,7 +1865,8 @@ function viewIpv6() {
     setActionMsg('已修改，请点击保存并应用');
   };
   ['#ra-if', '#ra-pfx', '#ra-max', '#ra-min', '#ra-life', '#ra-hop', '#ra-vl', '#ra-pl',
-    '#ra-rdnss', '#ra-dnssl', '#dv-wan', '#dv-lan', '#dv-plen', '#dv-sla', '#dv-iaid']
+    '#ra-rdnss', '#ra-dnssl', '#ra-rdnss-life', '#ra-dnssl-life',
+    '#dv-wan', '#dv-lan', '#dv-plen', '#dv-sla', '#dv-iaid']
     .forEach(s => { const e = $(s); if (e) e.oninput = rsync; });
   ['#ra-mg', '#ra-oc', '#dv-pd', '#dv-na'].forEach(s => { const e = $(s); if (e) e.onchange = rsync; });
 
@@ -3291,8 +3308,10 @@ function viewDhcpv6() {
           <option value="dhcpv6" ${c.method === 'dhcpv6' ? 'selected' : ''}>DHCPv6 有状态</option>
           <option value="both" ${c.method === 'both' ? 'selected' : ''}>两者同时</option>
         </select></label>
-        <label>子网 ID<input id="d6-sid" value="${esc(c.subnet_id || '0')}" placeholder="例如 0"></label>
+        <label>子网 ID（SLA-ID）<input id="d6-sid" value="${esc(c.sla_id || '::1')}" placeholder="例如 ::1 或 0"></label>
       </div>
+      <p class="hint-inline">这里的「子网 ID」与「IPv6 / RA」页面里的「SLA-ID 后缀」是同一个值
+      （原先这里写的是 subnet_id，渲染器读的是 sla_id —— 改了什么都不生效）。</p>
     </div>
 
     <div class="card">
@@ -3305,7 +3324,10 @@ function viewDhcpv6() {
     e.onchange = h; if (e.tagName === 'INPUT') e.oninput = h;
   };
   bind('#d6-len', 'prefix_len'); bind('#d6-iface', 'iface');
-  bind('#d6-method', 'method'); bind('#d6-sid', 'subnet_id');
+  bind('#d6-method', 'method');
+  // 写 sla_id 而不是 subnet_id：渲染器（render_dhcpcd 的 ia_pd 第 5 段）读的是
+  // sla_id，存到 subnet_id 的话用户改完点「保存并应用」什么都不会变。
+  bind('#d6-sid', 'sla_id');
   $('#d6-en').onchange = e => { S.cfg.dhcpv6 = Object.assign($w('dhcpv6'), { enabled: e.target.checked }); setActionMsg('已修改，请点击保存并应用'); };
   $('#d6-rapid').onchange = e => { S.cfg.dhcpv6 = Object.assign($w('dhcpv6'), { rapid_commit: e.target.checked }); setActionMsg('已修改，请点击保存并应用'); };
   liveV6();
@@ -4529,7 +4551,7 @@ async function viewDdns() {
     const r2 = await api('/api/ddns', { method: 'POST', body: { op: 'update' } });
     const p = (r2.data || {}).plan || [];
     $('#dd-out').innerHTML = `<pre>${esc(r2.msg_cn || '')}\n` +
-      p.map(x => `  • ${x.type} 记录  ${x.record} → ${x.ip}（${x.provider}）`).join('\n') + '</pre>';
+      p.map(x => `  • ${esc(x.type)} 记录  ${esc(x.record)} → ${esc(x.ip)}（${esc(x.provider)}）`).join('\n') + '</pre>';
     toast(r2.msg_cn, r2.ok ? 'ok' : 'err');
   };
   $('#dd-refresh').onclick = () => { toast('已刷新 DDNS 状态', 'ok'); viewDdns(); };
@@ -7448,12 +7470,41 @@ function viewSys() {
     setActionMsg('允许网段已修改，请点击保存并应用');
   };
   $('#sy-mig').onclick = async () => {
-    $('#sy-migout').innerHTML = '<pre>生成中…</pre>';
-    const r = await api('/api/migrate/preview', { method: 'POST', body: { cfg: { lan: { iface: $w('system').lan_iface, address: $w('system').lan_address } } } });
+    const out = $('#sy-migout');
+    // render_network 需要 wan/lan/bridge 三段齐全：只传 lan 会让它在
+    // `v_ifname(wan.get('iface') or '')` 这里直接抛「WAN 网卡不能为空」，
+    // 预览永远出不来；缺 bridge 则用户配好的网桥一个文件都不会显示在预览里。
+    const s = $w('system'), p = $w('pppoe');
+    if (!s.wan_iface) {
+      out.innerHTML = '<p class="desc">请先到「网卡与桥接」页把某个网口的角色设为 WAN，'
+        + '否则迁移配置里缺少 WAN 网卡，无法生成。</p>';
+      return;
+    }
+    const mode = p.mode || 'dhcp';
+    const wan = { iface: s.wan_iface, mode };
+    if (mode === 'static') {
+      wan.address = p.static_address || '';
+      wan.gateway = p.static_gateway || '';
+      wan.dns = p.static_dns || '';
+    } else if (mode === 'pppoe') {
+      wan.mtu = p.mtu || 1492;
+    } else {
+      wan.mtu = p.dhcp_mtu || 1500;
+      // 「使用上级下发的 DNS」若不给后端，render_network 里会按默认 yes 处理，
+      // 用户在 WAN 页关掉它就白关了。
+      wan.use_dns = p.dhcp_use_dns !== false;
+    }
+    out.innerHTML = '<pre>生成中…</pre>';
+    const r = await api('/api/migrate/preview', { method: 'POST', body: { cfg: {
+      wan,
+      lan: { iface: s.lan_iface || '', address: s.lan_address || '192.168.7.3/24', mtu: s.lan_mtu || 1500 },
+      bridge: { enabled: !!s.bridge_enabled, name: s.bridge_name || 'br0',
+                members: s.bridge_members || [], stp: !!s.bridge_stp },
+    } } });
     const files = (r.data || {}).files || [];
-    $('#sy-migout').innerHTML = files.length
+    out.innerHTML = files.length
       ? files.map(f => `<div style="margin-bottom:10px"><b class="mono">${esc(f.name)}</b><pre>${esc(f.content)}</pre></div>`).join('')
-      : '<p class="desc">' + esc(r.msg_cn) + '</p>';
+      : '<p class="desc">' + esc(r.msg_cn || '未生成任何文件') + '</p>';
   };
 }
 
@@ -7935,7 +7986,10 @@ function tmIssuesHTML(list) {
 /* 把主题渲染为 CSS 文本（与后端一致的输出格式，用于离线预览与「查看代码」） */
 function tmToCss(t) {
   const lines = [];
-  lines.push(`/* Drouter 主题：${t.name}${t.version ? ' v' + t.version : ''} */`);
+  // 主题名 / 版本是自由文本，原样拼进 /* */ 注释时，一个 "*/" 就能提前闭合注释、
+  // 把后面的内容变成真正的 CSS 规则。这里必须先把注释终止符和换行剥掉。
+  const cmt = s => String(s || '').replace(/\*\//g, '').replace(/[\r\n]+/g, ' ');
+  lines.push(`/* Drouter 主题：${cmt(t.name)}${t.version ? ' v' + cmt(t.version) : ''} */`);
   lines.push(':root{');
   Object.keys(t.vars || {}).sort().forEach(k => { lines.push(`  ${k}:${t.vars[k]};`); });
   lines.push('}');
@@ -8470,6 +8524,33 @@ function tmBindDesign() {
   $('#tm-save').onclick = () => tmSave(false);
   $('#tm-save-apply').onclick = () => tmSave(true);
   $('#tm-export-cur').onclick = () => tmExportDraft();
+  // 「按此主色生成整套配色」原先把取色器和按钮都渲染出来了，却从没接过任何 handler，
+  // 后端也没有对应的 op —— 用户点了完全没反应。配色统一交给后端 make_palette，
+  // 与内置主题共用同一套对比度保证，前端不自己造一份（否则会和有权重的那份跑偏）。
+  const palBtn = $('#tm-palette');
+  if (palBtn) palBtn.onclick = async () => {
+    const seed = ($('#tm-seed') || {}).value || '#1f6feb';
+    const dkEl = document.getElementById('tm-dark');
+    palBtn.disabled = true;
+    palBtn.textContent = '生成中…';
+    const r = await api('/api/theme/op', { method: 'POST',
+      body: { op: 'palette', color: seed, dark: !!(dkEl && dkEl.checked) } });
+    palBtn.disabled = false;
+    palBtn.textContent = '按此主色生成整套配色';
+    if (!r.ok) { toast('配色生成失败：' + (r.msg_cn || ''), 'err', 6000); return; }
+    const vars = (r.data || {}).vars || {};
+    Object.keys(vars).forEach(k => {
+      const key = k.replace(/[^a-z0-9-]/gi, '');
+      const txt = document.getElementById('tm-v-' + key);
+      if (txt) txt.value = vars[k];
+      const cb = document.getElementById('tm-o-' + key);
+      if (cb) cb.checked = true;          // 勾选 = 写进主题
+      const sw = document.querySelector('.tm-color[data-for="' + key + '"]');
+      if (sw) sw.value = tmToHex(vars[k], sw.value);
+    });
+    tmRefreshPreview();
+    toast(`已按主色生成 ${Object.keys(vars).length} 个配色变量`, 'ok');
+  };
   $('#tm-copy-css').onclick = () => {
     const txt = document.getElementById('tm-code').textContent;
     navigator.clipboard.writeText(txt).then(

@@ -22,7 +22,7 @@
 #
 # 用法（目标机）：
 #   把整个目录拷过去，执行
-#     sudo bash install.sh drouter_1.0.3_all.deb
+#     sudo bash install.sh drouter_1.0.4_all.deb
 # =============================================================================
 set -euo pipefail
 
@@ -260,7 +260,7 @@ if [ -z "$PKG" ]; then
   PKG=$(ls -1 "$HERE"/drouter_*_all.deb "$HERE"/*/drouter_*_all.deb 2>/dev/null | head -1 || true)
 fi
 [ -n "$PKG" ] && [ -f "$PKG" ] || PKG="$HERE/$PKG"
-[ -f "$PKG" ] || { echo "✘ 找不到 drouter 安装包（用法：bash install.sh drouter_1.0.3_all.deb）"; exit 1; }
+[ -f "$PKG" ] || { echo "✘ 找不到 drouter 安装包（用法：bash install.sh drouter_1.0.4_all.deb）"; exit 1; }
 echo "安装包：$PKG"
 
 echo ""
@@ -320,5 +320,5 @@ echo "======================================================================"
 echo "离线包已生成：$OUT"
 echo "  体积：$(du -sh "$OUT" | cut -f1)   （依赖 $(ls -1 "$OUT"/debs/*.deb 2>/dev/null | wc -l) 个 deb）"
 echo "  分发：把整个目录拷到目标机，执行"
-echo "        sudo bash install.sh drouter_1.0.3_all.deb"
+echo "        sudo bash install.sh drouter_1.0.4_all.deb"
 echo "======================================================================"

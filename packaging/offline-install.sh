@@ -102,7 +102,7 @@ if [ -z "$PKG" ]; then
   PKG=$(ls -1 "$HERE"/drouter_*_all.deb 2>/dev/null | head -1 || true)
 fi
 if [ -z "$PKG" ]; then
-  die "目录里找不到 drouter_*_all.deb（用法：bash install.sh drouter_1.0.3_all.deb）"
+  die "目录里找不到 drouter_*_all.deb（用法：bash install.sh drouter_1.0.4_all.deb）"
 fi
 [ -f "$PKG" ] || PKG="$HERE/$PKG"
 [ -f "$PKG" ] || die "找不到安装包：$PKG"
