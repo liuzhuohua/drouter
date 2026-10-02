@@ -51,7 +51,8 @@ Depends: python3 (>= 3.9),
  tar
 Recommends: tcpdump, jq, htop, iotop, nvme-cli, lm-sensors, dmidecode,
  e2fsprogs, exfatprogs, ntfs-3g, dosfstools, xfsprogs, btrfs-progs, f2fs-tools,
- usbutils, etherwake, zip, unzip, p7zip-full, iputils-ping, vim-tiny
+ usbutils, etherwake, zip, unzip, p7zip-full, iputils-ping, vim-tiny,
+ wireguard-tools
 Suggests: smartmontools, suricata, xtables-addons-common,
  samba, samba-common-bin, nfs-kernel-server, docker.io, docker-compose,
  cups, cups-client, snmpd, snmp

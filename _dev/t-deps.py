@@ -286,6 +286,9 @@ def main():
         'cups': 'cups（打印服务）',
         'cups-client': 'lpadmin / lpstat（打印机管理命令）',
         'usbutils': 'lsusb（USB 打印机识别）',
+        # VPN：helper 里有 5 处调 wg（genkey / pubkey / setconf / show），
+        # 漏登记的后果是自检页永远看不到「缺 wg」，用户进 VPN 页才发现配不了
+        'wireguard-tools': 'wg / wg-quick（VPN 服务端）',
     }
 
     print('=' * 70)

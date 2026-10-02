@@ -39,7 +39,7 @@ sqlite3 logrotate rsyslog curl wget procps sudo openssl ipset kmod systemd
 adduser ca-certificates tcpdump jq htop lm-sensors dmidecode
 e2fsprogs exfatprogs ntfs-3g dosfstools xfsprogs btrfs-progs f2fs-tools
 util-linux usbutils tar coreutils hostname udev
-etherwake zip unzip p7zip-full iputils-ping vim-tiny"
+etherwake zip unzip p7zip-full iputils-ping vim-tiny wireguard-tools"
 
 command -v apt-get >/dev/null 2>&1 || { echo "需要 apt-get（Debian/Ubuntu）"; exit 1; }
 

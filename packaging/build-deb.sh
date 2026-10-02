@@ -78,16 +78,19 @@ install -m 0755 "$HERE/packaging/deb/postrm"   "$STAGE/DEBIAN/postrm"
     | sed 's|^\./||' | xargs -r md5sum > DEBIAN/md5sums )
 
 echo "== 4/6 校验 =="
-# 后端 7 个模块必须齐全，缺一个上线后就是某个功能打不开
+# 后端 12 个模块必须齐全，缺一个上线后就是某个功能打不开
 for f in render.py drouter-helper.py drouter-web.py drouter-logd.py \
          drouter-snapshotd.py drouter-rescue.py drouter-shelld.py \
-         drouter-helpd.py theme.py; do
+         drouter-helpd.py drouter-backupd.py drouter-alertd.py \
+         drouter-quotad.py theme.py; do
   [ -f "$STAGE/opt/drouter/backend/$f" ] || { echo "✘ 缺少 $f"; exit 1; }
   python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' \
     "$STAGE/opt/drouter/backend/$f"
 done
 [ -f "$STAGE/opt/drouter/web/app.js" ] || { echo "✘ 缺少 app.js"; exit 1; }
-echo "  后端模块 8 个、语法全部通过"
+# 这里的数字必须等于上面for 里的条目数。写错了不会让构建失败，
+# 但会让人以为清单是全的（历史上「7 个」和实际 12 个长期不符）。
+echo "  后端模块 12 个、语法全部通过"
 
 # systemd 单元齐全性：少一个就是「某项功能装完不工作」
 for u in drouter-web.service drouter-helpd.service drouter-shelld.service \

@@ -1069,6 +1069,25 @@ class Api:
         # 快照下载到本地电脑
         if p.startswith('/api/snapshot/download'):
             return self.snapshot_download(query)
+        # 配置备份与还原（查询 / 导出 / 下载 / 预检 / 还原 / 清理 / 设置）
+        if p in ('/api/backup', '/api/backup/op') and method in ('GET', 'POST'):
+            return self.backup(method, p, query)
+        if p.startswith('/api/backup/download'):
+            return self.backup_download(query)
+        # 自动备份定时器状态
+        if p in ('/api/backupd',) and method == 'GET':
+            if not self.auth():
+                return
+            return self.json(self.helper('read:backupd', {}, timeout=30))
+        # 告警与通知中心
+        if p in ('/api/alert', '/api/alert/op') and method in ('GET', 'POST'):
+            return self.alert(method)
+        # WireGuard VPN
+        if p in ('/api/vpn', '/api/vpn/op') and method in ('GET', 'POST'):
+            return self.vpn(method)
+        # 用量统计（配额与账单）
+        if p in ('/api/quota', '/api/quota/op') and method in ('GET', 'POST'):
+            return self.quota(method, query)
         # 紧急救援通道（查询 / 配置）
         if p in ('/api/rescue',) and method in ('GET', 'POST'):
             return self.rescue()
@@ -1561,6 +1580,165 @@ class Api:
         except Exception:
             pass
         audit(self.user, '下载快照', ts, True)
+
+    def backup(self, method, p, query):
+        """配置备份与还原。
+
+        GET  -> status（顺带返回备份包列表）
+        POST -> {op: create|list|delete|pack|inspect|restore|prune|conf}
+
+        还原是唯一会「大面积改写磁盘」的动作，所以强制要求显式确认：
+        没有 confirm=true 就只跑 dry_run 预检并把计划返回给界面。
+        """
+        if not self.auth():
+            return
+        if method == 'GET':
+            return self.json(self.helper('backup', {'op': 'status'}, timeout=120))
+        b = self.body()
+        op = str(b.get('op') or 'status')
+        payload = dict(b)
+        payload['op'] = op
+        if op == 'restore':
+            if b.get('confirm') is not True:
+                # 未确认：强制预检，不写任何文件
+                payload['dry_run'] = True
+            res = self.helper('backup', payload, timeout=600)
+            if res.get('ok') and b.get('confirm') is True:
+                audit(self.user, '还原配置',
+                      '从备份包 %s 还原了 %s 个文件'
+                      % (b.get('name'), (res.get('data') or {}).get('applied', 0)),
+                      True, self.h.client_address[0])
+            return self.json(res)
+        if op == 'create':
+            res = self.helper('backup', payload, timeout=600)
+            if res.get('ok'):
+                audit(self.user, '导出配置备份',
+                      (res.get('msg_cn') or ''), True, self.h.client_address[0])
+            return self.json(res)
+        if op in ('delete', 'prune'):
+            res = self.helper('backup', payload, timeout=120)
+            if res.get('ok'):
+                audit(self.user, '清理配置备份', (res.get('msg_cn') or ''), True)
+            return self.json(res)
+        return self.json(self.helper('backup', payload, timeout=300))
+
+    def backup_download(self, query):
+        """把一份备份包送到浏览器。"""
+        if not self.auth():
+            return
+        name = (query.get('name') or [''])[0]
+        res = self.helper('backup', {'op': 'pack', 'name': name}, timeout=300)
+        if not res.get('ok'):
+            return self.json(res)
+        path = (res.get('data') or {}).get('path') or ''
+        if not path or not os.path.isfile(path):
+            return self.json({'ok': False, 'msg_cn': '准备下载文件失败'})
+        try:
+            with open(path, 'rb') as f:
+                data = f.read()
+        except Exception as e:
+            return self.json({'ok': False, 'msg_cn': '读取备份文件失败：%s' % e})
+        fn = os.path.basename(path)
+        quoted = fn.encode('utf-8').decode('latin-1', 'ignore')
+        self.h.send_response(200)
+        self.h.send_header('Content-Type', 'application/gzip')
+        self.h.send_header('Content-Disposition',
+                           "attachment; filename=\"%s\"; filename*=UTF-8''%s"
+                           % (quoted, _url_quote(fn)))
+        self.h.send_header('Content-Length', str(len(data)))
+        self.h.send_header('Cache-Control', 'no-store')
+        self.h.end_headers()
+        try:
+            self.h.wfile.write(data)
+        except Exception:
+            pass
+        audit(self.user, '下载配置备份', fn, True)
+
+    def alert(self, method):
+        """告警与通知中心。
+
+        GET  -> status（含规则、通道、探测值、历史）
+        POST -> {op: run|test|conf|history|clear|services}
+
+        推送通道里存着 SMTP 密码，所以读取时一律把 pass 抹掉。
+        抹掉之后前端表单里那个字段必然是空的 —— 如果原样回传，
+        一次「只改了阈值」的点保存就会把密码清成空串，用户下次再也收不到邮件，
+        而且界面上完全看不出发生过。补密码的动作必须放在 helper 侧：
+        只有它读得到旧值，Web 层拿不到明文。
+        """
+        if not self.auth():
+            return
+        if method == 'GET':
+            res = self.helper('alert', {'op': 'status'}, timeout=120)
+        else:
+            b = self.body()
+            op = str(b.get('op') or 'status')
+            res = self.helper('alert', dict(b, op=op), timeout=300)
+        if res.get('ok') and isinstance(res.get('data'), dict):
+            d = res['data']
+            if isinstance(d.get('conf'), dict) and isinstance(
+                    d['conf'].get('channels'), list):
+                d['conf']['channels'] = [
+                    {k: v for k, v in c.items() if k != 'pass'}
+                    for c in d['conf']['channels']]
+        return self.json(res)
+
+    def vpn(self, method):
+        """WireGuard VPN。
+
+        这个接口有两处特别要求：
+        1) **服务端与客户端私钥都不下发**。客户端私钥只在
+           peer_add / peer_conf 这一次返回里给（用户要导入手机），
+           status 接口一律走 helper 的 _vpn_mask 抹掉。
+        2) apply（启停服务）和 delete_all 会改网络状态，要写审计。
+        """
+        if not self.auth():
+            return
+        if method == 'GET':
+            return self.json(self.helper('vpn', {'op': 'status'}, timeout=120))
+        b = self.body()
+        op = str(b.get('op') or 'status')
+        # 双保险：即使 helper 侧的确认校验被绕过，Web 层也不再放行
+        if op == 'apply' and (b.get('conf') or {}).get('exit_node') is True \
+                and b.get('confirm_exit') is not True:
+            return self.json({'ok': False, 'code': 'NEEDCONFIRM',
+                              'msg_cn': '启用「全部流量经过本机」需要勾选确认后重试'})
+        res = self.helper('vpn', dict(b, op=op), timeout=180)
+        if res.get('ok') and op in ('apply', 'stop', 'delete_all', 'peer_del'):
+            audit(self.user, {'apply': '应用 VPN 配置', 'stop': '停止 VPN',
+                              'delete_all': '删除全部 VPN 配置',
+                              'peer_del': '删除 VPN 客户端'}[op],
+                  res.get('msg_cn') or '', True, self.h.client_address[0])
+        elif res.get('ok') and op == 'peer_add':
+            audit(self.user, '添加 VPN 客户端',
+                  (res.get('data') or {}).get('peer', {}).get('name', ''),
+                  True, self.h.client_address[0])
+        return self.json(res)
+
+    def quota(self, method, query):
+        """用量统计。
+
+        GET  -> status / report（?month=YYYY-MM）
+        POST -> {op: conf|reset|aggregate|device}
+
+        report 走的是**已聚合**的小文件，不扫原始归档 —— 这是这套东西
+        能在 4GB 机器上跑起来的关键，调用频率高也不能改。
+        """
+        if not self.auth():
+            return
+        if method == 'GET':
+            month = (query.get('month') or [''])[0]
+            op = 'report' if month else 'status'
+            payload = {'op': op}
+            if month:
+                payload['month'] = month
+            return self.json(self.helper('quota', payload, timeout=180))
+        b = self.body()
+        op = str(b.get('op') or 'status')
+        res = self.helper('quota', dict(b, op=op), timeout=300)
+        if res.get('ok') and op == 'reset':
+            audit(self.user, '清空用量统计', '已清空全部聚合数据', True)
+        return self.json(res)
 
     def rescue(self):
         if not self.auth():

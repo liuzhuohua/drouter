@@ -6,6 +6,7 @@
 都能跑的「结构正确性」检查，把「打出来的包不能用」挡在构建之前。
 """
 import os
+import re
 import subprocess
 import sys
 
@@ -16,7 +17,10 @@ fails = []
 
 
 def ck(name, cond, extra=''):
-    print('  %-46s %s %s' % (name, 'OK  ' if cond else 'FAIL', extra))
+    # extra 只在失败时打。通过的时候打出来是纯噪声（"OK → 只有 12 个" 这种
+    # 自相矛盾的话最糟，会让人以为真有问题），久了就没人看这输出了。
+    print('  %-46s %s %s' % (name, 'OK  ' if cond else 'FAIL',
+                             '' if cond else extra))
     if not cond:
         fails.append(name)
 
@@ -159,15 +163,49 @@ for rel in ('packaging/build-deb.sh', 'packaging/build-docker.sh',
 bd = read('packaging/build-deb.sh')
 ck('build-deb 先校验后端再打包', 'ast.parse' in bd)
 ck('build-deb 生成 md5sums', 'md5sums' in bd)
+
 # 逐个点名，别再用「数 .py 出现次数」这种会被注释里的文件名骗过的写法。
 # drouter-shelld.py 是 Web 终端的 PTY 守护，漏了它终端就打不开。
-BACKEND_MODULES = ['render.py', 'drouter-helper.py', 'drouter-web.py',
-                   'drouter-logd.py', 'drouter-snapshotd.py',
-                   'drouter-rescue.py', 'drouter-shelld.py',
-                   'drouter-helpd.py', 'theme.py']
-miss_mod = [m for m in BACKEND_MODULES if m not in bd]
+#
+# ⚠️ 清单必须**从 build-deb.sh 的 for 循环里抽**，不能在测试里再抄一份。
+# 早先这里硬编码了 9 个，而 build-deb.sh 实际校验 12 个 —— 两份清单各自
+# 独立维护，结果是 backupd / alertd / quotad 三个新守护「测试说齐了、
+# 打包脚本说齐了」，但谁都没真去对过对方。测试抄实现的清单，等于没测。
+# ⚠️ 必须 findall 再挑「.py 最多」的那个，不能用 search 取第一个 ——
+# build-deb.sh 里有好几个 for 循环（复制文件、算权限…），第一个匹配到的
+# 根本不是后端校验那个。
+_cands = [re.findall(r'[\w.-]+\.py', g)
+          for g in re.findall(r'for\s+\w+\s+in\s+(.*?);\s*do', bd, re.S)]
+if not _cands:
+    ck('build-deb.sh 能抽出后端模块 for 循环', False,
+       '→ 找不到 `for f in ... ; do` 形式的校验循环')
+    BACKEND_MODULES = []
+else:
+    BACKEND_MODULES = max(_cands, key=len)
+    ck('build-deb.sh 抽出 %d 个后端模块' % len(BACKEND_MODULES),
+       len(BACKEND_MODULES) >= 12,
+       '→ 只有 %d 个，backupd/alertd/quotad 这类新守护容易漏' %
+       len(BACKEND_MODULES))
+
+miss_mod = [x for x in BACKEND_MODULES if x not in bd]
 ck('build-deb 逐个校验 %d 个后端模块' % len(BACKEND_MODULES), not miss_mod,
    '→ 缺 %s' % miss_mod if miss_mod else '')
+
+# 清单里的每个文件都必须真的存在于 backend/ 下。
+# 上面那条只验「文件名出现在脚本里」，写错一个字（比如 drouter-backupd.py
+# 拼成 backup.py）照样能过。这条才是「打包不会漏文件」的真正保证。
+miss_real = [x for x in BACKEND_MODULES
+             if not os.path.exists(os.path.join(ROOT, 'backend', x))]
+ck('build-deb 清单里的每个模块在 backend/ 下真实存在', not miss_real,
+   '→ 不存在 %s' % miss_real if miss_real else '')
+
+# 反向：新加一个后端 .py 就必须进清单。漏了的话 dpkg 包里没有它，
+# 线上表现是「某个页面 404 / 某个守护根本不存在」，极难定位。
+have = {f for f in os.listdir(os.path.join(ROOT, 'backend'))
+        if f.endswith('.py') and not f.startswith('__')}
+notlisted = sorted(have - set(BACKEND_MODULES))
+ck('backend/ 下没有游离于清单之外的模块', not notlisted,
+   '→ 未进清单：%s' % notlisted if not notlisted else '')
 
 print('\n结果：失败 %d 项' % len(fails))
 for f in fails:

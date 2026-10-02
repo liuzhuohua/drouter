@@ -34,6 +34,11 @@ offline-deps/
 # ── 测试与验收的运行时残留 ──────────────────────────────
 _dev/.tmp/
 _dev/live-*.log
+# 跑测试时的输出重定向。_out_audit.txt 早先被误提交进版本库，
+# 已从索引移除并在此忽略 —— 它是每次跑测试都会变的中间产物。
+_dev/_out*.txt
+# run-static.py 的逐项进度日志（崩了之后靠它定位跑到哪）
+_dev/.run-static.log
 *.log
 !docs/**/*.log
 

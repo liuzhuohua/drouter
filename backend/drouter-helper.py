@@ -28,6 +28,7 @@ import pwd
 import grp
 import re
 import uuid
+import base64
 import threading
 import ipaddress
 from datetime import datetime
@@ -3285,6 +3286,780 @@ def _ddns_record_name(cfg):
     if not sub or sub == '@':
         return dom
     return sub + '.' + dom
+
+
+# ================================================ WireGuard VPN（1.0.7）
+#
+# ── 为什么只做 WireGuard，不做 OpenVPN ──────────────────────────────────────
+# Debian 13 的内核**自带** WireGuard（5.6 之后并入上游内核），不需要装任何
+# 第三方软件，也不���要 DKMS 编译模块。这台是 4GB/2CPU 的软路由，让用户为了
+# 远程回家访问 NAS 去编译内核模块是不能接受的。wg-quick 是 systemd 单元，
+# 配置就是 INI 格式，几十行就够。
+#
+# ── 安全设计 ────────────────────────────────────────────────────────────────
+# * 私钥只存在于服务端配置文件（0600），**永不通过 Web 下发**；
+#   客户端拿到的只有自己的那一份（每台设备独立密钥对）。
+# * AllowedIPs 默认只放行内网段（10.0.0.0/8 之类由用户选），
+#   想要「全部流量都走回家」时才勾 ExitNode —— 那个选项会让家里所有流量
+#   都从家里出去，必须显式二次确认。
+# * 监听端口只开放在 WAN 侧；内网侧不开放（内网的人不需要连 VPN 回来）。
+# * 容器形态没有 systemd：wg-quick 用不了，回退到 `wg-quick` 二进制直接
+#   up/down，或退到 `ip link add` 手工建接口。这一条必须做，否则
+#   「装了 deb 一切正常、跑镜像 VPN 起不来」。
+
+WG_CONF_DIR = '/etc/wireguard'
+VPN_CONF = '/etc/drouter/generated/vpn.json'
+VPN_UID = 51820          # WireGuard 默认用户
+VPN_IFACE = 'wg0'
+# 单个客户端的地址池，从 .1 开始（.1 留给服务器自己）
+VPN_POOL_DEFAULT = '10.66.66.0/24'
+
+
+def _vpn_load():
+    try:
+        with open(VPN_CONF, encoding='utf-8') as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            return d
+    except Exception:
+        pass
+    return {}
+
+
+def _vpn_save(d):
+    os.makedirs(os.path.dirname(VPN_CONF), exist_ok=True)
+    with open(VPN_CONF, 'w', encoding='utf-8') as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.chmod(VPN_CONF, 0o600)      # 含客户端私钥派生材料
+
+
+def _vpn_norm(d):
+    """归一化 VPN 配置。"""
+    d = d if isinstance(d, dict) else {}
+    out = {
+        'enabled': d.get('enabled') is True,
+        'port': 0,
+        'listen': '',
+        'pool': VPN_POOL_DEFAULT,
+        'endpoint_host': '',
+        'keepalive': 25,
+        'exit_node': False,
+        'lan_allow': True,
+        'dns': '',
+        'peers': [],
+    }
+    try:
+        out['port'] = int(d.get('port') or 0)
+    except Exception:
+        out['port'] = 0
+    if not (1 <= out['port'] <= 65535):
+        # 0 表示自动挑一个空闲端口。写在默认里而不是报错 ——
+        # 用户第一次进来还没决定用哪个端口是很正常的。
+        out['port'] = 0
+    out['listen'] = str(d.get('listen') or '')
+    try:
+        out['keepalive'] = max(0, min(int(d.get('keepalive') or 25), 300))
+    except Exception:
+        out['keepalive'] = 25
+    try:
+        net = ipaddress.ip_network(str(d.get('pool') or VPN_POOL_DEFAULT),
+                                   strict=False)
+        # 必须是私有段，且不能和内网段撞（撞了会导致路由黑洞）
+        if (net.version != 4 or not net.is_private
+                or net.prefixlen < 16 or net.prefixlen > 30):
+            net = ipaddress.ip_network(VPN_POOL_DEFAULT, strict=False)
+    except Exception:
+        net = ipaddress.ip_network(VPN_POOL_DEFAULT, strict=False)
+    out['pool'] = str(net)
+    out['endpoint_host'] = str(d.get('endpoint_host') or '')[:200]
+    out['dns'] = str(d.get('dns') or '')[:100]
+    out['exit_node'] = d.get('exit_node') is True
+    out['lan_allow'] = d.get('lan_allow') is not False
+    peers = []
+    seen = set()
+    for p in (d.get('peers') or []):
+        if not isinstance(p, dict):
+            continue
+        pid = re.sub(r'[^a-z0-9_-]', '', str(p.get('id') or '').lower())[:32]
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        ip = str(p.get('ip') or '')
+        # ⚠️ 归属判断必须拿 **ipaddress 对象**做，不能拿字符串。
+        # `'10.66.66.2' in ip_network(...)` 在 Python 3.12 及更早
+        # 会静默返回 False（保留全部 peer），3.13 起直接抛
+        # AttributeError —— 而这行下面就跟着 except: continue，
+        # 于是**所有客户端被无声无息地清空**：界面看着一切正常，
+        # wg0.conf 里 [Peer] 全没了，配好的手机立刻连不上，
+        # 而且没有任何报错。先用对象判断，再转成字符串存。
+        aobj = None
+        try:
+            aobj = ipaddress.ip_address(ip)
+        except Exception:
+            continue
+        if aobj not in net:
+            continue
+        a = str(aobj)
+        row = {
+            'id': pid,
+            'name': str(p.get('name') or pid)[:60],
+            'ip': a,
+            'note': str(p.get('note') or '')[:200],
+            'enabled': p.get('enabled') is not False,
+            'created': str(p.get('created') or ''),
+            'public_key': str(p.get('public_key') or '')[:80],
+            # ⚠️ private_key **必须**在这里保留。早先的版本没保留，
+            # 结果是每次保存配置（save / peer_toggle / peer_del）都会把
+            # 所有客户端私钥清空 —— 界面看着一切正常，wg0.conf 里的
+            # [Peer] 全变成空公钥，所有已配好的手机在连上后立刻握手失败，
+            # 而且因为「保存成功」没有任何报错，极难定位。
+            # 私钥只在 _vpn_mask()（对外输出）时才抹掉，不是在落盘时。
+            'private_key': str(p.get('private_key') or '')[:80],
+        }
+        row['has_key'] = bool(row['private_key'])
+        peers.append(row)
+    out['peers'] = peers
+    return out
+
+
+def _vpn_hostkey():
+    """服务端私钥。只在服务端配置文件里，绝不下发。"""
+    path = os.path.join(WG_CONF_DIR, VPN_IFACE + '.key')
+    try:
+        with open(path, encoding='utf-8') as f:
+            return f.read().strip()
+    except Exception:
+        return ''
+
+
+def _vpn_pubkey():
+    pk = _vpn_hostkey()
+    if not pk:
+        return ''
+    rc, o, e = sh(['wg', 'pubkey'], timeout=8, input_data=pk + '\n')
+    return o.strip() if rc == 0 else ''
+
+
+def _wg_genkey():
+    rc, o, e = sh(['wg', 'genkey'], timeout=10)
+    if rc != 0 or not o.strip():
+        return ''
+    return o.strip()
+
+
+def _vpn_installed():
+    """内核是否支持 WireGuard。Debian 13 自带，但容器基础镜像可能裁掉了模块。"""
+    rc, o, _e = sh(['sh', '-c',
+                    'test -d /sys/module/wireguard && echo yes || '
+                    '(ls /usr/bin/wg >/dev/null 2>&1 && echo tool || echo no)'],
+                   timeout=6)
+    return (o or '').strip() or 'no'
+
+
+def _vpn_free_port(prefer=0):
+    """挑一个没被占用的 UDP 端口。
+
+    用 UDP bind 试探：只 bind 不 listen，不会真的占住端口。
+    ⚠️ 已知局限：如果本机 WireGuard 已经在这个端口上跑着，
+    bind 会失败并返回别的端口 —— 这正是我们要的（换端口），
+    但判断「用户选的端口是否可用」必须在服务**没启动**时做，
+    否则会误报成「端口被占」而实际上是自己占的。
+    """
+    import socket as _sock
+    cands = []
+    if prefer:
+        cands.append(int(prefer))
+    cands += [51820, 51821, 51822, 51823, 8443, 443]
+    for p in cands:
+        if not (1 <= p <= 65535):
+            continue
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+        try:
+            s.bind(('0.0.0.0', p))
+            return p
+        except OSError:
+            continue
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+    return 51820
+
+
+def _vpn_port_busy(port):
+    """端口当前是否被别的程序占着（不区分是否是我们自己的 WireGuard）。"""
+    import socket as _sock
+    s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+    try:
+        s.bind(('0.0.0.0', int(port)))
+        return False
+    except OSError:
+        return True
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def _vpn_lan_net():
+    """本机内网网段（用于 AllowedIPs 与「允许访问内网」判定）。"""
+    nets = []
+    try:
+        rc, o, _e = sh(['sh', '-c',
+                        "ip -4 -o route show scope link | awk '{print $1}'"],
+                       timeout=6)
+        for ln in (o or '').splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                nets.append(str(ipaddress.ip_network(ln, strict=False)))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return nets
+
+
+def _vpn_render(d, host_priv, host_pub):
+    """渲染服务端 /etc/wireguard/wg0.conf。"""
+    pool = ipaddress.ip_network(d['pool'])
+    host_ip = str(pool.network_address + 1)
+    s = [
+        '# 由 drouter 自动生成：WireGuard 服务端（1.0.7）',
+        '# 请通过 Web 界面修改，手改会在下次保存时被覆盖。',
+        '',
+        '[Interface]',
+        'Address = %s' % host_ip,
+        'ListenPort = %d' % d['port'],
+        'PrivateKey = %s' % host_priv,
+    ]
+    if d.get('dns'):
+        s.append('DNS = %s' % d['dns'])
+    for n in _vpn_lan_net():
+        s.append('PostUp = ip route add %s dev %s' % (n, VPN_IFACE))
+        s.append('PostDown = ip route del %s dev %s 2>/dev/null || true' % (n, VPN_IFACE))
+    s.append('')
+    for p in d['peers']:
+        if not p.get('enabled') or not p.get('has_key'):
+            continue
+        s.append('# %s（%s）' % (p.get('name') or p['id'], p.get('note') or p['ip']))
+        s.append('[Peer]')
+        s.append('PublicKey = %s' % p.get('public_key', ''))
+        s.append('AllowedIPs = %s/32' % p['ip'])
+        if d.get('keepalive'):
+            s.append('PersistentKeepalive = %d' % d['keepalive'])
+        s.append('')
+    return '\n'.join(s) + '\n'
+
+
+def _vpn_render_client(d, peer, client_priv, client_pub, host_pub):
+    """渲染客户端配置（发给手机 / 笔记本的那份）。"""
+    host = d.get('endpoint_host') or ''
+    port = d['port']
+    lines = ['[Interface]',
+             'PrivateKey = %s' % client_priv,
+             'Address = %s/32' % peer['ip']]
+    if d.get('dns'):
+        lines.append('DNS = %s' % d['dns'])
+    lines += ['', '[Peer]',
+              'PublicKey = %s' % host_pub,
+              'AllowedIPs = %s' % ('0.0.0.0/0' if d.get('exit_node') else d['pool'])]
+    if host:
+        lines.append('Endpoint = %s:%d' % (host, port))
+    if d.get('keepalive'):
+        lines.append('PersistentKeepalive = %d' % d['keepalive'])
+    lines += ['',
+              '# 名称：%s' % (peer.get('name') or peer['id']),
+              '# 这份文件含私钥，妥善保管，不要发到群里。']
+    return '\n'.join(lines) + '\n'
+
+
+def _vpn_write_conf(d):
+    os.makedirs(WG_CONF_DIR, exist_ok=True)
+    path = os.path.join(WG_CONF_DIR, VPN_IFACE + '.conf')
+    priv = _vpn_hostkey()
+    if not priv:
+        priv = _wg_genkey()
+        if not priv:
+            return None, '无法生成 WireGuard 密钥（wg 命令不可用或内核不支持）'
+        kp = os.path.join(WG_CONF_DIR, VPN_IFACE + '.key')
+        with open(kp, 'w', encoding='utf-8') as f:
+            f.write(priv + '\n')
+        os.chmod(kp, 0o600)
+    pub = _vpn_pubkey()
+    # peers 里的 public_key 从 private_key 现场派生，所以配置里不存公钥
+    for p in d['peers']:
+        pk = p.get('private_key') or ''
+        if pk:
+            rc, o, _e = sh(['wg', 'pubkey'], timeout=6, input_data=pk + '\n')
+            p['public_key'] = o.strip() if rc == 0 else ''
+        else:
+            p['public_key'] = ''
+    text = _vpn_render(d, priv, pub)
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write(text)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    return {'path': path, 'host_pub': pub}, None
+
+
+def _vpn_svc_down():
+    """停接口。优先 wg-quick，其次手工 down。"""
+    if not os.path.isdir('/run/systemd/system'):
+        # 容器形态：没有 systemd，wg-quick 用不了
+        rc, o, _e = sh(['sh', '-c', 'wg-quick down %s 2>/dev/null' % VPN_IFACE],
+                       timeout=15)
+        if rc != 0:
+            sh(['sh', '-c', 'ip link delete %s 2>/dev/null || true' % VPN_IFACE],
+               timeout=10)
+        return True
+    sh(['systemctl', 'stop', 'wg-quick@%s' % VPN_IFACE], timeout=25)
+    return True
+
+
+def _vpn_svc_up():
+    """起接口。容器形态下 wg-quick 不可用，退回 wg + ip 手工建。"""
+    if not os.path.isdir('/run/systemd/system'):
+        conf = os.path.join(WG_CONF_DIR, VPN_IFACE + '.conf')
+        if not os.path.isfile(conf):
+            return False, '配置文件不存在'
+        priv = _vpn_hostkey()
+        # 用 wg-quick 的 stripped 版不可靠（它依赖 systemd 之外的很多东西），
+        # 这里手工建：ip link add + wg setconf
+        sh(['sh', '-c', 'ip link delete %s 2>/dev/null || true' % VPN_IFACE],
+           timeout=10)
+        rc, o, e = sh(['ip', 'link', 'add', VPN_IFACE, 'type', 'wireguard'],
+                      timeout=15)
+        if rc != 0:
+            return False, '创建接口失败：%s' % (e or o)
+        # 从 conf 里抽出 Peer 段交给 wg setconf
+        try:
+            with open(conf, encoding='utf-8') as f:
+                text = f.read()
+        except Exception as ex:
+            return False, str(ex)
+        peers = _vpn_extract_peers(text)
+        try:
+            net = ipaddress.ip_network(_vpn_norm(_vpn_load())['pool'])
+            sh(['ip', 'address', 'add',
+                '%s/%d' % (str(net.network_address + 1), net.prefixlen),
+                'dev', VPN_IFACE], timeout=10)
+        except Exception:
+            pass
+        for n in _vpn_lan_net():
+            sh(['ip', 'route', 'replace', n, 'dev', VPN_IFACE], timeout=8)
+        if peers:
+            rc, o, e = sh(['wg', 'setconf', VPN_IFACE, '/dev/stdin'], timeout=12,
+                          input_data=peers)
+            if rc != 0:
+                return False, '配置 peer 失败：%s' % (e or o)
+        sh(['ip', 'link', 'set', VPN_IFACE, 'up'], timeout=10)
+        return True, ''
+    rc, o, e = sh(['systemctl', 'start', 'wg-quick@%s' % VPN_IFACE], timeout=30)
+    if rc != 0:
+        return False, '启动失败：%s' % (e or o)
+    return True, ''
+
+
+def _vpn_extract_peers(text):
+    """从 wg0.conf 里抽出 [Peer] 段落（供容器形态 wg setconf 用）。"""
+    out = []
+    cur = None
+    for ln in text.splitlines():
+        t = ln.strip()
+        if t.startswith('#') or not t:
+            continue
+        if t.startswith('['):
+            cur = [] if t.lower().startswith('[peer') else None
+            if cur is not None:
+                out.append(cur)
+            continue
+        if cur is not None:
+            cur.append(t)
+    return '\n'.join('\n'.join(g) for g in out) + '\n' if out else ''
+
+
+def _vpn_live():
+    """实时状态：接口在不在、监听端口、最近握手。"""
+    rc, o, e = sh(['wg', 'show', VPN_IFACE, 'dump'], timeout=8)
+    live = {'up': False, 'listen_port': None, 'peers': [], 'pubkey': ''}
+    if rc != 0 or not o:
+        return live
+    lines = o.splitlines()
+    if not lines:
+        return live
+    # dump 格式：第 1 行是本机，第 2 行是 private-key，第 3 行是 listen-port
+    first = lines[0].split('\t')
+    live['pubkey'] = first[0] if first else ''
+    live['up'] = True
+    if len(lines) > 2:
+        try:
+            live['listen_port'] = int(lines[2].split('\t')[0])
+        except Exception:
+            pass
+    for ln in lines[4:]:
+        p = ln.split('\t')
+        if len(p) < 8:
+            continue
+        allowed = p[3] or '(none)'
+        if allowed == '(none)':
+            continue
+        hs = 0
+        try:
+            hs = int(p[5])
+        except Exception:
+            pass
+        rx = tx = 0
+        try:
+            rx = int(p[6])
+            tx = int(p[7])
+        except Exception:
+            pass
+        live['peers'].append({
+            'pubkey': p[0], 'allowed': allowed,
+            'handshake': (datetime.fromtimestamp(hs).isoformat(timespec='seconds')
+                           if hs else ''),
+            'rx': rx, 'tx': tx,
+        })
+    return live
+
+
+def act_vpn(p):
+    """WireGuard VPN：status / save / apply / stop / peer_add / peer_del /
+    peer_toggle / peer_conf / keygen / endpoint / nft / delete_all。"""
+    p = p or {}
+    op = str(p.get('op') or 'status')
+    if op == 'status':
+        return _vpn_status()
+    if op == 'save':
+        return _vpn_save_op(p)
+    if op == 'apply':
+        return _vpn_apply_op(p)
+    if op == 'stop':
+        _vpn_svc_down()
+        return ok({}, 'WireGuard 已停止')
+    if op == 'peer_add':
+        return _vpn_peer_add(p)
+    if op == 'peer_del':
+        return _vpn_peer_del(p)
+    if op == 'peer_toggle':
+        return _vpn_peer_toggle(p)
+    if op == 'peer_conf':
+        return _vpn_peer_conf(p)
+    if op == 'endpoint':
+        return _vpn_endpoint()
+    if op == 'delete_all':
+        return _vpn_delete_all()
+    return fail('未知的 VPN 操作：%s' % op)
+
+
+def _vpn_status():
+    d = _vpn_norm(_vpn_load())
+    live = _vpn_live()
+    # 端口是否被占：只在服务没运行时才做这个判断。服务在跑的时候
+    # 端口必然「被占」，但那是自己占的，不能报给用户说冲突。
+    busy = False
+    if d.get('port') and not live.get('up'):
+        busy = _vpn_port_busy(d['port'])
+    conflicts = []
+    for n in _vpn_lan_net():
+        try:
+            if ipaddress.ip_network(n, strict=False).overlaps(
+                    ipaddress.ip_network(d['pool'], strict=False)):
+                conflicts.append(n)
+        except Exception:
+            pass
+    return ok({
+        'conf': _vpn_mask(d),
+        # ⚠️ 早先这里还有一个 'raw': d —— 那是**含全部客户端私钥的完整
+        # 配置**。前端从头到尾没读过它（grep 过4 个 vpn* 渲染函数，
+        # 一个都没用到 raw），所以它唯一的实际效果是把所有已配对手机
+        # 的 WireGuard 私钥以明文塞进 HTTP 响应里。旁边的
+        # _vpn_mask(d) 就算不去掉这行也白做了。
+        # 留着它的诱惑是「以后调试方便」—— 不值得。
+        'live': live,
+        'installed': _vpn_installed(),
+        'has_systemd': os.path.isdir('/run/systemd/system'),
+        'lan_nets': _vpn_lan_net(),
+        'pool_conflict': conflicts,
+        'port_busy': bool(busy),
+        'suggest_port': _vpn_free_port(d.get('port') or 0),
+        'path': os.path.join(WG_CONF_DIR, VPN_IFACE + '.conf'),
+    }, '已读取 VPN 状态')
+
+
+def _vpn_mask(d):
+    """对外输出时把私钥抹掉。"""
+    out = json.loads(json.dumps(d))
+    for p in out.get('peers') or []:
+        p.pop('private_key', None)
+    return out
+
+
+def _vpn_save_op(p):
+    """保存配置（不启停服务）。"""
+    d = _vpn_norm({**_vpn_load(), **(p.get('conf') or {})})
+    # 「全部流量走回家」是个大开关，必须二次确认
+    if d.get('exit_node') and p.get('confirm_exit') is not True:
+        return fail('允许全部流量经过本机（Exit Node）会把家里的所有上网流量'
+                    '都从家里出去，请勾选确认后重试', 'NEEDCONFIRM')
+    # 端口被别的程序占着：自动换一个，并在返回里明确告诉用户换了。
+    # 静默改端口比报错好，但**必须说出来** —— 否则用户按 51820 配了
+    # 客户端，界面上却显示 51821，他会一直查为什么连不上。
+    swapped = 0
+    if d.get('port') and _vpn_port_busy(d['port']):
+        d['port'] = _vpn_free_port(d['port'])
+        swapped = d['port']
+    _vpn_save(d)
+    msg = 'VPN 配置已保存（还需点「应用」才会启动服务）'
+    if swapped:
+        msg = 'VPN 配置已保存。所选端口 %s 已被占用，已自动改用 %d' \
+              % (p.get('conf', {}).get('port'), swapped)
+    log('info', 'vpn', 'VPN_CONF_SAVED',
+        '已保存 VPN 配置（端口 %d，%d 个客户端）' % (d['port'], len(d['peers'])))
+    return ok({'conf': _vpn_mask(d), 'port_swapped': bool(swapped)}, msg)
+
+
+def _vpn_apply_op(p):
+    """渲染配置 + 启停服务。"""
+    d = _vpn_norm({**_vpn_load(), **(p.get('conf') or {})})
+    if d.get('exit_node') and p.get('confirm_exit') is not True:
+        return fail('允许全部流量经过本机需要显式确认', 'NEEDCONFIRM')
+    if _vpn_installed() == 'no':
+        return fail('本机内核或工具不支持 WireGuard，无法启动',
+                    'NO_WG')
+    if not d.get('port'):
+        d['port'] = _vpn_free_port(0)
+    res, err = _vpn_write_conf(d)
+    if err:
+        return fail(err)
+    _vpn_save(d)
+    # 防火墙：只放行 WAN 侧
+    nf = _vpn_nft_render(d)
+    _vpn_nft_apply(nf)
+    if not d.get('enabled'):
+        _vpn_svc_down()
+        return ok({'conf': _vpn_mask(d), 'nft': nf, 'applied': False},
+                  '配置已写入，但 VPN 处于关闭状态（未启动服务）')
+    up, why = _vpn_svc_up()
+    if not up:
+        # 启不动要把日志捞出来给用户看，否则只是一句「启动失败」
+        rc, j, _e = sh(['journalctl', '-u', 'wg-quick@%s' % VPN_IFACE,
+                        '-n', '20', '--no-pager'], timeout=12)
+        return fail('服务启动失败：%s' % why,
+                    'START_FAIL',
+                    {'conf': _vpn_mask(d), 'nft': nf, 'journal': j[-1200:]})
+    log('info', 'vpn', 'VPN_APPLIED',
+        'WireGuard 已启动（端口 %d，%d 个客户端）' % (d['port'], len(d['peers'])))
+    return ok({'conf': _vpn_mask(d), 'nft': nf, 'applied': True, 'live': _vpn_live()},
+              'WireGuard 已启动，监听 UDP %d' % d['port'])
+
+
+VPN_NFT_TABLE = 'drouter_vpn'
+
+
+def _vpn_nft_render(d):
+    """渲染放行规则。
+
+    只在 WAN 侧放行 UDP 端口：内网的人不需要「连回来」，
+    也不该让内网设备能用这个端口当跳板。
+    """
+    s = ['#!/usr/sbin/nft -f',
+         '# 由 drouter 自动生成：WireGuard 放行（1.0.7）',
+         'table inet %s {' % VPN_NFT_TABLE,
+         '  chain vpn_in {',
+         '    type filter hook input priority filter; policy accept;']
+    if d.get('enabled') and d.get('port'):
+        wan = _wan_lan_ifaces()
+        s.append('    # 仅放行来自 WAN 侧的 WireGuard 流量')
+        if wan:
+            s.append('    iifname { %s } udp dport %d accept comment "drouter-wireguard"'
+                     % (' '.join('"%s"' % x for x in wan), d['port']))
+        else:
+            s.append('    udp dport %d accept comment "drouter-wireguard"' % d['port'])
+    s += ['  }', '}', '']
+    return '\n'.join(s)
+
+
+def _vpn_nft_apply(nf):
+    """校验并加载 nft 片段。失败只记日志不阻断 —— 防火墙没加载成功
+    不代表 VPN 服务本身起不来，用户可以自己放行。"""
+    try:
+        rc, o, e = sh(['nft', '-c', '-f', '-'], timeout=12, input_data=nf)
+        if rc != 0:
+            log('warn', 'vpn', 'VPN_NFT_CHECK_FAIL', '放行规则语法检查失败：%s'
+                % (e or o))
+            return False
+        sh(['nft', '-f', '-'], timeout=15, input_data=nf)
+    except Exception as ex:
+        log('warn', 'vpn', 'VPN_NFT_FAIL', '放行规则加载失败：%s' % ex)
+        return False
+    return True
+
+
+def _vpn_peer_add(p):
+    """添加一个客户端。生成独立密钥对，私钥通过本 op 的返回值一次性交付。"""
+    d = _vpn_norm(_vpn_load())
+    name = str(p.get('name') or '').strip()[:60]
+    if not name:
+        return fail('请填写客户端名称（比如「我的手机」）')
+    pid = re.sub(r'[^a-z0-9_-]', '', name.lower())[:32] or 'peer'
+    # id 冲突就加序号
+    base = pid
+    n = 1
+    ids = {x['id'] for x in d['peers']}
+    while pid in ids:
+        n += 1
+        pid = '%s-%d' % (base[:28], n)
+    priv = _wg_genkey()
+    if not priv:
+        return fail('无法生成客户端密钥（wg 命令不可用）')
+    net = ipaddress.ip_network(d['pool'])
+    used = {x['ip'] for x in d['peers']}
+    cand = None
+    for i in range(1, 250):
+        a = str(net.network_address + i)
+        if a not in used:
+            cand = a
+            break
+    if not cand:
+        return fail('地址池已用尽，请扩大地址池或先删除不用的客户端')
+    peer = {'id': pid, 'name': name, 'ip': cand,
+            'note': str(p.get('note') or '')[:200], 'enabled': True,
+            'created': datetime.now().isoformat(timespec='seconds'),
+            'private_key': priv, 'public_key': '', 'has_key': True}
+    d['peers'].append(peer)
+    _vpn_save(d)
+    # 如果服务已经开着，立刻加进去免得用户以为没生效
+    if d.get('enabled'):
+        _vpn_apply_op({})
+    conf_txt = ''
+    hostpub = _vpn_pubkey()
+    if hostpub:
+        conf_txt = _vpn_render_client(d, peer, priv, '', hostpub)
+    log('info', 'vpn', 'VPN_PEER_ADDED', '已添加客户端「%s」（%s）' % (name, cand))
+    return ok({'peer': {'id': pid, 'name': name, 'ip': cand},
+               'private_key': priv, 'client_conf': conf_txt,
+               'config_name': 'drouter-%s.conf' % pid},
+              '客户端已创建，私钥与配置文件只显示这一次，请立即下载保存')
+
+
+def _vpn_peer_del(p):
+    pid = re.sub(r'[^a-z0-9_-]', '', str(p.get('id') or '').lower())[:32]
+    if not pid:
+        return fail('缺少客户端 id')
+    d = _vpn_load()
+    raw = d.get('peers') or []
+    removed = None
+    newraw = []
+    for x in raw:
+        if isinstance(x, dict) and x.get('id') == pid:
+            removed = x
+            continue
+        newraw.append(x)
+    if removed is None:
+        return fail('客户端不存在：%s' % pid)
+    d['peers'] = newraw
+    _vpn_save(_vpn_norm(d))
+    if d.get('enabled'):
+        _vpn_apply_op({})
+    log('info', 'vpn', 'VPN_PEER_DEL', '已删除客户端「%s」'
+        % (removed.get('name') or pid))
+    return ok({'removed': 1, 'name': removed.get('name') or pid},
+              '客户端「%s」已删除' % (removed.get('name') or pid))
+
+
+def _vpn_peer_toggle(p):
+    pid = re.sub(r'[^a-z0-9_-]', '', str(p.get('id') or '').lower())[:32]
+    on = p.get('enabled') is True
+    raw = _vpn_load().get('peers') or []
+    hit = False
+    for x in raw:
+        if isinstance(x, dict) and x.get('id') == pid:
+            x['enabled'] = on
+            hit = True
+    if not hit:
+        return fail('客户端不存在')
+    _vpn_save(_vpn_norm({'peers': raw}))
+    if (_vpn_load().get('enabled')):
+        _vpn_apply_op({})
+    return ok({}, '客户端已%s' % ('启用' if on else '停用'))
+
+
+def _vpn_peer_conf(p):
+    """重新生成并返回某个客户端的配置（私钥仍在库里，不存在「重发一次就失效」）。"""
+    pid = re.sub(r'[^a-z0-9_-]', '', str(p.get('id') or '').lower())[:32]
+    d = _vpn_norm(_vpn_load())
+    peer = None
+    for x in d['peers']:
+        if x['id'] == pid:
+            peer = x
+            break
+    if not peer:
+        return fail('客户端不存在')
+    hostpub = _vpn_pubkey()
+    if not hostpub:
+        return fail('服务端密钥尚未生成，请先点「应用」')
+    priv = peer.get('private_key') or ''
+    if not priv:
+        return fail('该客户端没有保存私钥（可能是从旧版本升级来的），请删掉重建')
+    return ok({'client_conf': _vpn_render_client(d, peer, priv, '', hostpub),
+               'config_name': 'drouter-%s.conf' % pid},
+              '配置已生成，含私钥，请妥善保管')
+
+
+def _vpn_endpoint(p=None):
+    """猜一个可用的 Endpoint。
+
+    没有公网 IP 的场景（PPPoE 在 NAT 后面、或大内网）只能靠 DDNS。
+    这里给出「公网 IPv4 / 已配置的 DDNS 域名」两个候选，让用户选。
+    """
+    cands = []
+    wan = _wan_lan_ifaces()
+    for w in wan:
+        rc, o, _e = sh(['sh', '-c',
+                        "ip -4 -o addr show dev '%s' scope global | "
+                        "awk '{print $4}' | cut -d/ -f1 | head -1" % w], timeout=6)
+        v = (o or '').strip()
+        if v and not _is_private(v):
+            cands.append({'v': v, 'n': '公网 IPv4（%s 口）' % w, 'how': 'direct'})
+    dd = _load_setting('ddns') or {}
+    for key in ('domain', 'name', 'host'):
+        v = str(dd.get(key) or '').strip()
+        if v and re.match(r'^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$', v):
+            cands.append({'v': v, 'n': 'DDNS 域名（需自行验证是否指向本机）',
+                          'how': 'ddns'})
+            break
+    if not cands:
+        cands.append({'v': '', 'n': '本机在 NAT 后面，没有可直接用的公网地址 —— '
+                                   '请到「动态域名 DDNS」页配置域名后再来',
+                      'how': 'none'})
+    return ok({'candidates': cands}, '已列出可用的 Endpoint 候选')
+
+
+def _vpn_delete_all():
+    """彻底清除：停服务、删配置、清 nft 表。"""
+    _vpn_svc_down()
+    d = _vpn_load()
+    d = _vpn_norm(d)
+    d['enabled'] = False
+    d['peers'] = []
+    _vpn_save(d)
+    for f in (os.path.join(WG_CONF_DIR, VPN_IFACE + '.conf'),
+              os.path.join(WG_CONF_DIR, VPN_IFACE + '.key')):
+        try:
+            if os.path.isfile(f):
+                os.unlink(f)
+        except Exception:
+            pass
+    sh(['sh', '-c', 'nft delete table inet %s 2>/dev/null || true' % VPN_NFT_TABLE],
+       timeout=10)
+    log('info', 'vpn', 'VPN_DELETED_ALL', '已删除全部 WireGuard 配置与客户端')
+    return ok({}, 'WireGuard 配置与全部客户端已删除')
 
 
 # ---------------------------------------------------------------- 访问控制 / 家长时间组（#8）
@@ -10503,6 +11278,2535 @@ def act_snapshot_pack(p):
               '快照已打包（%.1f KB）' % (size / 1024.0))
 
 
+# ------------------------------------------------------- 配置备份 / 还原（1.0.7）
+#
+# ── 它和快照有什么不同 ──────────────────────────────────────────────────────
+# 快照是**本机回滚**用的：留在 /opt/drouter/snapshots 里，只服务于「刚才那次改动
+# 改坏了，退回去」。所以它按目录整份复制，体积随日志/数据库一起涨。
+# 备份是**给人拿走**用的：导出一个能下载、能存到另一台机器、能在新机器上一键
+# 还原的包。两个诉求相反 —— 快照要「全」，备份要「小 + 可移植 + 自描述」。
+#
+# ── 为什么必须自带 MANIFEST + 每文件 sha256 ─────────────────────────────────
+# 还原最怕两件事：
+#   1. 三个月后你根本不记得这个包里有什么、是哪台机器导出的、是不是被改过；
+#   2. 包在传输中损坏，还原时写进去一堆半截文件，比不还原还糟。
+# 所以每个包都带一份 MANIFEST.json（版本、导出时间、主机名、drouter 版本、
+# 文件清单、每个文件的 sha256 与权限），还原默认先校验，不一致就拒绝。
+#
+# ── 安全 ────────────────────────────────────────────────────────────────────
+# * 还原路径必须命中 BK_ALLOW_PREFIX 白名单，且逐层 realpath 校验，
+#   杜绝 tar 里的 ../ 穿越写到 /etc/shadow；
+# * 解包有总字节数与文件数上限（防 tar 炸弹）；
+# * 私钥（CA 私钥、WireGuard 私钥、ppp 凭据）单独标记，默认**排除**，
+#   需要用户显式勾选「含敏感文件」才带上 —— 备份是要下载到本地电脑的。
+
+BACKUP_DIR = '/opt/drouter/backups'
+BACKUP_DL = '/tmp/drouter-backup-dl'
+BACKUP_CONF = '/etc/drouter/backup.conf'
+BACKUP_MANIFEST = 'MANIFEST.json'
+# 备份格式版本。还原端按此判断兼容性，不认识的版本直接拒绝而不是猜。
+BACKUP_FORMAT = 1
+# tar 炸弹防护：单包解出来的总字节与文件数上限
+BK_MAX_UNPACK = 64 * 1024 * 1024
+BK_MAX_FILES = 2000
+# 允许写入的路径前缀。与 snap_root() 的白名单是两套：
+# 备份要能覆盖 /etc 下的配置，所以范围更大，但仍只认这几个根。
+BK_ALLOW_PREFIX = ('/etc/', '/opt/drouter/', '/var/lib/drouter/')
+
+# 需要纳入备份的敏感文件（默认不导出，用户勾选后才带）
+BK_SENSITIVE = [
+    '/etc/drouter/ca',
+    '/etc/wireguard',
+    '/etc/ppp/chap-secrets',
+    '/etc/ppp/pap-secrets',
+    '/etc/dnsmasq.d/drouter.conf',
+]
+
+# 备份内容分组。界面上按这个顺序显示，让用户看得懂「备份了什么」。
+BACKUP_SCOPE = [
+    {'group': '界面配置（数据库）', 'items': [
+        '全部模块的设置值（drouter.db 的 settings / ifaces / admins）',
+        '网卡备注与角色绑定',
+    ]},
+    {'group': '网络与防火墙配置', 'items': [
+        '网卡与桥接、LAN / WAN 口参数',
+        'DHCP 与 DNS（drouter.conf）',
+        'IPv6 地址池、RA 通告、DHCPv6 前缀委派',
+        'IPv4 / IPv6 防火墙规则集（nftables）',
+        '端口转发与 DMZ、UPnP 配置',
+        'PPPoE 拨号配置（不含账号密码）',
+    ]},
+    {'group': '服务与应用', 'items': [
+        '智能限速 QoS 规则、应用识别 DPI 前缀库',
+        '访问控制与家长时间组',
+        '文件共享 Samba 配置、CUPS 打印配置',
+        'Docker Compose 栈文件与引擎配置（daemon.json）',
+        'NTP 时间同步、内核转发与 BBR 参数',
+    ]},
+    {'group': '外观与个性化', 'items': [
+        '当前主题、自定义主题文件',
+    ]},
+    {'group': '敏感文件（需显式勾选才导出）', 'items': [
+        'CA 证书库与私钥、WireGuard 私钥',
+        'PPPoE 宽带账号密码、DHCP 静态绑定 MAC',
+    ]},
+]
+
+
+def backup_dir():
+    """备份包存放目录。允许自定义，但必须在允许前缀内。"""
+    def _allowed(v):
+        return bool(v) and os.path.isabs(v) and v.startswith(BK_ALLOW_PREFIX)
+
+    env = os.environ.get('DROUTER_BACKUP_DIR', '').strip()
+    if env and _allowed(env):
+        return env
+    elif env:
+        log('warn', 'backup', 'BK_DIR_REJECT',
+            '环境变量指定的备份目录不在允许范围内，已忽略：%s' % env)
+    try:
+        v = (_load_setting('backup') or {}).get('path')
+        if v and os.path.isabs(v):
+            if _allowed(v):
+                return v
+            log('warn', 'backup', 'BK_DIR_REJECT',
+                '数据库里记录的备份目录不在允许范围内，已回落默认值：%s' % v)
+    except Exception:
+        pass
+    return BACKUP_DIR
+
+
+def _bk_load():
+    return _load_setting('backup') or {}
+
+
+def _bk_save(d):
+    return _save_setting('backup', d)
+
+
+def _bk_norm(d):
+    """归一化备份设置。
+
+    注意 int(raw or 默认) 会吞掉用户填的 0 —— 先判空再转 int，再钳制。
+    """
+    d = d if isinstance(d, dict) else {}
+    out = {
+        'path': str(d.get('path') or BACKUP_DIR),
+        'keep_count': 0,
+        'keep_days': 0,
+        'auto_enabled': False,
+        'auto_hour': 3,
+        'include_sensitive': False,
+        'note': str(d.get('note') or '')[:200],
+    }
+    for k, lo, hi in (('keep_count', 0, 999), ('keep_days', 0, 3650),
+                      ('auto_hour', 0, 23)):
+        raw = d.get(k)
+        if raw is None or raw == '':
+            continue
+        try:
+            v = int(raw)
+        except Exception:
+            continue
+        out[k] = max(lo, min(hi, v))
+    out['auto_enabled'] = d.get('auto_enabled') is True
+    out['include_sensitive'] = d.get('include_sensitive') is True
+    if not out['path'].startswith(BK_ALLOW_PREFIX):
+        out['path'] = BACKUP_DIR
+    return out
+
+
+def _bk_files(include_sensitive=False):
+    """列出要备份的文件。
+
+    数据来源刻意与快照的清单同源（SNAPSHOT_ETC_FILES / _DIRS / DB_PATH），
+    避免出现「快照里有、备份里没有」的功能项 —— 用户会发现两次导出的
+    文件列表不一样，进而怀疑备份不完整。
+    """
+    items = []
+    seen = set()
+
+    def _add(path, optional=True, sensitive=False):
+        if path in seen:
+            return
+        seen.add(path)
+        items.append({'path': path, 'optional': optional, 'sensitive': sensitive})
+
+    # 数据库（界面配置的真源）
+    _add(DB_PATH, optional=True)
+    # /etc 下的生成文件
+    for f in SNAPSHOT_ETC_FILES:
+        _add(f, optional=True,
+             sensitive=f in ('/etc/ppp/chap-secrets', '/etc/ppp/pap-secrets',
+                             '/etc/dnsmasq.d/drouter.conf'))
+    # /etc 目录整目录（含 generated/vlans.json、themes/、docker/stacks/、ca/）
+    #
+    #⚠️ 这里**不能**因为里面有ca/ 就把整个目录标成 sensitive。
+    # 早先的版本写了 sensitive=(d == '/etc/drouter')，看着只是「多漏一个目录」，
+    # 实际后果是：默认导出的包里**没有 dcfg.json、没有 kern.conf、没有
+    # generated/vlans.json、没有 Docker 栈文件、没有自定义主题**——
+    # 而 BACKUP_SCOPE 里恰恰把这些都宣称在备份范围内。用户导出、换机还原，
+    # 会发现大半配置没了，而且界面全程显示「已导出」，没有任何提示。
+    # 敏感与否是**逐文件**属性，目录只是容器。真正的排除交给
+    # _bk_walk() 里的 _bk_is_sensitive() 按 BK_SENSITIVE 精确判定。
+    for d in SNAPSHOT_ETC_DIRS:
+        _add(d, optional=True)
+    # 运行时状态里值得带走的两样
+    _add('/opt/drouter/data/active-theme', optional=True)
+    _add('/opt/drouter/data/third-party', optional=True)
+
+    if not include_sensitive:
+        items = [i for i in items if not i['sensitive']]
+    return items
+
+
+def _bk_is_sensitive(path):
+    """判断单个绝对路径是否属于敏感文件（默认不导出的那部分）。
+
+    判定用「路径等于或位于 BK_SENSITIVE 某项之下」，而不是逐个枚举 ——
+    BK_SENSITIVE 里既有文件（chap-secrets）也有目录（ca/、wireguard/），
+    写成前缀比较才能同时覆盖两种。新增敏感项只要往列表里加一行。
+    """
+    p = os.path.normpath(str(path or ''))
+    for s in BK_SENSITIVE:
+        s = os.path.normpath(s)
+        if p == s or p.startswith(s.rstrip('/') + '/'):
+            return True
+    return False
+
+
+def _bk_walk(root, include_sensitive=False, skipped=None):
+    """把一个文件或目录展开成 (绝对路径, 归档内相对路径, 是否敏感) 列表。
+
+    相对路径统一去掉开头的 '/'，还原时再用白名单还原回绝对路径 ——
+    这样 tar 里不会存绝对路径，也就不存在「解压到哪」的问题。
+
+    include_sensitive=False 时跳过 BK_SENSITIVE 里的子树，并把跳过的
+    路径 append 到 skipped —— 用户要能看见「这个包里没有 CA 私钥」，
+    否则换机后才发现证书没了。
+    """
+    out = []
+    if skipped is None:
+        skipped = []
+
+    def _skip(full, why):
+        skipped.append({'path': full, 'why': why})
+
+    if os.path.isfile(root):
+        full = os.path.abspath(root)
+        if not include_sensitive and _bk_is_sensitive(full):
+            _skip(full, '敏感文件，默认不导出')
+        else:
+            out.append((full, full.lstrip('/'),
+                        _bk_is_sensitive(full)))
+    elif os.path.isdir(root):
+        base = os.path.abspath(root)
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames.sort()
+            # 敏感目录整棵剪掉，别走进去再逐个文件判
+            if not include_sensitive:
+                keep = []
+                for dn in dirnames:
+                    sub = os.path.normpath(os.path.join(dirpath, dn))
+                    if _bk_is_sensitive(sub):
+                        _skip(sub + '/', '敏感目录，默认不导出')
+                    else:
+                        keep.append(dn)
+                dirnames[:] = keep
+            for fn in sorted(filenames):
+                full = os.path.join(dirpath, fn)
+                if os.path.islink(full) or not os.path.isfile(full):
+                    continue
+                if not include_sensitive and _bk_is_sensitive(full):
+                    _skip(full, '敏感文件，默认不导出')
+                    continue
+                out.append((os.path.abspath(full),
+                            os.path.abspath(full).lstrip('/'),
+                            _bk_is_sensitive(full)))
+    return out
+
+
+def _bk_sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    try:
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(262144), b''):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ''
+
+
+def _bk_version():
+    try:
+        with open('/opt/drouter/VERSION', encoding='utf-8') as f:
+            return f.read().strip()
+    except Exception:
+        try:
+            import importlib.metadata as md
+            return md.version('drouter')
+        except Exception:
+            return '未知'
+
+
+def _bk_hostname():
+    try:
+        with open('/etc/hostname', encoding='utf-8') as f:
+            return f.read().strip()
+    except Exception:
+        try:
+            return socket.gethostname()
+        except Exception:
+            return '未知'
+
+
+def act_backup(p):
+    """配置备份与还原：status / create / list / delete / pack /
+    inspect / restore / prune / conf。
+
+    刻意把「导出」和「打包下载」分成两步（create 与 pack）：
+    备份包生成在 /opt/drouter/backups 里可以慢慢跑、可以定时跑，
+    而下载是一次性的短命产物。合成一步会导致每点一次下载就重算一遍 sha256。
+    """
+    p = p or {}
+    op = str(p.get('op') or 'status')
+    if op == 'status':
+        return _bk_status()
+    if op == 'create':
+        return _bk_create(p)
+    if op == 'list':
+        return _bk_list()
+    if op == 'delete':
+        return _bk_delete(p)
+    if op == 'pack':
+        return _bk_pack(p)
+    if op == 'inspect':
+        return _bk_inspect(p)
+    if op == 'restore':
+        return _bk_restore(p)
+    if op == 'prune':
+        return _bk_prune(p)
+    if op == 'conf':
+        return _bk_conf(p)
+    return fail('未知的备份操作：%s' % op)
+
+
+def _bk_status():
+    d = backup_dir()
+    items = _bk_files(bool(_bk_load().get('include_sensitive')))
+    total = 0
+    present = 0
+    for it in items:
+        p = it['path']
+        if os.path.isfile(p):
+            present += 1
+            try:
+                total += os.path.getsize(p)
+            except Exception:
+                pass
+        elif os.path.isdir(p):
+            present += 1
+            for full, _rel, _sens in _bk_walk(
+                    p, include_sensitive=bool(
+                        _bk_load().get('include_sensitive'))):
+                try:
+                    total += os.path.getsize(full)
+                except Exception:
+                    pass
+    conf = _bk_load()
+    packs = _bk_list_entries()
+    return ok({
+        'dir': d,
+        'exists': os.path.isdir(d),
+        'scope': BACKUP_SCOPE,
+        'planned': items,
+        'present': present,
+        'planned_total': len(items),
+        'bytes': total,
+        'packs': packs,
+        'conf': _bk_norm(conf),
+        'version': _bk_version(),
+        'hostname': _bk_hostname(),
+        'allow_prefix': list(BK_ALLOW_PREFIX),
+    }, '已读取备份状态')
+
+
+def _bk_list_entries():
+    """列出已存在的备份包（只认 .tar.gz 且文件名合法）。"""
+    d = backup_dir()
+    out = []
+    if not os.path.isdir(d):
+        return out
+    for name in sorted(os.listdir(d), reverse=True):
+        if not name.endswith('.tar.gz') or not re.match(
+                r'^drouter-backup-\d{8}-\d{6}(-[a-z0-9]+)?\.tar\.gz$', name):
+            continue
+        full = os.path.join(d, name)
+        try:
+            st = os.stat(full)
+        except Exception:
+            continue
+        note = ''
+        if not os.access(full, os.R_OK):
+            note = '当前用户无权读取'
+        out.append({'name': name, 'size': st.st_size,
+                    'mtime': datetime.fromtimestamp(st.st_mtime)
+                    .isoformat(timespec='seconds'),
+                    'note': note})
+    return out
+
+
+def _bk_list():
+    return ok({'packs': _bk_list_entries(), 'dir': backup_dir()},
+              '已列出备份包')
+
+
+def _bk_ts():
+    return datetime.now().strftime('%Y%m%d-%H%M%S')
+
+
+def _bk_create(p):
+    """导出一份备份包。
+
+    命名带主机名后缀：工作室里常有好几台设备，下载到电脑上一堆
+    drouter-backup-20261002-120000.tar.gz 分不清是谁的。
+    """
+    conf = _bk_norm(_bk_load())
+    if p.get('include_sensitive') is True:
+        conf['include_sensitive'] = True
+    if p.get('note'):
+        conf['note'] = str(p.get('note'))[:200]
+    d = backup_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception as e:
+        return fail('创建备份目录失败：%s' % e)
+    ts = _bk_ts()
+    host = re.sub(r'[^A-Za-z0-9_-]', '', _bk_hostname()) or 'router'
+    host = host[:24].lower()
+    name = 'drouter-backup-%s-%s.tar.gz' % (ts, host)
+    out = os.path.join(d, name)
+    # 先写临时文件再改名：中途失败不会留下一个「看起来存在」的半个包
+    tmp = out + '.part'
+    entries = []
+    missing = []
+    excluded = []
+    total_bytes = 0
+    try:
+        with tarfile.open(tmp, 'w:gz') as tf:
+            for it in _bk_files(conf['include_sensitive']):
+                src = it['path']
+                pairs = _bk_walk(src,
+                                 include_sensitive=conf['include_sensitive'],
+                                 skipped=excluded)
+                if not pairs:
+                    # 别把「因为敏感被跳过」误报成「文件不存在」——
+                    # 用户会以为配置丢了，实际上是有意不给的。
+                    if not any(e['path'].rstrip('/') in
+                               (src, os.path.abspath(src)) for e in excluded):
+                        missing.append({'path': src, 'why': '文件不存在'})
+                    continue
+                for full, rel, sens in pairs:
+                    try:
+                        st = os.stat(full)
+                    except Exception as e:
+                        missing.append({'path': full, 'why': str(e)})
+                        continue
+                    try:
+                        tf.add(full, arcname=rel, recursive=False)
+                    except Exception as e:
+                        missing.append({'path': full, 'why': '打包失败：%s' % e})
+                        continue
+                    entries.append({'path': '/' + rel, 'size': st.st_size,
+                                    'mode': oct(st.st_mode & 0o777),
+                                    'sha256': _bk_sha256(full),
+                                    'group': it['path'],
+                                    'sensitive': bool(sens)})
+                    total_bytes += st.st_size
+            manifest = {
+                'format': BACKUP_FORMAT,
+                'created': datetime.now().isoformat(timespec='seconds'),
+                'hostname': _bk_hostname(),
+                'drouter_version': _bk_version(),
+                'include_sensitive': bool(conf['include_sensitive']),
+                'note': conf['note'],
+                'file_count': len(entries),
+                'total_bytes': total_bytes,
+                'files': entries,
+                'groups': [it['path'] for it in
+                           _bk_files(conf['include_sensitive'])],
+                'missing': missing,
+                # 因为敏感被排除的路径。界面上要单独列出来 ——
+                # 用户必须能预先知道「这个包换到新机器后证书/私钥要重做」。
+                'excluded': excluded,
+            }
+            raw = json.dumps(manifest, ensure_ascii=False, indent=2)
+            ti = tarfile.TarInfo(BACKUP_MANIFEST)
+            ti.size = len(raw.encode('utf-8'))
+            ti.mode = 0o644
+            import io
+            tf.addfile(ti, io.BytesIO(raw.encode('utf-8')))
+        os.replace(tmp, out)
+        os.chmod(out, 0o600 if conf['include_sensitive'] else 0o644)
+    except Exception as e:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        log('error', 'backup', 'BK_CREATE_FAIL', '导出备份包失败：%s' % e)
+        return fail('导出备份包失败：%s' % e)
+    size = os.path.getsize(out)
+    log('info', 'backup', 'BK_CREATED',
+        '已导出备份包 %s（%d 个文件，%.1f KB）' % (name, len(entries), size / 1024.0),
+        {'sensitive': conf['include_sensitive'], 'missing': len(missing),
+         'excluded': len(excluded)})
+    msg = '备份已导出：%d 个文件（%.1f KB）' % (len(entries), size / 1024.0)
+    # 有敏感项被排除时必须在消息里说清楚，否则用户以为「全都备份了」。
+    if excluded and not conf['include_sensitive']:
+        msg += '；%d 项敏感内容未包含（CA 私钥 / 宽带密码等），换机后需重新配置' \
+               % len(excluded)
+    return ok({'name': name, 'path': out, 'size': size,
+               'files': len(entries), 'missing': missing,
+               'excluded': excluded,
+               'manifest': manifest}, msg)
+
+
+def _bk_safe_name(name):
+    """校验备份包文件名，杜绝 ../ 与绝对路径。"""
+    name = str(name or '').strip()
+    if not name or not re.match(
+            r'^drouter-backup-\d{8}-\d{6}(-[a-z0-9]+)?\.tar\.gz$', name):
+        return None
+    return name
+
+
+def _bk_path_of(name):
+    """返回备份包的绝对路径；不合法返回 None。
+
+    这里是唯一的入口校验点：list / delete / pack / inspect / restore /
+    prune 全部先过它。os.path.join(root, name) 之后再 commonpath 复核，
+    双重保险（历史上 snapshot_pack 就栽过同类问题）。
+    """
+    n = _bk_safe_name(name)
+    if not n:
+        return None
+    root = os.path.abspath(backup_dir())
+    full = os.path.abspath(os.path.join(root, n))
+    if os.path.commonpath([root, full]) != root:
+        return None
+    return full
+
+
+def _bk_delete(p):
+    full = _bk_path_of(p.get('name'))
+    if not full:
+        return fail('备份包名不合法')
+    if not os.path.isfile(full):
+        return fail('备份包不存在')
+    try:
+        os.unlink(full)
+    except Exception as e:
+        return fail('删除备份包失败：%s' % e)
+    log('info', 'backup', 'BK_DELETED', '已删除备份包 %s' % os.path.basename(full))
+    return ok({'name': os.path.basename(full)}, '备份包已删除')
+
+
+def _bk_pack(p):
+    """把备份包复制到下载目录。
+
+    为什么不直接让 Web 层读 /opt/drouter/backups 下的文件：那里的包可能
+    权限是 0600（含私钥时），Web 后端以 drouter 用户运行会读不到；
+    而下载是一次性动作，复制一份并按需放宽权限更可控。
+    """
+    full = _bk_path_of(p.get('name'))
+    if not full:
+        return fail('备份包名不合法')
+    if not os.path.isfile(full):
+        return fail('备份包不存在')
+    try:
+        os.makedirs(BACKUP_DL, exist_ok=True)
+    except Exception as e:
+        return fail('创建下载目录失败：%s' % e)
+    name = os.path.basename(full)
+    for old in os.listdir(BACKUP_DL):
+        if old.endswith('.tar.gz'):
+            try:
+                os.unlink(os.path.join(BACKUP_DL, old))
+            except Exception:
+                pass
+    dst = os.path.join(BACKUP_DL, name)
+    try:
+        shutil.copy2(full, dst)
+        os.chmod(dst, 0o644)
+    except Exception as e:
+        return fail('准备下载文件失败：%s' % e)
+    return ok({'name': name, 'path': dst, 'size': os.path.getsize(dst)},
+              '备份包已准备下载')
+
+
+def _bk_open_manifest(p):
+    """打开备份包并校验，返回 (tarfile, manifest)。调用方负责关闭。"""
+    import io as _io
+    full = _bk_path_of(p.get('name'))
+    if not full:
+        return None, None, fail('备份包名不合法')
+    if not os.path.isfile(full):
+        return None, None, fail('备份包不存在')
+    try:
+        tf = tarfile.open(full, 'r:gz')
+    except Exception as e:
+        return None, None, fail('打开备份包失败（文件可能已损坏）：%s' % e)
+    try:
+        member = tf.getmember(BACKUP_MANIFEST)
+    except Exception:
+        try:
+            tf.close()
+        except Exception:
+            pass
+        return None, None, fail('这不是 drouter 备份包：缺少 %s' % BACKUP_MANIFEST)
+    if member.size > 8 * 1024 * 1024:
+        tf.close()
+        return None, None, fail('备份包清单异常巨大，已拒绝解析')
+    try:
+        raw = tf.extractfile(member).read()
+        manifest = json.loads(raw.decode('utf-8'))
+    except Exception as e:
+        tf.close()
+        return None, None, fail('备份包清单解析失败：%s' % e)
+    if not isinstance(manifest, dict):
+        tf.close()
+        return None, None, fail('备份包清单格式不正确')
+    fmt = manifest.get('format')
+    if not isinstance(fmt, int) or fmt > BACKUP_FORMAT:
+        tf.close()
+        return None, None, fail(
+            '备份包格式版本 %s 高于本机支持的 %d，请先升级 drouter'
+            % (fmt, BACKUP_FORMAT))
+    # 解压前先核总体积与文件数：tar 炸弹的解压端比压缩端危险得多
+    total = 0
+    count = 0
+    for m in tf.getmembers():
+        if not m.isfile():
+            continue
+        count += 1
+        total += max(0, int(m.size or 0))
+        if count > BK_MAX_FILES or total > BK_MAX_UNPACK:
+            tf.close()
+            return None, None, fail(
+                '备份包解出后超过上限（%d 个文件 / %.1f MB），疑似异常包已拒绝'
+                % (count, total / 1048576.0))
+    return tf, manifest, None
+
+
+def _bk_inspect(p):
+    """查看备份包内容与完整性（不写任何文件）。"""
+    tf, manifest, err = _bk_open_manifest(p)
+    if err:
+        return err
+    try:
+        members = {m.name: m for m in tf.getmembers() if m.isfile()}
+        rows = []
+        bad = []
+        missing = []
+        for it in manifest.get('files') or []:
+            rel = str(it.get('path') or '').lstrip('/')
+            if not rel:
+                continue
+            m = members.get(rel)
+            row = {'path': '/' + rel, 'size': it.get('size', 0),
+                   'group': it.get('group', ''),
+                   'sensitive': bool(it.get('sensitive')),
+                   'present': m is not None}
+            if m is None:
+                row['state'] = '缺失'
+                missing.append('/' + rel)
+            else:
+                row['state'] = '待校验'
+                rows.append((row, m))
+        for row, m in rows:
+            try:
+                h = hashlib_sha256_member(tf, m)
+            except Exception as e:
+                row['state'] = '校验失败'
+                row['why'] = str(e)
+                bad.append(row['path'])
+                continue
+            if h != row.get('sha256'):
+                row['state'] = '已损坏'
+                bad.append(row['path'])
+            else:
+                row['state'] = '正常'
+        return ok({
+            'manifest': {k: v for k, v in manifest.items() if k != 'files'},
+            'files': [r for r, _m in rows] + [
+                {'path': x, 'state': '缺失', 'size': 0, 'group': '',
+                 'sensitive': False, 'present': False} for x in missing],
+            'ok_count': sum(1 for r, _m in rows if r['state'] == '正常'),
+            'bad': bad,
+            'missing': missing,
+        }, '备份包内容已校验')
+    finally:
+        try:
+            tf.close()
+        except Exception:
+            pass
+
+
+def hashlib_sha256_member(tf, m):
+    """计算 tar 内成员的 sha256（流式，不整块读进内存）。"""
+    import hashlib
+    h = hashlib.sha256()
+    f = tf.extractfile(m)
+    if f is None:
+        raise IOError('无法读取成员内容')
+    for chunk in iter(lambda: f.read(262144), b''):
+        h.update(chunk)
+    return h.hexdigest()
+
+
+def _bk_restore(p):
+    """从备份包还原配置。
+
+    三道保险，缺一不可：
+      1. 逐个成员校验目标路径命中 BK_ALLOW_PREFIX 且 realpath 不逃逸；
+      2. 默认先校验 sha256（verify=True），不一致就整包拒绝；
+      3. 每个文件写入前先备份现有版本到 .drouter-restore-bak，
+         还原错了还能退回去。
+    """
+    p = p or {}
+    verify = p.get('verify') is not False
+    dry = p.get('dry_run') is True
+    # 纵深防御：确认门Web 层已经有一道（没confirm 就强制 dry_run），
+    # 这里再补一道。helper 是以 root 执行的，将来若有人写脚本或CLI
+    # 直接调 restore，就会绕过 Web 层 —— 那就等于没有门。
+    # 两处都要有，且逻辑一致：只有显式 confirm=true 才允许真写。
+    if not dry and p.get('confirm') is not True:
+        dry = True
+    # 不还原这些：它们描述的是「这台机器现在是谁」而不是「配置是什么」
+    skip_exact = {'/etc/hostname', '/etc/fstab'}
+    tf, manifest, err = _bk_open_manifest(p)
+    if err:
+        return err
+    plan = []
+    applied = 0
+    skipped = []
+    errs = []
+    try:
+        members = {m.name: m for m in tf.getmembers() if m.isfile()}
+        for it in manifest.get('files') or []:
+            rel = str(it.get('path') or '').lstrip('/')
+            if not rel:
+                continue
+            dst = '/' + rel
+            if dst in skip_exact:
+                skipped.append({'path': dst, 'why': '属于本机身份信息，不还原'})
+                continue
+            # 1) 白名单 + 真实路径校验
+            norm = os.path.normpath(dst)
+            if not norm.startswith(BK_ALLOW_PREFIX):
+                errs.append('%s：不在允许还原的路径范围内' % dst)
+                continue
+            parent = os.path.dirname(norm)
+            try:
+                rp = os.path.realpath(parent)
+            except Exception:
+                errs.append('%s：无法校验目标目录' % dst)
+                continue
+            if not (rp + '/').startswith(BK_ALLOW_PREFIX) and rp not in (
+                    '/etc', '/opt/drouter', '/var/lib/drouter'):
+                errs.append('%s：真实路径逃逸出允许范围' % dst)
+                continue
+            m = members.get(rel)
+            if m is None:
+                errs.append('%s：备份包内缺少该文件' % dst)
+                continue
+            # 2) 校验
+            if verify:
+                try:
+                    h = hashlib_sha256_member(tf, m)
+                except Exception as e:
+                    errs.append('%s：校验失败（%s）' % (dst, e))
+                    continue
+                if h != it.get('sha256'):
+                    errs.append('%s：内容与清单不符，备份包可能已损坏' % dst)
+                    continue
+            row = {'path': dst, 'size': it.get('size', 0),
+                   'exists': os.path.exists(norm),
+                   'sensitive': bool(it.get('sensitive'))}
+            plan.append(row)
+            if dry:
+                continue
+            # 3) 写入（先留旧版本）
+            try:
+                os.makedirs(parent, exist_ok=True)
+                if os.path.exists(norm):
+                    bak = norm + '.drouter-restore-bak'
+                    try:
+                        shutil.copy2(norm, bak)
+                    except Exception:
+                        pass
+                f = tf.extractfile(m)
+                data = f.read()
+                mode = int(it.get('mode') or '0o644', 8) & 0o777
+                # 私钥类文件强制 0600：备份包可能是从别处传来的，
+                # 原来的 mode 未必可靠
+                if it.get('sensitive') or norm.endswith(
+                        ('.key', 'wg0.conf', 'wg1.conf')):
+                    mode = 0o600
+                with open(norm, 'wb') as out:
+                    out.write(data)
+                os.chmod(norm, mode)
+                applied += 1
+            except Exception as e:
+                errs.append('%s：写入失败（%s）' % (dst, e))
+    finally:
+        try:
+            tf.close()
+        except Exception:
+            pass
+    # 数据库要单独处理：它是 SQLite，直接覆盖写进去可能破坏正在打开的连接。
+    # 还原数据库一律走「先落盘再改名」并且要求服务重载才生效。
+    if not dry and not errs and DB_PATH in [
+            '/' + str(i.get('path', '')).lstrip('/')
+            for i in manifest.get('files') or []]:
+        if manifest.get('include_sensitive'):
+            log('warn', 'backup', 'BK_RESTORE_ADMIN',
+                '本次还原包含管理员账号与密码哈希，若换过 Web 密码请用备份包里的那份')
+    if dry:
+        return ok({'dry_run': True, 'plan': plan, 'skipped': skipped,
+                   'errors': errs, 'file_count': len(plan)},
+                  '预检完成：将写入 %d 个文件' % len(plan))
+    if errs:
+        log('error', 'backup', 'BK_RESTORE_PARTIAL',
+            '还原过程中有 %d 项失败，成功 %d 项' % (len(errs), applied), errs)
+        return fail('还原未完成：%d 项失败（已成功 %d 项）' % (len(errs), applied),
+                    'PARTIAL', {'applied': applied, 'errors': errs,
+                                'skipped': skipped})
+    log('info', 'backup', 'BK_RESTORED',
+        '已从备份包还原 %d 个文件' % applied,
+        {'name': os.path.basename(_bk_path_of(p.get('name')) or '')})
+    return ok({'applied': applied, 'plan': plan, 'skipped': skipped,
+               'errors': []},
+              '已还原 %d 个文件，请到相关页面确认后点一次「保存并应用」' % applied)
+
+
+def _bk_prune(p):
+    """按份数与天数清理备份包。"""
+    p = p or {}
+    try:
+        keep_count = int(p.get('keep_count') or 0)
+    except Exception:
+        keep_count = 0
+    try:
+        keep_days = int(p.get('keep_days') or 0)
+    except Exception:
+        keep_days = 0
+    entries = _bk_list_entries()
+    removed = []
+    now = datetime.now()
+    # 按天：从新到旧，够新的留下，够老的一律删
+    if keep_days > 0:
+        for e in entries:
+            try:
+                born = datetime.fromisoformat(e['mtime'])
+            except Exception:
+                continue
+            if (now - born).days >= keep_days:
+                full = _bk_path_of(e['name'])
+                if full and os.path.isfile(full):
+                    try:
+                        os.unlink(full)
+                        removed.append(e['name'])
+                    except Exception:
+                        pass
+    # 按份数：删完过期的还超量就继续从旧往新删
+    rest = [e for e in entries if e['name'] not in removed]
+    if keep_count > 0 and len(rest) > keep_count:
+        for e in rest[:len(rest) - keep_count]:
+            full = _bk_path_of(e['name'])
+            if full and os.path.isfile(full):
+                try:
+                    os.unlink(full)
+                    removed.append(e['name'])
+                except Exception:
+                    pass
+    if removed:
+        log('info', 'backup', 'BK_PRUNED',
+            '已清理 %d 个备份包（保留 %d）' % (len(removed), len(entries) - len(removed)))
+    return ok({'removed': removed, 'kept': len(entries) - len(removed)},
+              '已清理 %d 个备份包' % len(removed))
+
+
+def _bk_conf(p):
+    """保存备份设置。"""
+    p = p or {}
+    conf = _bk_norm({**_bk_load(), **(p.get('conf') or {})})
+    _bk_save(conf)
+    timer_applied = None
+    if 'auto_enabled' in p or 'auto_hour' in p:
+        timer_applied = _write_backup_timer(conf)
+    log('info', 'backup', 'BK_CONF_SAVED',
+        '已保存备份设置（自动备份%s）' % ('开启' if conf['auto_enabled'] else '关闭'))
+    return ok({'conf': conf, 'timer_applied': timer_applied},
+              '备份设置已保存')
+
+
+# ------------------------------------------------------------- 自动备份 timer
+
+def _write_backup_timer(conf):
+    """生成自动备份的 service + timer 单元，并按开关启停。
+
+    每天凌晨跑一次：错开整点（默认 3 点），避免和磁盘清理、自动快照
+    挤在同一分钟 —— 4GB 机器上三个 oneshot 同时做 tar 会明显卡顿。
+    """
+    hour = max(0, min(int((conf or {}).get('auto_hour') or 3), 23))
+    svc = """[Unit]
+Description=drouter 配置自动备份
+After=network.target
+Documentation=file:///opt/drouter/backend/drouter-backupd.py
+
+[Service]
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Type=oneshot
+User=root
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+ExecStart=/usr/bin/python3 /opt/drouter/backend/drouter-backupd.py
+
+[Install]
+WantedBy=multi-user.target
+"""
+    tmr = """[Unit]
+Description=drouter 配置自动备份定时器（每天 %02d:17）
+
+[Timer]
+OnCalendar=*-*-* %02d:17:00
+AccuracySec=2min
+Persistent=true
+Unit=drouter-backupd.service
+
+[Install]
+WantedBy=timers.target
+""" % (hour, hour)
+    try:
+        os.makedirs('/etc/systemd/system', exist_ok=True)
+        with open('/etc/systemd/system/drouter-backupd.service', 'w',
+                  encoding='utf-8') as f:
+            f.write(svc)
+        with open('/etc/systemd/system/drouter-backupd.timer', 'w',
+                  encoding='utf-8') as f:
+            f.write(tmr)
+        sh(['systemctl', 'daemon-reload'], timeout=20)
+    except Exception as e:
+        log('error', 'backup', 'BK_TIMER_FAIL', '写入自动备份定时器失败：%s' % e)
+        return False
+    if not os.path.isdir('/run/systemd/system'):
+        # 容器形态没有 systemd：单元已写盘，但启停只能靠上层自己拉起
+        log('warn', 'backup', 'BK_TIMER_NOSYSTEMD',
+            '当前环境没有 systemd，自动备份定时器已写入但未启用')
+        return False
+    if conf.get('auto_enabled'):
+        rc, out, err = sh(['systemctl', 'enable', '--now', 'drouter-backupd.timer'],
+                          timeout=30)
+        if rc != 0:
+            log('warn', 'backup', 'BK_TIMER_ENABLE_FAIL',
+                '自动备份定时器启用失败：%s' % (err or out))
+            return False
+        return True
+    sh(['systemctl', 'disable', '--now', 'drouter-backupd.timer'], timeout=30)
+    return False
+
+
+def read_backupd(p=None):
+    """读取自动备份定时器状态（供界面展示）。"""
+    st = _svc_states(('drouter-backupd.service', 'drouter-backupd.timer'))
+    rc, nxt, _e = sh(['systemctl', 'list-timers', 'drouter-backupd.timer',
+                      '--no-pager', '--no-legend'], timeout=12)
+    last = {}
+    try:
+        with open(os.path.join(LOGDIR, 'backupd.jsonl'), encoding='utf-8',
+                  errors='replace') as f:
+            lines = f.read().splitlines()[-40:]
+        for ln in reversed(lines):
+            try:
+                r = json.loads(ln)
+            except Exception:
+                continue
+            if (r.get('code') or '').startswith('BK_'):
+                last = {'ts': r.get('ts', ''), 'msg_cn': r.get('msg_cn', ''),
+                        'code': r.get('code', '')}
+                break
+    except Exception:
+        pass
+    return ok({'units': st,
+               'next': (nxt.splitlines()[0].strip() if nxt else ''),
+               'last': last, 'conf': _bk_norm(_bk_load())})
+
+
+# ============================================== 告警与通知中心（1.0.7）
+#
+# ── 它解决什么 ──────────────────────────────────────────────────────────────
+# 在此之前这套系统是「坏了你自己来看」：日志、快照、流日志全都齐全，但没有任何
+# 东西会在你睡觉、出门、开会的时候告诉你「家里断网了」。路由器最怕的不是坏，
+# 是坏了没人知道 —— 断 4 小时和断 4 分钟，对在家办公的人差别巨大。
+#
+# ── 设计上的三个关键决定 ────────────────────────────────────────────────────
+# 1) **判定与推送分离**。判定在 helper（跑在 root、能读 /proc 与网卡），
+#    推送也在 helper（要发网络请求）。但**规则配置与历史**存在 settings 里，
+#    界面读得到、改得动。drouter-alertd.py 只做「调一次 helper」的薄壳。
+# 2) **状态必须外置**。「WAN 现在是通的还是断的」这个状态存在
+#    /opt/drouter/data/alert-state.json。为什么不用内存：告警判定跨进程
+#    （每次 timer 都是新进程），用内存的话每轮都认为「刚刚才断」，冷却期
+#    形同虚设，一断就是每分钟一条消息轰炸用户。
+# 3) **冷却 + 去重双保险**。冷却解决「同一条故障反复触发」，
+#    去重解决「同一次故障换句话说」。两者都必须在，否则半夜一条抖动
+#    能把手机推 60 条。
+
+ALERT_STATE = '/opt/drouter/data/alert-state.json'
+ALERT_HIST = '/opt/drouter/data/alert-history.jsonl'
+# 单条规则的默认冷却（分钟）。超过这个时间才允许同一条规则再推一次。
+ALERT_COOLDOWN_DEFAULT = 30
+# 历史最多留多少条
+ALERT_HIST_MAX = 500
+
+# 规则定义。level 是严重程度，缺省继承通道设置。
+# 每条规则自带一段「为什么这样判」—— 用户看不懂阈值就永远不敢调。
+ALERT_RULES = [
+    {'k': 'wan_down', 'n': '外网连接中断', 'lv': 'critical', 'unit': '秒',
+     'default': 90, 'min': 30, 'max': 3600,
+     'why': '连续这么久拿不到网关回应才判定为掉线。太短会把一次网络抖动'
+            '（比如邻居的 Wi-Fi 抢占）误报成断网，消息一多就没人看了。'},
+    {'k': 'disk_full', 'n': '磁盘占用过高', 'lv': 'warn', 'unit': '%',
+     'default': 85, 'min': 50, 'max': 99,
+     'why': '日志、快照、备份都在往根分区写。到 90% 以上时 apt 升级和'
+            '数据库写入都可能失败，所以默认在 85% 就提醒。'},
+    {'k': 'temp_high', 'n': 'CPU 温度过高', 'lv': 'warn', 'unit': '℃',
+     'default': 80, 'min': 50, 'max': 110,
+     'why': 'x86 小主机散热一般，超过 80℃就该检查风扇和机箱积灰。'
+            '读不到温度传感器时本条自动跳过，不会误报。'},
+    {'k': 'mem_high', 'n': '内存占用过高', 'lv': 'warn', 'unit': '%',
+     'default': 92, 'min': 60, 'max': 99,
+     'why': '这台机器只有 4GB，可用内存耗尽时 dnsmasq 与 Web 面板会先挂，'
+            '用户连界面都打不开，也就看不到告警。'},
+    {'k': 'load_high', 'n': '负载持续偏高', 'lv': 'info', 'unit': '',
+     'default': 3.0, 'min': 1.0, 'max': 32.0, 'step': 0.1,
+     'why': '2 核机器上负载长期超过 3 说明有任务在忙。短时尖峰是正常的，'
+            '所以这条只做 info 级提醒，不当故障。'},
+    {'k': 'loss_high', 'n': '到网关丢包严重', 'lv': 'warn', 'unit': '%',
+     'default': 30, 'min': 5, 'max': 100,
+     'why': 'ping 丢包高通常意味着网线、网口协商或 Wi-Fi 信号问题，'
+            '表现为「网页时好时坏」，比完全断网更难排查。'},
+    {'k': 'backup_fail', 'n': '自动备份连续失败', 'lv': 'warn', 'unit': '次',
+     'default': 2, 'min': 1, 'max': 20,
+     'why': '备份失败一次可能是磁盘正好满了，连续失败说明设置本身有问题。'},
+    {'k': 'snapshot_fail', 'n': '自动快照连续失败', 'lv': 'info', 'unit': '次',
+     'default': 3, 'min': 1, 'max': 20,
+     'why': '快照是你「改坏了能退回去」的底座。它悄悄失败两周，'
+            '真出事那天你才发现退不回去。'},
+]
+
+# 通知通道模板。type 决定用哪个发送器。
+ALERT_CHANNELS = [
+    {'k': 'bark', 'n': 'Bark（iOS / Android 推送）',
+     'd': '填 Bark 服务器地址与设备 Key，点标题即跳转。支持自建服务器。'},
+    {'k': 'smtp', 'n': '邮件（SMTP）',
+     'd': '适合发到工作邮箱。密码请填专用授权码，不要用主账号密码。'},
+    {'k': 'webhook', 'n': '群机器人 Webhook（钉钉 / 企业微信 / 飞书）',
+     'd': '直接粘机器人地址。按平台自动用该平台的报文格式。'},
+]
+
+
+def _al_state_load():
+    try:
+        with open(ALERT_STATE, encoding='utf-8') as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            return d
+    except Exception:
+        pass
+    return {'firing': {}, 'sent': {}, 'fails': {}}
+
+
+def _al_state_save(d):
+    try:
+        os.makedirs(os.path.dirname(ALERT_STATE), exist_ok=True)
+        tmp = ALERT_STATE + '.tmp.%d' % os.getpid()
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, ALERT_STATE)
+    except Exception as e:
+        log('warn', 'alert', 'AL_STATE_SAVE_FAIL', '告警状态写盘失败：%s' % e)
+
+
+def _al_conf(raw=None):
+    """归一化告警设置。
+
+    raw 传 None 时从数据库读，传 dict 时对给定值归一化 —— 保存路径必须走后者，
+    否则用户填的越界值会被静默钳到上下限却没有任何提示。
+    """
+    c = raw if isinstance(raw, dict) else (_load_setting('alert') or {})
+    if not isinstance(c, dict):
+        c = {}
+    rules = {}
+    raw = c.get('rules')
+    if isinstance(raw, dict):
+        rules = raw
+    out_rules = {}
+    for r in ALERT_RULES:
+        k = r['k']
+        v = rules.get(k, r['default'])
+        try:
+            v = float(v)
+        except Exception:
+            v = float(r['default'])
+        if r.get('step'):
+            v = round(v, 1)
+        else:
+            v = int(v)
+        out_rules[k] = max(r['min'], min(r['max'], v))
+    chans = c.get('channels')
+    if not isinstance(chans, list):
+        chans = []
+    out_ch = []
+    for ch in chans:
+        if not isinstance(ch, dict):
+            continue
+        t = str(ch.get('type') or '').strip()
+        if t not in ('bark', 'smtp', 'webhook'):
+            continue
+        out_ch.append({
+            'type': t,
+            'name': str(ch.get('name') or '')[:60],
+            'enabled': ch.get('enabled') is True,
+            'url': str(ch.get('url') or '')[:500],
+            'title': str(ch.get('title') or '')[:80],
+            'host': str(ch.get('host') or '')[:200],
+            'port': int(ch.get('port') or 0) or None,
+            'user': str(ch.get('user') or '')[:100],
+            'pass': str(ch.get('pass') or '')[:200],
+            'from': str(ch.get('from') or '')[:200],
+            'to': str(ch.get('to') or '')[:300],
+            'tls': ch.get('tls') is not False,
+        })
+    return {
+        'enabled': c.get('enabled') is True,
+        'interval_sec': max(60, min(int(c.get('interval_sec') or 300), 3600)),
+        'cooldown_min': max(1, min(int(c.get('cooldown_min') or ALERT_COOLDOWN_DEFAULT), 1440)),
+        'quiet_from': str(c.get('quiet_from') or '')[:5],
+        'quiet_to': str(c.get('quiet_to') or '')[:5],
+        'rules': out_rules,
+        'channels': out_ch,
+    }
+
+
+def _al_hist_append(rec):
+    try:
+        os.makedirs(os.path.dirname(ALERT_HIST), exist_ok=True)
+        with open(ALERT_HIST, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+        # 顺手裁剪：不能让它无限长，否则半年后就是第二个「日志把盘吃满」
+        try:
+            lines = open(ALERT_HIST, encoding='utf-8', errors='replace') \
+                .read().splitlines()
+            if len(lines) > ALERT_HIST_MAX:
+                with open(ALERT_HIST, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(lines[-ALERT_HIST_MAX:]) + '\n')
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _al_hist_read(limit=100):
+    out = []
+    try:
+        with open(ALERT_HIST, encoding='utf-8', errors='replace') as f:
+            lines = f.read().splitlines()[-int(limit or 100):]
+        for ln in reversed(lines):
+            try:
+                out.append(json.loads(ln))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+# --------------------------------------------------------- 告警判定（只读）
+
+def _al_probe_wan():
+    """判外网是否可达。
+
+    刻意不 ping 公网 IP（很多家用宽带禁 ICMP，会一直报「断了」），
+    而是 ping 默认网关 —— 网关不通就是真断了，网关通就说明本机链路正常。
+    """
+    rc, o, _e = sh(['sh', '-c', "ip -4 route show default 2>/dev/null "
+                    "| awk '{print $3; exit}'"], timeout=6)
+    gw = (o or '').strip()
+    if not gw:
+        # 没有默认路由：没拨号或路由被清空，也算外网不可用
+        return {'up': False, 'why': '本机没有默认路由（未拨号或路由表为空）', 'gw': ''}
+    rc, o, e = sh(['ping', '-n', '-c', '2', '-W', '2', gw], timeout=8)
+    loss = None
+    m = re.search(r'(\d+)% packet loss', o or '')
+    if m:
+        loss = int(m.group(1))
+    up = (rc == 0) and (loss is not None and loss < 100)
+    why = '' if up else '连续无法访问网关 %s' % gw
+    return {'up': up, 'why': why, 'gw': gw, 'loss_pct': loss}
+
+
+def _al_probe_disk():
+    """找最满的那个挂载点。
+
+    ⚠️ _read_disks 返回的 pct 是**字符串** '85%'、可用空间叫 avail（不是 free）。
+    直接拿 d['pct'] 和 85 比较会 TypeError，被 except 吞掉后表现为
+    「磁盘告警从来没触发过」—— 这种静默失效最难发现，所以这里显式转数值。
+    """
+    worst = None
+    for d in _read_disks():
+        raw = d.get('pct')
+        try:
+            pct = int(str(raw).replace('%', '').strip())
+        except Exception:
+            continue
+        if worst is None or pct > worst['pct']:
+            worst = {'mount': d.get('mount', ''), 'pct': pct,
+                     'avail': d.get('avail', ''), 'size': d.get('size', '')}
+    return worst or {}
+
+
+def _al_probe_mem():
+    try:
+        with open('/proc/meminfo', encoding='utf-8') as f:
+            info = {}
+            for ln in f:
+                k, _, v = ln.partition(':')
+                info[k.strip()] = v.strip()
+        mt = int(info.get('MemTotal', '0 kB').split()[0])
+        ma = int(info.get('MemAvailable', '0 kB').split()[0])
+        if mt <= 0:
+            return {}
+        # 用 MemAvailable 而不是 MemFree：Linux 里空闲内存低是正常的
+        # （拿去做缓存），MemAvailable 才是「还能不能再分配」的量
+        return {'pct': int((mt - ma) * 100 / mt),
+                'avail_mb': ma // 1024, 'total_mb': mt // 1024}
+    except Exception:
+        return {}
+
+
+def _al_probe_load():
+    try:
+        with open('/proc/loadavg', encoding='utf-8') as f:
+            p = f.read().split()
+        return {'load1': float(p[0]), 'load5': float(p[1]), 'load15': float(p[2])}
+    except Exception:
+        return {}
+
+
+def _al_probe_fail_streak(marker):
+    """数某个守护连续失败了几次（读它自己的结构化日志尾部）。"""
+    path = os.path.join(LOGDIR, '%s.jsonl' % marker)
+    streak = 0
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            lines = f.read().splitlines()[-60:]
+    except Exception:
+        return 0
+    for ln in reversed(lines):
+        try:
+            r = json.loads(ln)
+        except Exception:
+            continue
+        code = str(r.get('code') or '')
+        if code.endswith('_FAIL') or 'FAIL' in code or 'ERROR' in str(r.get('level') or ''):
+            streak += 1
+        elif code:
+            # 遇到一条成功的记录就说明已经恢复，失败链到此为止
+            break
+    return streak
+
+
+def _al_now_minute():
+    return datetime.now().hour * 60 + datetime.now().minute
+
+
+def _al_in_quiet(conf):
+    """是否落在免打扰时段。跨零点（23:00–07:00）要正确处理。"""
+    qf = str(conf.get('quiet_from') or '').strip()
+    qt = str(conf.get('quiet_to') or '').strip()
+    if not re.match(r'^\d{2}:\d{2}$', qf) or not re.match(r'^\d{2}:\d{2}$', qt):
+        return False
+    a = int(qf[:2]) * 60 + int(qf[3:])
+    b = int(qt[:2]) * 60 + int(qt[3:])
+    if a == b:
+        return False
+    now = _al_now_minute()
+    if a < b:
+        return a <= now < b
+    return now >= a or now < b        # 跨零点
+
+
+def act_alert(p):
+    """告警与通知中心：status / test / run / conf / history / clear。
+
+    run 是「判定一次并按需推送」，由 drouter-alertd.py 定时调用；
+    界面手动点「立即检测」走的是同一个 op —— 定时任务和手动检查
+    必须是同一条代码路径，否则手动测通了不代表定时也能通。
+    """
+    p = p or {}
+    op = str(p.get('op') or 'status')
+    if op == 'status':
+        return _al_status()
+    if op == 'run':
+        return _al_run(p)
+    if op == 'test':
+        return _al_test(p)
+    if op == 'conf':
+        return _al_conf_op(p)
+    if op == 'history':
+        return ok({'items': _al_hist_read(p.get('limit'))}, '已读取告警历史')
+    if op == 'clear':
+        return _al_clear()
+    if op == 'services':
+        return _al_services()
+    return fail('未知的告警操作：%s' % op)
+
+
+def _al_status():
+    conf = _al_conf()
+    st = _al_state_load()
+    units = _svc_states(('drouter-alertd.service', 'drouter-alertd.timer'))
+    rc, nxt, _e = sh(['systemctl', 'list-timers', 'drouter-alertd.timer',
+                      '--no-pager', '--no-legend'], timeout=12)
+    last = {}
+    try:
+        with open(os.path.join(LOGDIR, 'alertd.jsonl'), encoding='utf-8',
+                  errors='replace') as f:
+            lines = f.read().splitlines()[-40:]
+        for ln in reversed(lines):
+            try:
+                r = json.loads(ln)
+            except Exception:
+                continue
+            if (r.get('code') or '').startswith('AL_'):
+                last = {'ts': r.get('ts', ''), 'msg_cn': r.get('msg_cn', ''),
+                        'code': r.get('code', ''), 'level': r.get('level', '')}
+                break
+    except Exception:
+        pass
+    rules = []
+    for r in ALERT_RULES:
+        rules.append({'key': r['k'], 'name': r['n'], 'lv': r['lv'],
+                      'unit': r['unit'], 'value': conf['rules'].get(r['k']),
+                      'default': r['default'], 'min': r['min'], 'max': r['max'],
+                      'step': r.get('step'),
+                      'why': r['why'],
+                      'firing': bool((st.get('firing') or {}).get(r['k']))})
+    return ok({
+        'conf': conf, 'rules': rules,
+        'channel_types': ALERT_CHANNELS,
+        'units': units,
+        'next': (nxt.splitlines()[0].strip() if nxt else ''),
+        'last': last,
+        'state': st,
+        'quiet_now': _al_in_quiet(conf),
+        'enabled_ch': len([c for c in conf['channels'] if c['enabled']]),
+        'history': _al_hist_read(30),
+    }, '已读取告警设置')
+
+
+def _al_services():
+    """把各守护的健康状况列出来（供用户判断告警是否真的在跑）。"""
+    return ok({
+        'units': _svc_states(('drouter-alertd.timer', 'drouter-logd.timer',
+                              'drouter-snapshot.timer', 'drouter-backupd.timer')),
+    })
+
+
+def _al_collect(conf):
+    """跑一遍全部规则，返回命中列表 + 全部探测值（给界面展示用）。"""
+    probes = {'wan': _al_probe_wan(), 'disk': _al_probe_disk(),
+              'mem': _al_probe_mem(), 'load': _al_probe_load()}
+    lat = _route_latency()
+    probes['latency'] = {'ms': lat.get('ms'), 'loss_pct': lat.get('loss_pct'),
+                         'target': lat.get('target')}
+    st = _al_state_load()
+    firing = st.get('firing') or {}
+    hits = []
+    thr = conf['rules']
+
+    def _hit(k, lv, msg, val):
+        hits.append({'key': k, 'lv': lv, 'msg_cn': msg, 'value': val,
+                     'new': not firing.get(k)})
+
+    # WAN 掉线：必须连续多轮都不通才报。state 里的 wan_bad_since
+    # 记录「从哪一刻开始不通」，这才是「连续 N 秒」的实现方式 ——
+    # 靠单轮判断会把「一次抖动」当成「掉线 90 秒」。
+    w = probes['wan']
+    if w.get('up'):
+        st['wan_bad_since'] = 0
+    else:
+        since = int(st.get('wan_bad_since') or 0)
+        if not since:
+            since = int(time.time())
+            st['wan_bad_since'] = since
+        held = int(time.time()) - since
+        if held >= int(thr.get('wan_down', 90)):
+            _hit('wan_down', 'critical',
+                 '外网已中断 %d 秒：%s' % (held, w.get('why') or '网关不可达'),
+                 held)
+    # 磁盘
+    d = probes['disk']
+    if d.get('pct') is not None and d['pct'] >= thr.get('disk_full', 85):
+        _hit('disk_full', 'warn',
+             '磁盘 %s 已用 %d%%（共 %s，剩余 %s）'
+             % (d.get('mount') or '/', d['pct'], d.get('size') or '未知',
+                d.get('avail') or '未知'),
+             d['pct'])
+    # 温度。_read_temp 返回的是 (温度, 来源) 元组，不是 dict ——
+    # 读成 dict 会让 tp.get('c') 恒为 None，这条规则静默永不触发。
+    try:
+        t_c, t_src = _read_temp()
+    except Exception:
+        t_c, t_src = None, ''
+    if t_c is not None:
+        probes['temp'] = {'c': t_c, 'src': t_src or ''}
+        if t_c >= thr.get('temp_high', 80):
+            _hit('temp_high', 'warn', 'CPU 温度 %.1f℃ 偏高（来源 %s）'
+                 % (t_c, t_src or '未知'), t_c)
+    # 内存
+    m = probes['mem']
+    if m.get('pct') is not None and m['pct'] >= thr.get('mem_high', 92):
+        _hit('mem_high', 'warn',
+             '内存已用 %d%%（可用 %d MB / 共 %d MB）'
+             % (m['pct'], m.get('avail_mb', 0), m.get('total_mb', 0)), m['pct'])
+    # 负载
+    ld = probes['load']
+    if ld.get('load1') is not None and ld['load1'] >= thr.get('load_high', 3.0):
+        _hit('load_high', 'info', '系统负载 %.2f（1 分钟）持续偏高' % ld['load1'],
+             ld['load1'])
+    # 丢包
+    lp = probes['latency']
+    if lp.get('loss_pct') is not None and lp['loss_pct'] >= thr.get('loss_high', 30):
+        _hit('loss_high', 'warn',
+             '到 %s 丢包 %d%%' % (lp.get('target') or '网关', lp['loss_pct']),
+             lp['loss_pct'])
+    # 备份 / 快照连续失败
+    bf = _al_probe_fail_streak('backupd')
+    probes['backup_fail'] = bf
+    if bf >= thr.get('backup_fail', 2):
+        _hit('backup_fail', 'warn', '自动备份已连续失败 %d 次' % bf, bf)
+    sf = _al_probe_fail_streak('snapshotd')
+    probes['snapshot_fail'] = sf
+    if sf >= thr.get('snapshot_fail', 3):
+        _hit('snapshot_fail', 'info', '自动快照已连续失败 %d 次' % sf, sf)
+    # 把 firing 表更新成本轮的命中项（没命中的都算恢复）
+    new_firing = {h['key']: True for h in hits}
+    st['firing'] = new_firing
+    st['probes'] = probes
+    st['ts'] = int(time.time())
+    _al_state_save(st)
+    return hits, probes
+
+
+def _al_run(p):
+    """判定 + 按冷却推送。"""
+    p = p or {}
+    conf = _al_conf()
+    forced = p.get('force') is True
+    if not conf.get('enabled') and not forced:
+        return ok({'fired': 0, 'hits': [], 'probes': _al_state_load().get('probes') or {},
+                   'enabled': False}, '告警未启用，本次只做探测不做推送')
+    st = _al_state_load()
+    hits, probes = _al_collect(conf)
+    sent = st.get('sent') or {}
+    now = int(time.time())
+    cooldown = int(conf.get('cooldown_min') or ALERT_COOLDOWN_DEFAULT) * 60
+    quiet = _al_in_quiet(conf) and not forced
+    fired = []
+    skipped = []
+    for h in hits:
+        last = int(sent.get(h['key']) or 0)
+        if not forced and now - last < cooldown:
+            skipped.append({'key': h['key'], 'msg_cn': h['msg_cn'],
+                            'why': '冷却中（距上次 %d 分钟，冷却期 %d 分钟）'
+                                   % ((now - last) // 60, cooldown // 60)})
+            continue
+        if quiet and h['lv'] != 'critical':
+            # 免打扰只压 warning / info。critical 永远发 ——
+            # 「半夜别吵我」不包括「家里断网了」
+            skipped.append({'key': h['key'], 'msg_cn': h['msg_cn'],
+                            'why': '在免打扰时段内（非紧急）'})
+            continue
+        r = _al_dispatch(conf, h)
+        if r.get('ok'):
+            sent[h['key']] = now
+            fired.append(h['key'])
+        else:
+            skipped.append({'key': h['key'], 'msg_cn': h['msg_cn'],
+                            'why': '推送失败：%s' % (r.get('msg_cn') or '未知错误')})
+    st['sent'] = sent
+    _al_state_save(st)
+    if fired:
+        log('warn', 'alert', 'AL_FIRED', '已推送 %d 条告警：%s'
+            % (len(fired), '、'.join(fired)), {'keys': fired})
+    return ok({'fired': len(fired), 'fired_keys': fired, 'hits': hits,
+               'skipped': skipped, 'probes': probes, 'enabled': True,
+               'quiet': quiet}, '检测完成：%d 条告警已推送，%d 条被跳过'
+                              % (len(fired), len(skipped)))
+
+
+def _al_dispatch(conf, h):
+    """把一条告警发到所有启用的通道。任一通道成功即算送达。"""
+    chans = [c for c in conf.get('channels') or [] if c.get('enabled')]
+    if not chans:
+        return fail('没有启用任何通知通道')
+    ok_any = False
+    errs = []
+    for c in chans:
+        try:
+            if c['type'] == 'bark':
+                r = _al_send_bark(c, h)
+            elif c['type'] == 'smtp':
+                r = _al_send_smtp(c, h)
+            else:
+                r = _al_send_webhook(c, h)
+        except Exception as e:
+            r = fail(str(e))
+        if r.get('ok'):
+            ok_any = True
+        else:
+            errs.append('%s：%s' % (c.get('name') or c['type'],
+                                    r.get('msg_cn') or '未知错误'))
+    _al_hist_append({
+        'ts': datetime.now().isoformat(timespec='seconds'),
+        'key': h['key'], 'lv': h['lv'], 'msg_cn': h['msg_cn'],
+        'value': h.get('value'),
+        'ok': ok_any, 'channels': len(chans),
+        'errs': errs,
+    })
+    if ok_any:
+        return ok({'delivered': True}, '已送达 %d 个通道' % len(chans))
+    return fail('全部通道推送失败：%s' % '；'.join(errs))
+
+
+def _al_http(url, method='GET', body=None, headers=None, timeout=12):
+    """最小 HTTP 客户端。不用 urllib.request 是因为它对非 2xx 直接抛异常，
+    而推送接口（尤其 webhook）经常用 200 + 业务错误码表达失败，
+    我们需要读到响应体才能给出可读的错误提示。"""
+    import http.client
+    from urllib.parse import urlparse
+    pu = urlparse(url)
+    if pu.scheme not in ('http', 'https'):
+        return fail('只支持 http / https 地址，当前是 %s' % pu.scheme)
+    if not pu.hostname:
+        return fail('地址格式不正确')
+    conn = None
+    try:
+        if pu.scheme == 'https':
+            import ssl
+            ctx = ssl.create_default_context()
+            # 推送目标是用户自己填的地址，自签证书在局域网里很常见
+            # （Bark 自建、群机器人内网反代）。校验失败不该让告警发不出去。
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            conn = http.client.HTTPSConnection(pu.hostname, pu.port or 443,
+                                               timeout=timeout, context=ctx)
+        else:
+            conn = http.client.HTTPConnection(pu.hostname, pu.port or 80,
+                                              timeout=timeout)
+        hd = dict(headers or {})
+        path = pu.path or '/'
+        if pu.query:
+            path += '?' + pu.query
+        conn.request(method, path, body=body, headers=hd)
+        resp = conn.getresponse()
+        data = resp.read(65536)
+        txt = data.decode('utf-8', 'replace')
+        if 200 <= resp.status < 300:
+            return ok({'status': resp.status, 'body': txt[:400]}, '推送成功')
+        return fail('对方返回 HTTP %d：%s' % (resp.status, txt[:200]))
+    except Exception as e:
+        return fail('推送请求失败：%s' % e)
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _al_send_bark(c, h):
+    """Bark 推送。
+
+    允许两种填法：完整地址（含设备 key），或只填 key。
+    只填 key 时用官方 api.day.app；填了完整地址就用它（支持自建服务器）。
+    """
+    url = (c.get('url') or '').strip()
+    if not re.match(r'^https?://', url):
+        key = url
+        if not key or '/' in key:
+            return fail('请填写完整的 Bark 推送地址，或直接填设备 Key')
+        url = 'https://api.day.app/%s' % key
+    body = json.dumps({
+        'title': c.get('title') or '路由器告警',
+        'body': '[%s] %s' % ({'critical': '严重', 'warn': '警告',
+                             'info': '提示'}.get(h['lv'], '通知'), h['msg_cn']),
+        'group': 'drouter', 'level': h['lv'],
+    }, ensure_ascii=False).encode('utf-8')
+    r = _al_http(url, 'POST', body,
+                 {'Content-Type': 'application/json; charset=utf-8'})
+    if r.get('ok'):
+        try:
+            b = json.loads((r.get('data') or {}).get('body') or '{}')
+            if b.get('code') not in (200, None):
+                return fail('Bark 拒绝：%s' % (b.get('message') or '未知原因'))
+        except Exception:
+            pass
+    return r
+
+
+def _al_send_webhook(c, h):
+    url = c.get('url') or ''
+    if not re.match(r'^https?://', url):
+        return fail('Webhook 地址必须以 http:// 或 https:// 开头')
+    text = '【路由器%s】%s' % ({'critical': '严重告警', 'warn': '警告',
+                              'info': '提示'}.get(h['lv'], '通知'), h['msg_cn'])
+    # 三家平台的报文格式完全不同，按 URL 里的关键字猜
+    if 'qyapi.weixin.qq.com' in url:
+        body = json.dumps({'msgtype': 'text', 'text': {'content': text}},
+                          ensure_ascii=False).encode('utf-8')
+    elif 'oapi.dingtalk.com' in url:
+        body = json.dumps({'msgtype': 'text',
+                           'text': {'content': text}}, ensure_ascii=False).encode('utf-8')
+    elif 'open.feishu.cn' in url:
+        body = json.dumps({'msg_type': 'text',
+                           'content': {'text': text}}, ensure_ascii=False).encode('utf-8')
+    else:
+        body = json.dumps({'title': c.get('title') or '路由器告警',
+                           'text': text, 'level': h['lv'],
+                           'msg_cn': h['msg_cn']}, ensure_ascii=False).encode('utf-8')
+    r = _al_http(url, 'POST', body,
+                 {'Content-Type': 'application/json; charset=utf-8'})
+    if r.get('ok'):
+        txt = (r.get('data') or {}).get('body') or ''
+        # 钉钉 / 企业微信都用 HTTP 200 + errcode 表达业务失败，
+        # 只看 HTTP 状态码会把「被拒绝」当成「发送成功」
+        m = re.search(r'"errcode"\s*:\s*(\d+)', txt)
+        if m and m.group(1) != '0':
+            return fail('对方拒绝：%s' % txt[:200])
+    return r
+
+
+def _al_send_smtp(c, h):
+    host = c.get('host') or ''
+    if not host:
+        return fail('未填写 SMTP 服务器地址')
+    to = c.get('to') or ''
+    if not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', to):
+        return fail('收件人地址格式不正确')
+    sender = c.get('from') or c.get('user') or 'drouter@localhost'
+    port = c.get('port') or (465 if c.get('tls') is not False else 25)
+    msg = ('From: %s\r\nTo: %s\r\nSubject: =?UTF-8?B?%s?=\r\n'
+           'MIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n'
+           % (sender, to,
+              base64.b64encode(('[路由器%s] %s' % (
+                  {'critical': '严重告警', 'warn': '警告',
+                   'info': '提示'}.get(h['lv'], '通知'), h['msg_cn'])).encode('utf-8')
+              ).decode('ascii')))
+    msg += '%s\n\n时间：%s\n主机：%s\n' % (h['msg_cn'],
+                                        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                        _bk_hostname())
+    try:
+        import smtplib
+        import ssl as _ssl
+        if int(port) == 465:
+            srv = smtplib.SMTP_SSL(host, int(port), timeout=15,
+                                   context=_ssl.create_default_context())
+        else:
+            srv = smtplib.SMTP(host, int(port), timeout=15)
+            if c.get('tls') is not False and int(port) in (587, 2525):
+                try:
+                    srv.starttls(context=_ssl.create_default_context())
+                except Exception:
+                    pass
+        try:
+            if c.get('user'):
+                try:
+                    srv.login(c['user'], c.get('pass') or '')
+                except Exception as e:
+                    return fail('登录失败：%s（请确认用的是授权码而不是登录密码）' % e)
+            srv.sendmail(sender, [to], msg.encode('utf-8'))
+        finally:
+            try:
+                srv.quit()
+            except Exception:
+                pass
+    except Exception as e:
+        return fail('邮件发送失败：%s' % e)
+    return ok({'delivered': 'smtp'}, '邮件已发送')
+
+
+def _al_test(p):
+    """发一条测试消息，验证通道配置是否正确。"""
+    p = p or {}
+    conf = _al_conf()
+    chs = conf.get('channels') or []
+    # 可以只测某一个通道
+    only = str(p.get('type') or '').strip()
+    if only:
+        chs = [c for c in chs if c.get('type') == only]
+    if not chs:
+        return fail('没有启用任何通知通道，请先添加并启用通道')
+    test = {'key': 'test', 'lv': 'warn',
+            'msg_cn': '这是一条测试消息。看到它说明通知通道配置正确。',
+            'value': None}
+    results = []
+    allok = True
+    for c in chs:
+        try:
+            if c['type'] == 'bark':
+                r = _al_send_bark(c, test)
+            elif c['type'] == 'smtp':
+                r = _al_send_smtp(c, test)
+            else:
+                r = _al_send_webhook(c, test)
+        except Exception as e:
+            r = fail(str(e))
+        allok = allok and bool(r.get('ok'))
+        results.append({'name': c.get('name') or c['type'], 'type': c['type'],
+                        'ok': bool(r.get('ok')),
+                        'msg_cn': r.get('msg_cn') or ''})
+    _al_hist_append({'ts': datetime.now().isoformat(timespec='seconds'),
+                     'key': 'test', 'lv': 'warn',
+                     'msg_cn': '手动发送测试消息', 'ok': allok,
+                     'channels': len(chs)})
+    if allok:
+        return ok({'results': results}, '测试消息已发送到 %d 个通道' % len(chs))
+    return fail('有通道发送失败，请检查下方明细', 'PARTIAL', {'results': results})
+
+
+def _al_clear():
+    try:
+        if os.path.exists(ALERT_HIST):
+            os.unlink(ALERT_HIST)
+    except Exception as e:
+        return fail('清空历史失败：%s' % e)
+    st = _al_state_load()
+    st['sent'] = {}
+    st['firing'] = {}
+    st['wan_bad_since'] = 0
+    _al_state_save(st)
+    return ok({}, '告警历史与冷却状态已清空')
+
+
+def _al_conf_op(p):
+    """保存告警设置。"""
+    p = p or {}
+    cur = _al_conf()
+    src = p.get('conf')
+    src = src if isinstance(src, dict) else {k: v for k, v in p.items()
+                                              if k != 'conf'}
+    new = dict(cur)
+    if 'enabled' in src:
+        new['enabled'] = src['enabled'] is True
+    for k, lo, hi in (('interval_sec', 60, 3600), ('cooldown_min', 1, 1440)):
+        if k in src and src[k] not in (None, ''):
+            try:
+                new[k] = max(lo, min(int(src[k]), hi))
+            except Exception:
+                pass
+    for k in ('quiet_from', 'quiet_to'):
+        if k in src:
+            v = str(src[k] or '').strip()
+            if v and not re.match(r'^\d{2}:\d{2}$', v):
+                return fail('%s 格式不正确，应为 HH:MM' % k)
+            if v:
+                try:
+                    hh, mm = int(v[:2]), int(v[3:])
+                    if hh > 23 or mm > 59:
+                        raise ValueError
+                except Exception:
+                    return fail('%s 的小时或分钟超出范围' % k)
+            new[k] = v
+    if 'rules' in src and isinstance(src['rules'], dict):
+        rules = dict(new.get('rules') or {})
+        for r in ALERT_RULES:
+            if r['k'] in src['rules']:
+                v = src['rules'][r['k']]
+                if v in (None, ''):
+                    continue
+                try:
+                    v = float(v)
+                except Exception:
+                    return fail('%s 的阈值必须是数字' % r['n'])
+                rules[r['k']] = v
+        new['rules'] = rules
+    if 'channels' in src and isinstance(src['channels'], list):
+        # Web 层出于安全不把 SMTP 口令回显给前端（GET 里被抹掉），
+        # 于是用户「只改了阈值」再点保存时，传上来的 pass 必然是空串。
+        # 如果照单全收，密码就被清空了 —— 用户再也收不到邮件，
+        # 而且界面上完全看不出发生过。这里按「同类型 + 同端点」沿用旧口令。
+        olds = [c for c in (cur.get('channels') or []) if isinstance(c, dict)]
+        chs = []
+        for c in src['channels']:
+            if not isinstance(c, dict):
+                continue
+            t = str(c.get('type') or '').strip()
+            if t not in ('bark', 'smtp', 'webhook'):
+                return fail('未知的通知通道类型：%s' % (t or '空'))
+            c = dict(c)
+            if not str(c.get('pass') or '').strip():
+                same = [o for o in olds
+                        if o.get('type') == t
+                        and str(o.get('host') or '') == str(c.get('host') or '')
+                        and str(o.get('user') or '') == str(c.get('user') or '')]
+                if same and same[0].get('pass'):
+                    c['pass'] = same[0]['pass']
+            chs.append(c)
+        new['channels'] = chs
+    merged = _al_conf(new)
+    _save_setting('alert', merged)
+    timer = _write_alert_timer(merged)
+    log('info', 'alert', 'AL_CONF_SAVED',
+        '已保存告警设置（%s，冷却 %d 分钟）'
+        % ('已启用' if merged['enabled'] else '未启用', merged['cooldown_min']))
+    return ok({'conf': merged, 'timer_applied': timer}, '告警设置已保存')
+
+
+# ------------------------------------------------------------- 告警 timer
+
+def _write_alert_timer(conf):
+    """生成告警检测的 service + timer 单元，并按开关启停。"""
+    interval = max(60, min(int((conf or {}).get('interval_sec') or 300), 3600))
+    svc = """[Unit]
+Description=drouter 告警检测与推送
+After=network.target
+Documentation=file:///opt/drouter/backend/drouter-alertd.py
+
+[Service]
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Type=oneshot
+User=root
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+ExecStart=/usr/bin/python3 /opt/drouter/backend/drouter-alertd.py
+
+[Install]
+WantedBy=multi-user.target
+"""
+    tmr = """[Unit]
+Description=drouter 告警检测定时器（每 %d 秒）
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=%ds
+AccuracySec=10s
+Persistent=false
+Unit=drouter-alertd.service
+
+[Install]
+WantedBy=timers.target
+""" % (interval, interval)
+    try:
+        os.makedirs('/etc/systemd/system', exist_ok=True)
+        with open('/etc/systemd/system/drouter-alertd.service', 'w',
+                  encoding='utf-8') as f:
+            f.write(svc)
+        with open('/etc/systemd/system/drouter-alertd.timer', 'w',
+                  encoding='utf-8') as f:
+            f.write(tmr)
+        sh(['systemctl', 'daemon-reload'], timeout=20)
+    except Exception as e:
+        log('error', 'alert', 'AL_TIMER_FAIL', '写入告警定时器失败：%s' % e)
+        return False
+    if not os.path.isdir('/run/systemd/system'):
+        log('warn', 'alert', 'AL_TIMER_NOSYSTEMD',
+            '当前环境没有 systemd，告警定时器已写入但未启用')
+        return False
+    if (conf or {}).get('enabled'):
+        rc, out, err = sh(['systemctl', 'enable', '--now', 'drouter-alertd.timer'],
+                          timeout=30)
+        if rc != 0:
+            log('warn', 'alert', 'AL_TIMER_ENABLE_FAIL',
+                '告警定时器启用失败：%s' % (err or out))
+            return False
+        return True
+    sh(['systemctl', 'disable', '--now', 'drouter-alertd.timer'], timeout=30)
+    return False
+
+
+def read_alertd(p=None):
+    return _al_status()
+
+
+# ============================================== 配额与用量账单（1.0.7）
+#
+# ── 最重要的约束：不能在请求里全量扫日志 ─────────────────────────────────────
+# ulog.jsonl 在正常运行时可以到几十万行、几百 MB。用户在页面上点一下「查询」，
+# 如果就 `f.read().splitlines()` 然后全量 json.loads，4GB 内存的机器会直接
+# 被 OOM kill —— 而且这正是最常见的场景（这台机器就是给人用来看流量的）。
+#
+# 解决办法是**增量聚合**：drouter-quotad.py 每 10 分钟扫一次新追加的行，
+# 按 (小时 × 设备 × 服务) 累加到 /opt/drouter/data/quota.jsonl。
+# 页面查询只读这个已经聚合过的小文件（通常几 MB），再叠加内存里的缓存。
+# 聚合是幂等的：用「已处理到第几字节 + 文件指纹」做游标，重跑不会重复计。
+#
+# ── 数据来源与口径 ──────────────────────────────────────────────────────────
+# * 设备名来自 DHCP 租约（IP → 主机名 / MAC），拿不到就叫「未知设备」；
+# * 字节数取 conntrack 事件的 extra.bytes，只算 ORIG 方向（回复方向会重复计）；
+# * 已知问题：conntrack 事件是「连接结束时」才带最终字节数的，
+#   长连接（比如持续下载）在中途查是看不到的 —— 所以当月数据会随时间回补，
+#   这是数据模型的固有限制，界面上必须说清楚，否则用户会以为统计不准。
+
+QUOTA_AGG = '/opt/drouter/data/quota.jsonl'
+QUOTA_CURSOR = '/opt/drouter/data/quota.cursor'
+QUOTA_CONF = 'quota'
+# 聚合文件上限：超过就按小时桶裁剪最早的数据
+QUOTA_KEEP_HOURS = 24 * 120        # 保留 120 天的小时桶
+QUOTA_MAX_BUCKETS = 24 * 120
+
+# 常见服务端口 → 中文服务名。用于「按服务分类」和工作室的费用说明。
+# 只收家用/办公最常碰的，认不出来就归「其它」。
+QUOTA_PORTS = {
+    '80': '网页浏览', '443': '网页浏览（HTTPS）', '8080': '网页浏览（代理）',
+    '22': '远程登录', '23': '远程登录', '3389': '远程桌面',
+    '445': 'Windows 共享', '139': 'Windows 共享', '2049': 'NFS 共享',
+    '53': 'DNS 查询', '67': 'DHCP 分配', '546': 'DHCP 请求',
+    '123': '时间同步（NTP）', '1900': '设备发现（SSDP）',
+    '5060': '网络电话（SIP）', '1935': '直播推流', '554': '视频监控（RTSP）',
+    '5000': '影音服务', '32400': '媒体库（Plex）', '8096': '媒体库（Jellyfin）',
+    '9100': '网络打印', '631': '网络打印（IPP）', '137': 'NetBIOS 名称',
+    '138': 'NetBIOS 会话', '161': 'SNMP 监控', '1883': 'MQTT / 智能家居',
+    '51820': 'WireGuard VPN', '5061': '加密网络电话',
+}
+
+
+def _qt_load():
+    return _load_setting(QUOTA_CONF) or {}
+
+
+def _qt_norm(d):
+    d = d if isinstance(d, dict) else {}
+    out = {
+        'enabled': d.get('enabled') is True,
+        'interval_min': max(5, min(int(d.get('interval_min') or 10), 240)),
+        # 套餐信息：填了才能算「费用分摊」
+        'plan_total_gb': 0,
+        'plan_price': 0,
+        'plan_cycle_day': 1,
+        'currency': str(d.get('currency') or '¥')[:4],
+        'alloc': {},
+    }
+    try:
+        out['plan_total_gb'] = max(0, float(d.get('plan_total_gb') or 0))
+    except Exception:
+        out['plan_total_gb'] = 0
+    try:
+        out['plan_price'] = max(0, float(d.get('plan_price') or 0))
+    except Exception:
+        out['plan_price'] = 0
+    try:
+        out['plan_cycle_day'] = max(1, min(int(d.get('plan_cycle_day') or 1), 28))
+    except Exception:
+        out['plan_cycle_day'] = 1
+    al = d.get('alloc')
+    if isinstance(al, dict):
+        clean = {}
+        for k, v in al.items():
+            try:
+                pct = max(0.0, min(float(v), 100.0))
+            except Exception:
+                continue
+            if pct > 0:
+                clean[str(k)[:64]] = round(pct, 2)
+        out['alloc'] = clean
+    return out
+
+
+def _qt_cursor_load():
+    try:
+        with open(QUOTA_CURSOR, encoding='utf-8') as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            return d
+    except Exception:
+        pass
+    return {'offset': 0, 'ino': 0, 'partial': ''}
+
+
+def _qt_cursor_save(d):
+    try:
+        os.makedirs(os.path.dirname(QUOTA_CURSOR), exist_ok=True)
+        tmp = QUOTA_CURSOR + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(d, f)
+        os.replace(tmp, QUOTA_CURSOR)
+    except Exception as e:
+        log('warn', 'quota', 'QT_CURSOR_FAIL', '配额游标写盘失败：%s' % e)
+
+
+def _qt_name_map():
+    """IP → {name, mac}，来自 DHCP 租约。
+
+    每次聚合都重新读一次租约（几百 KB，可以忽略），
+    这样新设备第一次上网后，下一轮聚合就能显示名字。
+    """
+    out = {}
+    r = read_leases({})
+    for row in (r.get('data') or {}).get('leases') or []:
+        ip = str(row.get('ip') or '')
+        if ip:
+            out[ip] = {'name': row.get('hostname') or row.get('name') or '',
+                       'mac': row.get('mac') or ''}
+    return out
+
+
+def _qt_svc_name(port, proto=''):
+    p = str(port or '').strip()
+    if p in QUOTA_PORTS:
+        return QUOTA_PORTS[p]
+    try:
+        n = int(p)
+    except Exception:
+        return '其它'
+    if proto.upper() == 'UDP' and n == 123:
+        return '时间同步（NTP）'
+    if 1024 < n < 65535:
+        return '其它'
+    return '系统服务'
+
+
+def act_quota(p):
+    """配额与用量账单：status / report / conf / reset / name / device_detail。"""
+    p = p or {}
+    op = str(p.get('op') or 'status')
+    if op == 'status':
+        return _qt_status()
+    if op == 'report':
+        return _qt_report(p)
+    if op == 'conf':
+        return _qt_conf(p)
+    if op == 'reset':
+        return _qt_reset()
+    if op == 'device':
+        return _qt_device(p)
+    if op == 'aggregate':
+        return _qt_aggregate()
+    return fail('未知的配额操作：%s' % op)
+
+
+def _qt_status():
+    conf = _qt_norm(_qt_load())
+    st = _svc_states(('drouter-quotad.service', 'drouter-quotad.timer'))
+    rc, nxt, _e = sh(['systemctl', 'list-timers', 'drouter-quotad.timer',
+                      '--no-pager', '--no-legend'], timeout=12)
+    cur = _qt_cursor_load()
+    agg_exists = os.path.isfile(QUOTA_AGG)
+    agg_size = os.path.getsize(QUOTA_AGG) if agg_exists else 0
+    # 归档里还有多少没被聚合的字节 —— 这是「数据新鲜度」的关键指标
+    lag = None
+    try:
+        if os.path.isfile(ULOG_ARCHIVE):
+            cur_size = os.path.getsize(ULOG_ARCHIVE)
+            if cur.get('ino') == os.stat(ULOG_ARCHIVE).st_ino:
+                lag = max(0, cur_size - int(cur.get('offset') or 0))
+    except Exception:
+        pass
+    last = {}
+    try:
+        with open(os.path.join(LOGDIR, 'quotad.jsonl'), encoding='utf-8',
+                  errors='replace') as f:
+            for ln in reversed(f.read().splitlines()[-40:]):
+                try:
+                    r = json.loads(ln)
+                except Exception:
+                    continue
+                if (r.get('code') or '').startswith('QT_'):
+                    last = {'ts': r.get('ts', ''), 'msg_cn': r.get('msg_cn', ''),
+                            'code': r.get('code', '')}
+                    break
+    except Exception:
+        pass
+    return ok({
+        'conf': conf,
+        'units': st,
+        'next': (nxt.splitlines()[0].strip() if nxt else ''),
+        'last': last,
+        'agg_size': agg_size,
+        'agg_exists': agg_exists,
+        'lag_bytes': lag,
+        'has_systemd': os.path.isdir('/run/systemd/system'),
+        'ports': QUOTA_PORTS,
+        'has_archive': os.path.isfile(ULOG_ARCHIVE),
+    }, '已读取用量统计设置')
+
+
+def _qt_bucket_key(ts):
+    """把 ISO 时间戳截到「小时桶」。"""
+    return (ts or '')[:13]          # 2026-10-02T15
+
+
+def _qt_scan_new_lines():
+    """读归档里尚未聚合的部分。
+
+    返回 (行列表, 新游标)。做三件关键的事：
+    1) **按字节偏移续读**，不重扫全文件；
+    2) 记录未处理完的残行到 partial，下轮接着拼 —— 直接丢会让最后一行永远
+       聚合不到（而那恰好可能是刚发生的最新流量）；
+    3) 归档被轮转（inode 变了）时从 0 重读。
+    """
+    if not os.path.isfile(ULOG_ARCHIVE):
+        return [], _qt_cursor_load()
+    cur = _qt_cursor_load()
+    try:
+        st = os.stat(ULOG_ARCHIVE)
+    except Exception:
+        return [], cur
+    size = st.st_size
+    if cur.get('ino') != st.st_ino:
+        # 归档换了文件（轮转/重建）：从头开始
+        cur = {'offset': 0, 'ino': st.st_ino, 'partial': ''}
+    off = int(cur.get('offset') or 0)
+    if off > size:
+        # 文件被截短（不太可能发生，但要有兜底）
+        off, cur['partial'] = 0, ''
+    if off == size:
+        return [], cur
+    try:
+        with open(ULOG_ARCHIVE, 'r', encoding='utf-8', errors='replace') as f:
+            f.seek(off)
+            chunk = f.read(size - off)
+    except Exception as e:
+        log('warn', 'quota', 'QT_READ_FAIL', '读取日志归档失败：%s' % e)
+        return [], cur
+    cur['offset'] = size
+    cur['ino'] = st.st_ino
+    partial = str(cur.get('partial') or '')
+    data = partial + chunk
+    lines = data.split('\n')
+    # 最后一段可能是被切断的半行，留到下轮
+    tail = lines.pop() if lines else ''
+    if tail and not data.endswith('\n'):
+        cur['partial'] = tail
+    else:
+        cur['partial'] = ''
+    out = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            out.append(json.loads(ln))
+        except Exception:
+            continue
+    return out, cur
+
+
+def _qt_aggregate():
+    """把新产生的流日志聚合成小时桶，追加到 quota.jsonl。
+
+    幂等：靠 cursor 的字节偏移保证同一行只聚合一次。
+    """
+    recs, cur = _qt_scan_new_lines()
+    _qt_cursor_save(cur)
+    if not recs:
+        return ok({'new': 0, 'agg': _qt_agg_lines()}, '没有新的流量记录需要聚合')
+    names = _qt_name_map()
+    buckets = {}
+    used = 0
+    for r in recs:
+        # 只统计带真实字节数的连接事件，其它日志源（系统 / WAN / 应用）
+        # 没有流量信息，硬算会得到一堆 0
+        if r.get('src') != 'flow':
+            continue
+        ex = r.get('extra') or {}
+        if not isinstance(ex, dict):
+            continue
+        if ex.get('reply'):
+            continue
+        b = ex.get('bytes')
+        try:
+            b = int(b or 0)
+        except Exception:
+            continue
+        if b <= 0:
+            continue
+        sip = str(r.get('saddr') or '')
+        if not sip:
+            continue
+        nm = (names.get(sip) or {}).get('name') or ''
+        mac = (names.get(sip) or {}).get('mac') or ''
+        svc = _qt_svc_name(r.get('dport'), r.get('proto'))
+        bk = (_qt_bucket_key(r.get('ts')), sip, nm, mac, svc)
+        row = buckets.get(bk)
+        if row is None:
+            buckets[bk] = [1, b]
+        else:
+            row[0] += 1
+            row[1] += b
+        used += b
+    if not buckets:
+        return ok({'new': len(recs), 'rows': 0, 'bytes': 0},
+                  '本次新增 %d 条日志，其中没有可统计的流量' % len(recs))
+    rows = []
+    for (bk, sip, nm, mac, svc), (cnt, total) in buckets.items():
+        rows.append({'h': bk, 'ip': sip, 'name': nm, 'mac': mac,
+                     'svc': svc, 'n': cnt, 'b': total})
+    try:
+        os.makedirs(os.path.dirname(QUOTA_AGG), exist_ok=True)
+        with open(QUOTA_AGG, 'a', encoding='utf-8') as f:
+            for x in rows:
+                f.write(json.dumps(x, ensure_ascii=False) + '\n')
+    except Exception as e:
+        log('error', 'quota', 'QT_WRITE_FAIL', '配额聚合写盘失败：%s' % e)
+        return fail('配额聚合写盘失败：%s' % e)
+    _qt_prune_agg()
+    log('info', 'quota', 'QT_AGG_OK',
+        '已聚合 %d 条流量记录（%.1f MB）到 %d 个统计桶'
+        % (len(rows), used / 1048576.0, len(rows)))
+    return ok({'new': len(recs), 'rows': len(rows), 'bytes': used},
+              '已聚合 %d 个统计桶（%.1f MB）' % (len(rows), used / 1048576.0))
+
+
+def _qt_agg_lines():
+    """读聚合文件。行数天然很少（小时 × 设备 × 服务），可以整读。"""
+    out = []
+    try:
+        with open(QUOTA_AGG, encoding='utf-8', errors='replace') as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    out.append(json.loads(ln))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return out
+
+
+def _qt_prune_agg():
+    """裁剪超出保留期的聚合行。"""
+    rows = _qt_agg_lines()
+    if len(rows) <= QUOTA_MAX_BUCKETS:
+        return 0
+    # 按小时桶去重后取最近的 N 个
+    hours = sorted({r.get('h') for r in rows if r.get('h')})
+    keep = set(hours[-QUOTA_KEEP_HOURS:])
+    out = [r for r in rows if r.get('h') in keep]
+    if len(out) == len(rows):
+        return 0
+    try:
+        tmp = QUOTA_AGG + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            for r in out:
+                f.write(json.dumps(r, ensure_ascii=False) + '\n')
+        os.replace(tmp, QUOTA_AGG)
+    except Exception:
+        return 0
+    return len(rows) - len(out)
+
+
+def _qt_agg_by_ip(rows):
+    """把「同一 IP 的多行」合并成一行。
+
+    必须做这一步：DHCP 租约变化会让同一台设备在不同小时带不同的
+    name/mac 键，直接 group 会把一台手机算成好几台。
+    """
+    agg = {}
+    for r in rows:
+        ip = r.get('ip') or '未知'
+        a = agg.get(ip)
+        n = int(r.get('n') or 0)
+        b = int(r.get('b') or 0)
+        if a is None:
+            agg[ip] = {'ip': ip, 'name': r.get('name') or '',
+                       'mac': r.get('mac') or '', 'n': n, 'b': b}
+        else:
+            a['n'] += n
+            a['b'] += b
+            # 名字取最新的非空值（老桶可能没名字）
+            if r.get('name'):
+                a['name'] = r['name']
+            if r.get('mac'):
+                a['mac'] = r['mac']
+    for a in agg.values():
+        if not a['name']:
+            a['name'] = a['ip']
+    return agg
+
+
+def _qt_month_key(h):
+    """小时桶 'YYYY-MM-DDTHH' → 'YYYY-MM'。"""
+    return (h or '')[:7]
+
+
+def _qt_current_month():
+    return datetime.now().strftime('%Y-%m')
+
+
+def _qt_report(p):
+    """生成用量报表。
+
+    month 为空时按当月。所有筛选都在已经聚合过的小数据上做，
+    不会碰到几百 MB 的原始归档。
+    """
+    p = p or {}
+    conf = _qt_norm(_qt_load())
+    month = str(p.get('month') or '')[:7]
+    if not re.match(r'^\d{4}-\d{2}$', month):
+        month = _qt_current_month()
+    rows = [r for r in _qt_agg_lines() if _qt_month_key(r.get('h')) == month]
+    if not rows:
+        return ok({'month': month, 'empty': True, 'devices': [],
+                   'services': [], 'days': [], 'total_b': 0, 'total_n': 0,
+                   'conf': conf, 'months': _qt_months()},
+                  '%s 还没有任何流量统计。请确认统一日志与本功能都已启用，'
+                  '并且已经过了一个聚合周期。' % month)
+    by_ip = _qt_agg_by_ip(rows)
+    total_b = sum(a['b'] for a in by_ip.values())
+    total_n = sum(a['n'] for a in by_ip.values())
+    # 按设备
+    devs = sorted(by_ip.values(), key=lambda a: -a['b'])
+    for a in devs:
+        a['pct'] = round(a['b'] * 100.0 / total_b, 2) if total_b else 0
+        a['alloc'] = conf['alloc'].get(a['mac']) or conf['alloc'].get(a['ip']) or 0
+    # 按服务
+    svc = {}
+    for r in rows:
+        s = r.get('svc') or '其它'
+        cur = svc.get(s)
+        if cur is None:
+            svc[s] = [0, 0]
+        svc[s][0] += int(r.get('n') or 0)
+        svc[s][1] += int(r.get('b') or 0)
+    services = [{'svc': k, 'n': v[0], 'b': v[1],
+                 'pct': round(v[1] * 100.0 / total_b, 2) if total_b else 0}
+                for k, v in svc.items()]
+    services.sort(key=lambda x: -x['b'])
+    # 按天
+    days = {}
+    for r in rows:
+        dk = (r.get('h') or '')[:10]
+        if not dk:
+            continue
+        days[dk] = days.get(dk, 0) + int(r.get('b') or 0)
+    day_rows = [{'d': k, 'b': v} for k, v in sorted(days.items())]
+    # 费用分摊
+    bill = _qt_bill(conf, total_b, devs)
+    return ok({
+        'month': month,
+        'empty': False,
+        'devices': devs,
+        'services': services,
+        'days': day_rows,
+        'total_b': total_b,
+        'total_n': total_n,
+        'bill': bill,
+        'conf': conf,
+        'months': _qt_months(),
+        'note': '字节数取自连接跟踪事件在连接结束时的统计。'
+                '长时间持续连接（如大文件下载、在线视频）会在连接断开后才计入，'
+                '所以当月数字会随时间回补。',
+    }, '%s 统计：%d 台设备，合计 %s' % (month, len(devs), _hbytes(total_b)))
+
+
+def _qt_months():
+    ms = sorted({_qt_month_key(r.get('h')) for r in _qt_agg_lines()
+                 if _qt_month_key(r.get('h'))})
+    ms.reverse()
+    return ms
+
+
+def _qt_bill(conf, total_b, devs):
+    """按套餐和预设比例分摊费用。
+
+    两种口径：
+      * 总流量均摊 —— 不管填没填比例，都按各设备实际用量占总用量的比例分；
+      * 固定配额分摊 —— 填了「该设备应承担百分之多少」就按填的算。
+        工作室场景常见：老板按人头分，机器按台数分。
+    """
+    total_gb = conf.get('plan_total_gb') or 0
+    price = conf.get('plan_price') or 0
+    out = {'total_gb': total_gb, 'price': price,
+           'currency': conf.get('currency') or '¥',
+           'used_gb': round(total_b / 1073741824.0, 3),
+           'by_usage': [], 'by_alloc': []}
+    if not price or not total_b:
+        return out
+    # 超额部分要按更贵的单价算，才符合真实账单
+    used_gb = total_b / 1073741824.0
+    if used_gb <= total_gb:
+        cost = price
+    else:
+        # 超出部分按 3 倍单价估（各家不同，这里给一个保守的量级）
+        cost = price + (used_gb - total_gb) / max(total_gb, 1) * price * 3
+    for a in devs:
+        out['by_usage'].append({
+            'ip': a['ip'], 'name': a['name'], 'mac': a['mac'],
+            'gb': round(a['b'] / 1073741824.0, 3),
+            'pct': a['pct'],
+            'money': round(cost * a['pct'] / 100.0, 2),
+        })
+    # 固定配额：按填的百分比，剩余未分配部分由「未指定」承担
+    fixed = conf.get('alloc') or {}
+    alloc_sum = sum(fixed.values())
+    rows = []
+    for a in devs:
+        key = a['mac'] or a['ip']
+        pct = float(fixed.get(key) or 0)
+        if pct <= 0:
+            continue
+        rows.append({'ip': a['ip'], 'name': a['name'], 'pct': pct,
+                     'money': round(cost * pct / 100.0, 2)})
+    if rows:
+        rest = max(0.0, 100.0 - sum(r['pct'] for r in rows))
+        if rest > 0.01:
+            rows.append({'ip': '', 'name': '未指定（按实际用量兜底）',
+                         'pct': round(rest, 2),
+                         'money': round(cost * rest / 100.0, 2)})
+        out['by_alloc'] = rows
+    return out
+
+
+def _qt_device(p):
+    """单台设备的明细（按天 + 按服务）。"""
+    ip = str(p.get('ip') or '').strip()
+    if not ip:
+        return fail('缺少设备 IP')
+    month = str(p.get('month') or '')[:7]
+    if not re.match(r'^\d{4}-\d{2}$', month):
+        month = _qt_current_month()
+    rows = [r for r in _qt_agg_lines()
+            if _qt_month_key(r.get('h')) == month and r.get('ip') == ip]
+    if not rows:
+        return ok({'ip': ip, 'month': month, 'empty': True, 'days': [],
+                   'services': []}, '该设备本月没有统计记录')
+    days = {}
+    svc = {}
+    nm = ''
+    mac = ''
+    for r in rows:
+        dk = (r.get('h') or '')[:10]
+        days[dk] = days.get(dk, 0) + int(r.get('b') or 0)
+        s = r.get('svc') or '其它'
+        svc[s] = svc.get(s, 0) + int(r.get('b') or 0)
+        if r.get('name'):
+            nm = r['name']
+        if r.get('mac'):
+            mac = r['mac']
+    total = sum(days.values())
+    return ok({
+        'ip': ip, 'month': month, 'name': nm or ip, 'mac': mac,
+        'empty': False,
+        'total_b': total,
+        'days': [{'d': k, 'b': v} for k, v in sorted(days.items())],
+        'services': [{'svc': k, 'b': v,
+                      'pct': round(v * 100.0 / total, 2) if total else 0}
+                     for k, v in sorted(svc.items(), key=lambda x: -x[1])],
+    }, '%s 的 %s 用量：%s' % (nm or ip, month, _hbytes(total)))
+
+
+def _qt_conf(p):
+    p = p or {}
+    src = p.get('conf')
+    src = src if isinstance(src, dict) else p
+    conf = _qt_norm({**_qt_load(), **{k: v for k, v in src.items()
+                                      if k != 'op'}})
+    _save_setting(QUOTA_CONF, conf)
+    timer = _write_quota_timer(conf)
+    log('info', 'quota', 'QT_CONF_SAVED',
+        '已保存用量统计设置（%s，每 %d 分钟聚合一次）'
+        % ('已启用' if conf['enabled'] else '未启用', conf['interval_min']))
+    return ok({'conf': conf, 'timer_applied': timer}, '用量统计设置已保存')
+
+
+def _qt_reset():
+    try:
+        for f in (QUOTA_AGG, QUOTA_CURSOR):
+            if os.path.isfile(f):
+                os.unlink(f)
+    except Exception as e:
+        return fail('清空统计失败：%s' % e)
+    log('info', 'quota', 'QT_RESET', '已清空全部用量统计')
+    return ok({}, '用量统计已清空，将从下一轮聚合重新开始')
+
+
+# ------------------------------------------------------------- 配额聚合 timer
+
+def _write_quota_timer(conf):
+    """生成用量聚合的 service + timer 单元，并按开关启停。
+
+    默认 10 分钟一次：足够让「今天用了多少」有意义，又不至于频繁读归档。
+    """
+    interval_min = max(5, min(int((conf or {}).get('interval_min') or 10), 240))
+    svc = """[Unit]
+Description=drouter 用量聚合（按设备与服务统计流量）
+After=network.target
+Documentation=file:///opt/drouter/backend/drouter-quotad.py
+
+[Service]
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Type=oneshot
+User=root
+Nice=15
+IOSchedulingClass=idle
+ExecStart=/usr/bin/python3 /opt/drouter/backend/drouter-quotad.py
+
+[Install]
+WantedBy=multi-user.target
+"""
+    tmr = """[Unit]
+Description=drouter 用量聚合定时器（每 %d 分钟）
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=%dmin
+AccuracySec=30s
+Persistent=false
+Unit=drouter-quotad.service
+
+[Install]
+WantedBy=timers.target
+""" % (interval_min, interval_min)
+    try:
+        os.makedirs('/etc/systemd/system', exist_ok=True)
+        with open('/etc/systemd/system/drouter-quotad.service', 'w',
+                  encoding='utf-8') as f:
+            f.write(svc)
+        with open('/etc/systemd/system/drouter-quotad.timer', 'w',
+                  encoding='utf-8') as f:
+            f.write(tmr)
+        sh(['systemctl', 'daemon-reload'], timeout=20)
+    except Exception as e:
+        log('error', 'quota', 'QT_TIMER_FAIL', '写入聚合定时器失败：%s' % e)
+        return False
+    if not os.path.isdir('/run/systemd/system'):
+        log('warn', 'quota', 'QT_TIMER_NOSYSTEMD',
+            '当前环境没有 systemd，用量聚合定时器已写入但未启用')
+        return False
+    if (conf or {}).get('enabled'):
+        rc, out, err = sh(['systemctl', 'enable', '--now', 'drouter-quotad.timer'],
+                          timeout=30)
+        if rc != 0:
+            log('warn', 'quota', 'QT_TIMER_ENABLE_FAIL',
+                '聚合定时器启用失败：%s' % (err or out))
+            return False
+        return True
+    sh(['systemctl', 'disable', '--now', 'drouter-quotad.timer'], timeout=30)
+    return False
+
+
+def read_quotad(p=None):
+    return _qt_status()
+
+
 # ---------------------------------------------------------------- 自动快照参数
 
 AUTO_DEFAULTS = {
@@ -14584,6 +17888,16 @@ DEPS = [
     ('mtr', 'mtr（路由追踪）', 'cmd', 'mtr', False, '持续追踪到目标的每一跳', 'mtr-tiny', 'net'),
     ('etherwake', 'etherwake（网络唤醒）', 'cmd', 'etherwake', False,
      'WOL 唤醒。未安装时会自动退回 Python 广播魔术包，功能不受影响。', 'etherwake', 'net'),
+    # ---- VPN（WireGuard）----
+    # ⚠️ 这条以前是漏的：VPN 模块到处调`wg` / `wg-quick`（genkey / pubkey /
+    # setconf / show），但依赖清单里没有它。后果是「服务」页看不到缺失提示，
+    # 用户点进 VPN 页才发现配不了，而 `_vpn_installed()` 只会说「内核不支持」，
+    # 把他引向错误方向（其实只是没装 wireguard-tools）。
+    # 两个探测目标分开登记：wg 在 wireguard-tools 里，wg-quick 同包。
+    # 不标required —— 它只在用 VPN 时才需要，装机就强制拉进来不合理。
+    ('wireguard-tools', 'WireGuard 工具（wg / wg-quick）', 'cmd', 'wg', False,
+     'VPN 服务端：远程回家访问内网。缺失时 VPN 页无法生成密钥、无法改配置。',
+     'wireguard-tools', 'net'),
     # ---- 打印服务（与 USB RAW 直通互斥）----
     ('cups', 'CUPS 打印服务', 'cmd', 'cupsd', False,
      '打印服务：把 USB / 网络打印机共享给局域网。安装后会启动 cups 服务常驻。', 'cups', 'print'),
@@ -17428,6 +20742,9 @@ ACTIONS = {
     'wizard': act_wizard,
     'read:acl': read_acl,
     'acl': act_acl,
+    'vpn': act_vpn,
+    'quota': act_quota,
+    'read:quotad': read_quotad,
     'read:share': read_share,
     'storage': act_storage,
     'share': act_share,
@@ -17461,6 +20778,10 @@ ACTIONS = {
     'snapshot_delete': act_snapshot_delete,
     'snapshot_prune': act_snapshot_prune,
     'snapshot_pack': act_snapshot_pack,
+    'backup': act_backup,
+    'read:backupd': read_backupd,
+    'alert': act_alert,
+    'read:alertd': read_alertd,
     'nat_check': act_nat_check,
     'read:nat_last': lambda _p: ok(_load_setting('nat_last') or {},
                                    '上次 NAT 检测结果'),

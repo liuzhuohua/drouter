@@ -46,6 +46,11 @@ install -m 0644 $SRC/backend/drouter-rescue.py  $OPT/backend/drouter-rescue.py
 # （helper 每次都是跑完就退出的新进程，PTY fd 跨不了请求），漏装则终端连不上。
 install -m 0644 $SRC/backend/drouter-shelld.py  $OPT/backend/drouter-shelld.py
 install -m 0644 $SRC/backend/drouter-helpd.py  $OPT/backend/drouter-helpd.py
+# 三个定时任务守护（1.0.7）。它们的 systemd 单元由 helper 在用户保存设置时
+# 现写，ExecStart 指向的就是下面这三个文件 —— 漏装 = 定时器起来就报 203/EXEC。
+install -m 0644 $SRC/backend/drouter-backupd.py $OPT/backend/drouter-backupd.py
+install -m 0644 $SRC/backend/drouter-alertd.py  $OPT/backend/drouter-alertd.py
+install -m 0644 $SRC/backend/drouter-quotad.py  $OPT/backend/drouter-quotad.py
 
 # 主题之家（#12）：自定义主题目录 + 生效主题标记
 mkdir -p /etc/drouter/themes
@@ -365,7 +370,8 @@ echo "=== 10. 校验 ==="
 # 逐个编译校验：缺文件直接中止部署（避免上线后才发现少装了一个守护进程）
 for f in render.py drouter-helper.py drouter-web.py drouter-logd.py \
          drouter-snapshotd.py drouter-rescue.py drouter-shelld.py \
-         drouter-helpd.py theme.py; do
+         drouter-helpd.py drouter-backupd.py drouter-alertd.py \
+         drouter-quotad.py theme.py; do
     p="$OPT/backend/$f"
     if [ ! -f "$p" ]; then echo "✘ 缺少文件: $p"; exit 1; fi
     python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' "$p" \

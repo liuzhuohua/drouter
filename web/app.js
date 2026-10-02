@@ -158,6 +158,7 @@ const NAV_GROUPS = [
       { k: 'portfwd', n: '端口转发 / DMZ', t: '端口转发与 DMZ（nftables DNAT）', needSave: true },
       { k: 'upnp', n: 'UPnP / NAT-PMP', t: 'UPnP / NAT-PMP', needSave: true },
       { k: 'acl', n: '访问控制 / 时间组', t: '访问控制与家长时间组', needSave: true },
+      { k: 'vpn', n: 'WireGuard VPN', t: '远程连回家里访问内网与 NAS：Debian 13 内核自带 WireGuard，逐台设备发放独立配置', needSave: false },
     ],
   },
   {
@@ -183,7 +184,9 @@ const NAV_GROUPS = [
   {
     g: '日志与审计', icon: '☰', hue: 220, items: [
       { k: 'log', n: '系统日志', t: '日志查看' },
+      { k: 'alert', n: '告警与通知', t: '掉线 / 磁盘满 / 温度高主动推送：Bark · 邮件 · 群机器人，带冷却与免打扰', needSave: false },
       { k: 'flowlog', n: '连接与流日志', t: '连接跟踪与流量日志（统一日志系统）' },
+      { k: 'quota', n: '用量与账单', t: '按设备与服务统计每月流量，工作室可按比例分摊话费；后台增量聚合，不会拖慢机器', needSave: false },
     ],
   },
   {
@@ -192,6 +195,7 @@ const NAV_GROUPS = [
       { k: 'cleanup', n: '磁盘与日志清理', t: '回收日志 / 缓存 / 临时文件，可设定阈值自动清理，防止小硬盘被占满', needSave: false },
       { k: 'kern', n: '内核转发与加速', t: 'IP 转发 · 出向伪装 · MSS 钳制 · BBR · SNMP，五项内核级开关（每项附说明与联动影响）', needSave: false },
       { k: 'ca', n: '证书 / SSL', t: 'CA 证书管理：建自己的 CA · 签发服务器证书 · 导入 · 部署给管理后台；附带 SSL/TLS 握手体检工具', needSave: false },
+      { k: 'backup', n: '配置备份与还原', t: '把全部设置导成一个能下载、能换机还原的包：带清单与逐文件校验，还原前先预检', needSave: false },
       { k: 'power', n: '电源控制', t: '电源控制' },
       { k: 'user', n: '用户与密钥', t: '系统用户与 SSH 公钥' },
       { k: 'sys', n: '系统设置', t: '系统设置' },
@@ -261,6 +265,7 @@ const VIEWS = {
   fw6: viewFw,
   portfwd: viewPortfwd,
   acl: viewAcl,
+  vpn: viewVpn,
   nfs: viewNfs,
   docker: viewDocker,
   dcfg: viewDcfg,
@@ -276,11 +281,14 @@ const VIEWS = {
   api: viewApi,
   log: viewLog,
   flowlog: viewFlowLog,
+  quota: viewQuota,
   theme: viewTheme,
   depcheck: viewDepCheck,
   cleanup: viewCleanup,
   kern: viewKern,
   ca: viewCa,
+  backup: viewBackup,
+  alert: viewAlert,
   power: viewPower,
   user: viewUser,
   sys: viewSys,
@@ -8815,8 +8823,7 @@ function modal(title, html, onOk, okText = '确定') {
   const m = $('#modal');
   $('#modal-box').innerHTML = `<h3>${esc(title)}</h3><div class="modal-body">${html}</div>
     <div class="acts"><button id="md-cancel" class="ghost">取消</button>
-    ${onOk ? `<button id="md-ok" class="primary">${esc(okText)}</button>` : ''}</div>`;
-  m.classList.remove('hidden');
+    ${onOk ? `<button id="md-ok" class="primary">${esc(okText)}</button>` : ''}</div>`;  m.classList.remove('hidden');
   const close = () => m.classList.add('hidden');
   $('#md-cancel').onclick = close;
   m.onclick = e => { if (e.target === m) close(); };
@@ -10941,6 +10948,1606 @@ function ulState() {
       live: false, liveSec: 3 };
   }
   return S.ulog;
+}
+
+/* ============ 配置备份与还原（1.0.7） ============ */
+let BK_DATA = null;
+let BK_INSPECT = null;
+
+async function viewBackup() {
+  $('#view').innerHTML = `
+    <div class="card">
+      <h3>这是什么
+        <button class="ghost small" id="bk-reload" style="float:right">重新读取</button></h3>
+      <p class="desc">这里导出的不是「整机镜像」，而是<b>你这台路由器的全部设置</b>：
+        网卡与 WAN 参数、DHCP 与 DNS、防火墙规则、限速与识别、访问控制、
+        共享与打印、Docker 配置、主题外观。换机器、重装系统、或者改坏了想回到
+        某个时间点，从这里导出的包就能一键还原。</p>
+      <p class="desc">每个包里都带一份清单（导出于哪台机器、什么版本、每个文件的校验值），
+        还原前会先校验，文件对不上就拒绝写入 —— 避免把一个损坏的包还原成半截配置。</p>
+      <div id="bk-stat"><p class="desc">正在读取…</p></div>
+    </div>
+
+    <div class="card">
+      <h3>备份覆盖范围</h3>
+      <p class="desc">下面这份清单与「系统设置 → 配置快照」同源，两边不会一份有一份没有。</p>
+      <div id="bk-scope"><p class="desc">正在读取…</p></div>
+    </div>
+
+    <div class="card">
+      <h3>立即导出</h3>
+      <p class="desc">导出会逐个文件计算校验值，几十 KB 的配置通常一两秒内完成。</p>
+      <div class="row" style="margin:10px 0">
+        <label style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="bk-sens">
+          <span>包含敏感文件（私钥 · 宽带密码 · CA 证书）</span>
+        </label>
+      </div>
+      <p class="desc" style="color:var(--warn)">
+        勾上之后包里的文件权限会收紧到仅 root 可读。含私钥的包请不要丢在共享目录里。</p>
+      <div class="row" style="margin-top:10px">
+        <button class="primary" id="bk-create">导出备份包</button>
+      </div>
+      <div id="bk-create-out" class="hidden" style="margin-top:12px"></div>
+    </div>
+
+    <div class="card">
+      <h3>已导出的备份包
+        <span class="tag gray" id="bk-cnt"></span>
+        <button class="ghost small" id="bk-prune" style="float:right">清理旧包</button></h3>
+      <p class="desc">点文件名那一行的「校验」可以先看清包里有什么、哪些文件已损坏，
+        确认无误再还原。</p>
+      <div id="bk-list"><p class="desc">正在读取…</p></div>
+      <div id="bk-inspect" class="hidden" style="margin-top:14px"></div>
+    </div>
+
+    <div class="card">
+      <h3>自动备份</h3>
+      <p class="desc">每天凌晨自动导出一份并清理旧包。默认<b>不包含敏感文件</b> ——
+        定时任务在后台跑，没人盯着的时候把私钥写出去不是好主意。</p>
+      <div id="bk-auto"><p class="desc">正在读取…</p></div>
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="bk-conf">保存自动备份设置</button>
+      </div>
+    </div>`;
+  $('#bk-reload').onclick = () => bkLoad(true);
+  $('#bk-create').onclick = bkCreate;
+  $('#bk-conf').onclick = bkSaveConf;
+  $('#bk-prune').onclick = bkPrune;
+  bkLoad(false);
+}
+
+function bkRenderStat(d) {
+  const mb = (d.bytes || 0) / 1048576.0;
+  $('#bk-stat').innerHTML = `
+    <table class="kv">
+      <tr><td>本机名称</td><td class="mono">${esc(d.hostname || '未知')}</td></tr>
+      <tr><td>drouter 版本</td><td class="mono">${esc(d.version || '未知')}</td></tr>
+      <tr><td>备份目录</td><td class="mono">${esc(d.dir || '')}
+        ${d.exists ? '' : '<span class="tag warn">尚未创建，首次导出会自动建</span>'}</td></tr>
+      <tr><td>本次将打包</td><td>${d.present || 0} / ${d.planned_total || 0} 个来源项
+        （约 ${mb < 0.01 ? '<1' : mb.toFixed(1)} MB）</td></tr>
+      <tr><td>含敏感文件</td><td>${d.conf && d.conf.include_sensitive
+        ? '<span class="tag warn">是</span>' : '否'}</td></tr>
+    </table>`;
+  $('#bk-scope').innerHTML = (d.scope || []).map(g => `
+    <div style="margin-bottom:12px">
+      <b>${esc(g.group)}</b>
+      <ul class="tight">${(g.items || []).map(i => `<li>${esc(i)}</li>`).join('')}</ul>
+    </div>`).join('');
+}
+
+function bkRenderList(packs) {
+  $('#bk-cnt').textContent = (packs || []).length + ' 个';
+  if (!packs || !packs.length) {
+    $('#bk-list').innerHTML = '<p class="desc">还没有导出过备份包。上面点一次「导出备份包」就会出现在这里。</p>';
+    return;
+  }
+  $('#bk-list').innerHTML = `<table class="tbl">
+    <thead><tr><th>包名</th><th>大小</th><th>导出时间</th><th class="nowrap">操作</th></tr></thead>
+    <tbody>${packs.map(x => `<tr>
+      <td class="mono" style="font-size:12px">${esc(x.name)}</td>
+      <td>${fmtBytes(x.size)}</td>
+      <td class="mono" style="font-size:12px">${esc(x.mtime)}</td>
+      <td class="nowrap">
+        <button class="small" data-bkdl="${esc(x.name)}">下载</button>
+        <button class="small" data-bkck="${esc(x.name)}">校验</button>
+        <button class="small" data-bkrs="${esc(x.name)}">还原</button>
+        <button class="small danger" data-bkdel="${esc(x.name)}">删除</button>
+      </td></tr>`).join('')}</tbody></table>`;
+  $$('[data-bkdl]').forEach(b => b.onclick = () => bkDownload(b.dataset.bkdl));
+  $$('[data-bkck]').forEach(b => b.onclick = () => bkInspect(b.dataset.bkck));
+  $$('[data-bkdel]').forEach(b => b.onclick = () => bkDelete(b.dataset.bkdel));
+  $$('[data-bkrs]').forEach(b => b.onclick = () => bkRestore(b.dataset.bkrs));
+}
+
+function bkRenderAuto(t) {
+  const c = (t && t.conf) || {};
+  const units = (t && t.units) || {};
+  const sw = (id, on) =>
+    `<label class="switch"><input type="checkbox" id="${id}"${on ? ' checked' : ''}><i></i></label>`;
+  const stTxt = u => {
+    const v = u && (u.active !== undefined ? u.active : u);
+    if (v === 'active') return '<span class="tag ok">运行中</span>';
+    if (v === 'activating') return '<span class="tag ok">启动中</span>';
+    if (v === 'failed') return '<span class="tag err">失败</span>';
+    if (v === 'inactive') return '<span class="tag gray">已停止</span>';
+    return '<span class="tag gray">未知</span>';
+  };
+  $('#bk-auto').innerHTML = `
+    <table class="kv">
+      <tr><td>定时器</td><td>${stTxt(units['drouter-backupd.timer'])}</td></tr>
+      <tr><td>下次执行</td><td class="mono">${esc((t && t.next) || '未启用')}</td></tr>
+      <tr><td>上次结果</td><td>${t && t.last && t.last.msg_cn
+        ? esc(t.last.msg_cn) + '<br><span class="desc mono" style="font-size:11px">'
+          + esc(t.last.ts) + '</span>' : '<span class="desc">暂无记录</span>'}</td></tr>
+    </table>
+    <div class="row" style="margin-top:12px;align-items:center;gap:14px;flex-wrap:wrap">
+      <span>每天自动导出</span>${sw('bk-auto-en', c.auto_enabled)}
+      <span>执行时刻</span>
+      <input type="number" id="bk-auto-hour" min="0" max="23" value="${esc(c.auto_hour || 3)}"
+        style="width:72px"> <span class="desc">点（0–23）</span>
+    </div>
+    <div class="row" style="margin-top:10px;align-items:center;gap:14px;flex-wrap:wrap">
+      <span>最多保留</span>
+      <input type="number" id="bk-keep-count" min="0" max="999"
+        value="${esc(c.keep_count || 0)}" style="width:86px"> <span class="desc">份（0 = 不限）</span>
+      <span>超过</span>
+      <input type="number" id="bk-keep-days" min="0" max="3650"
+        value="${esc(c.keep_days || 0)}" style="width:86px"> <span class="desc">天就删（0 = 不按时间）</span>
+    </div>
+    <p class="desc" style="margin-top:8px">定时器固定在设定时刻之后的 17 分执行 ——
+      错开整点是为了不和磁盘清理、自动快照挤在同一分钟。</p>`;
+}
+
+async function bkLoad(toastIt) {
+  const r = await api('/api/backup', { method: 'GET' });
+  if (!r.ok) {
+    $('#bk-stat').innerHTML = `<div class="notice err">${esc(r.msg_cn || '读取失败')}</div>`;
+    return;
+  }
+  BK_DATA = r.data || {};
+  bkRenderStat(BK_DATA);
+  bkRenderList(BK_DATA.packs);
+  const t = await api('/api/backupd');
+  if (t.ok) bkRenderAuto(t.data);
+  else $('#bk-auto').innerHTML =
+    `<div class="notice warn">${esc(t.msg_cn || '读取自动备份状态失败')}</div>`;
+  if (toastIt) toast('已重新读取', 'ok');
+}
+
+async function bkCreate() {
+  const sens = $('#bk-sens') && $('#bk-sens').checked;
+  if (sens && !confirm(
+    '即将导出包含私钥与宽带密码的备份包。\n\n' +
+    '这类包必须妥善保管 —— 拿到包的人等于拿到你的管理后台密码和宽带账号。\n\n确定继续吗？')) return;
+  toast('正在导出备份包…', 'ok', 4000);
+  const r = await api('/api/backup', {
+    method: 'POST', body: { op: 'create', include_sensitive: !!sens }, timeout: 600000
+  });
+  if (!r.ok) {
+    toast(r.msg_cn || '导出失败', 'err', 8000);
+    return;
+  }
+  const d = r.data || {};
+  const miss = (d.missing || []).length;
+  // 敏感项被排除要和「缺失」分开列：缺失是「本机没有这个功能」，
+  // 排除是「有意不给」。混在一起用户会以为备份不完整。
+  const exc = d.excluded || [];
+  $('#bk-create-out').classList.remove('hidden');
+  $('#bk-create-out').innerHTML = `
+    <div class="notice ok">${esc(r.msg_cn || '备份已导出')}</div>
+    <table class="kv">
+      <tr><td>包名</td><td class="mono">${esc(d.name || '')}</td></tr>
+      <tr><td>大小</td><td>${fmtBytes(d.size || 0)}</td></tr>
+      <tr><td>文件数</td><td>${d.files || 0}</td></tr>
+      <tr><td>缺失项</td><td>${miss ? miss + ' 个来源项在本机不存在（已跳过）' : '无'}</td></tr>
+      <tr><td>敏感排除</td><td>${exc.length
+        ? exc.length + ' 项未包含（见下）' : '无'}</td></tr>
+    </table>
+    ${miss ? '<p class="desc" style="margin-top:8px">缺失的一般是没启用的功能'
+      + '（比如没配打印服务就不会有 CUPS 配置），不影响还原。</p>' : ''}
+    ${exc.length ? '<div class="notice warn" style="margin-top:8px">'
+      + '以下内容<b>没有</b>放进包里（默认不导出敏感项）：</div>'
+      + '<ul class="tight">' + exc.slice(0, 30).map(e =>
+        `<li class="mono" style="font-size:11px">${esc(e.path)} —— ${esc(e.why)}</li>`
+      ).join('') + (exc.length > 30
+        ? `<li class="desc">…另有 ${exc.length - 30} 项</li>` : '')
+      + '</ul>'
+      + '<p class="desc">换机还原后，这些内容需要在新机器上重新生成'
+      + '（证书可从旧机器单独拷贝）。</p>' : ''}
+    <div class="row" style="margin-top:10px">
+      <button class="primary" id="bk-dl-now">现在下载</button>
+    </div>`;
+  const b = $('#bk-dl-now');
+  if (b) b.onclick = () => bkDownload(d.name);
+  toast(r.msg_cn || '备份已导出', 'ok');
+  bkLoad(false);
+}
+
+async function bkDownload(name) {
+  toast('正在准备下载 ' + name + '…', 'ok', 4000);
+  try {
+    const res = await fetch('/api/backup/download?name=' + encodeURIComponent(name),
+      { headers: S.token ? { 'X-Token': S.token } : {} });
+    if (!res.ok) {
+      let m = '下载失败';
+      try { m = (await res.json()).msg_cn || m; } catch (e) { }
+      toast(m, 'err', 8000);
+      return;
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    toast('已开始下载 ' + name, 'ok');
+  } catch (e) {
+    toast('下载失败：' + netErrCn(e && e.message), 'err', 8000);
+  }
+}
+
+async function bkInspect(name) {
+  const box = $('#bk-inspect');
+  box.classList.remove('hidden');
+  box.innerHTML = '<p class="desc">正在校验包内每个文件的校验值…</p>';
+  const r = await api('/api/backup', {
+    method: 'POST', body: { op: 'inspect', name }, timeout: 300000
+  });
+  if (!r.ok) {
+    box.innerHTML = `<div class="notice err">${esc(r.msg_cn || '校验失败')}</div>`;
+    return;
+  }
+  const d = r.data || {};
+  const mf = d.manifest || {};
+  BK_INSPECT = d;
+  const bad = d.bad || [];
+  const miss = d.missing || [];
+  // excluded 来自 manifest：这个包**有意**没包含的敏感内容。
+  // 必须在还原之前告诉用户，否则他还原完才发现证书没了。
+  const exc = mf.excluded || [];
+  const groups = {};
+  (d.files || []).forEach(f => {
+    const g = f.group || '其它';
+    (groups[g] = groups[g] || []).push(f);
+  });
+  box.innerHTML = `
+    <h4>${esc(name)} 的内容</h4>
+    <table class="kv">
+      <tr><td>导出于</td><td class="mono">${esc(mf.created || '')}</td></tr>
+      <tr><td>来源机器</td><td class="mono">${esc(mf.hostname || '')}</td></tr>
+      <tr><td>drouter 版本</td><td class="mono">${esc(mf.drouter_version || '')}</td></tr>
+      <tr><td>含敏感文件</td><td>${mf.include_sensitive
+        ? '<span class="tag warn">是</span>' : '否'}</td></tr>
+      <tr><td>敏感排除</td><td>${exc.length
+        ? exc.length + ' 项未包含' : '无'}</td></tr>
+      <tr><td>备注</td><td>${esc(mf.note || '（无）')}</td></tr>
+      <tr><td>校验结果</td><td>正常 ${d.ok_count || 0} 个${
+        bad.length ? ' · <span class="tag err">损坏 ' + bad.length + ' 个</span>' : ''}${
+        miss.length ? ' · <span class="tag warn">缺失 ' + miss.length + ' 个</span>' : ''}</td></tr>
+    </table>
+    ${bad.length ? '<div class="notice err" style="margin-top:10px">包内 '
+      + bad.length + ' 个文件与清单不符 —— 这个包在传输中损坏过，'
+      + '<b>不要还原</b>，请重新导出。</div>' : ''}
+    ${exc.length ? '<div class="notice warn" style="margin-top:10px">'
+      + '这个包<b>有意</b>未包含 ' + exc.length + ' 项敏感内容'
+      + '（CA 私钥、宽带密码等）。配置本身能还原，但这些需要还原后重新生成。</div>'
+      + '<details style="margin-top:6px"><summary>查看被排除的 '
+      + exc.length + ' 项</summary><ul class="tight">'
+      + exc.slice(0, 40).map(e => `<li class="mono" style="font-size:11px">${
+        esc(e.path)} —— ${esc(e.why)}</li>`).join('')
+      + (exc.length > 40 ? `<li class="desc">…另有 ${
+        exc.length - 40} 项</li>` : '') + '</ul></details>' : ''}
+    ${Object.keys(groups).map(g => `
+      <details style="margin-top:8px"><summary>${esc(g)}（${groups[g].length} 个文件）</summary>
+      <table class="tbl"><thead><tr><th>文件</th><th>大小</th><th>状态</th></tr></thead>
+      <tbody>${groups[g].map(f => `<tr>
+        <td class="mono" style="font-size:11px">${esc(f.path)}${
+          f.sensitive ? ' <span class="tag warn">敏感</span>' : ''}</td>
+        <td>${fmtBytes(f.size || 0)}</td>
+        <td>${f.state === '正常' ? '<span class="tag ok">正常</span>'
+          : '<span class="tag err">' + esc(f.state) + '</span>'}</td></tr>`).join('')}
+      </tbody></table></details>`).join('')}`;
+}
+
+function bkDelete(name) {
+  modal('删除备份包',
+    `<p>确定删除 <b class="mono">${esc(name)}</b> 吗？</p>
+     <p class="desc">如果这个包已经下载到本地电脑，删掉不影响你手上的那份。</p>`,
+    async () => {
+      const r = await api('/api/backup', { method: 'POST', body: { op: 'delete', name } });
+      toast(r.msg_cn, r.ok ? 'ok' : 'err');
+      if (r.ok) { $('#bk-inspect').classList.add('hidden'); bkLoad(false); }
+    }, '删除');
+}
+
+function bkRestore(name) {
+  const n = (v, d) => (v === '' || v === null || v === undefined) ? d : Number(v);
+  const steps = [
+    { op: 'inspect', name },
+    { op: 'restore', name, dry_run: true },
+    { op: 'restore', name, confirm: true, dry_run: false },
+  ];
+  const box = $('#bk-inspect');
+  box.classList.remove('hidden');
+  box.innerHTML = '<p class="desc">正在预检…（第 1 步：读取包内容）</p>';
+  // 三步走：先校验包本身，再 dry-run 出计划，最后才真写。
+  // 少任何一步都会出问题：跳过校验会把损坏包写进系统，
+  // 跳过预检就是让用户闭着眼点「确认」。
+  (async () => {
+    const r1 = await api('/api/backup', {
+      method: 'POST', body: steps[0], timeout: 300000
+    });
+    if (!r1.ok) {
+      box.innerHTML = `<div class="notice err">${esc(r1.msg_cn || '读取备份包失败')}</div>`;
+      return;
+    }
+    const bad = (r1.data.bad || []).length;
+    if (bad) {
+      box.innerHTML = `<div class="notice err">包内 ${bad} 个文件校验不通过，`
+        + '这个包已损坏，<b>已中止还原</b>。请重新导出。</div>';
+      return;
+    }
+    box.innerHTML = '<p class="desc">正在预检…（第 2 步：算出还原计划）</p>';
+    const r2 = await api('/api/backup', {
+      method: 'POST', body: steps[1], timeout: 300000
+    });
+    if (!r2.ok) {
+      box.innerHTML = `<div class="notice err">${esc(r2.msg_cn || '预检失败')}</div>`;
+      return;
+    }
+    const plan = r2.data.plan || [];
+    const errs = r2.data.errors || [];
+    const skip = r2.data.skipped || [];
+    box.innerHTML = `
+      <h4>还原预检结果</h4>
+      <div class="notice ${errs.length ? 'err' : 'ok'}">
+        将写入 <b>${plan.length}</b> 个文件${errs.length
+          ? '，另有 <b>' + errs.length + '</b> 项被拒绝' : '，没有冲突'}</div>
+      ${errs.length ? '<ul class="tight" style="color:var(--err)">'
+        + errs.map(e => `<li>${esc(e)}</li>`).join('') + '</ul>' : ''}
+      ${skip.length ? '<p class="desc" style="margin-top:8px">以下文件按设计跳过：</p>'
+        + '<ul class="tight">' + skip.map(e =>
+          `<li class="mono" style="font-size:11px">${esc(e.path)} —— ${esc(e.why)}</li>`).join('')
+        + '</ul>' : ''}
+      <details style="margin-top:8px"><summary>查看完整清单（${plan.length} 项）</summary>
+        <table class="tbl"><thead><tr><th>文件</th><th>大小</th><th>本机现状</th></tr></thead>
+        <tbody>${plan.map(f => `<tr>
+          <td class="mono" style="font-size:11px">${esc(f.path)}${
+            f.sensitive ? ' <span class="tag warn">敏感</span>' : ''}</td>
+          <td>${fmtBytes(f.size || 0)}</td>
+          <td>${f.exists ? '将覆盖' : '将新建'}</td></tr>`).join('')}
+        </tbody></table></details>`;
+    if (errs.length) return;
+    modal('确认还原配置',
+      `<p>即将把 <b class="mono">${esc(name)}</b> 里的 <b>${plan.length}</b> 个文件写入本机。</p>
+       <p class="desc">现有同名文件会先被复制成 <span class="mono">.drouter-restore-bak</span>
+       备份再覆盖，所以这一操作本身是可退的。</p>
+       <p class="desc">还原<b>只写文件、不重启服务</b>。写完之后请到相关页面确认，
+       再点一次「保存并应用」让改动真正生效。</p>
+       <p class="desc" style="color:var(--warn)">网络相关配置在服务重启瞬间可能短暂中断。</p>`,
+      async () => {
+        box.innerHTML = '<p class="desc">正在还原…</p>';
+        const r3 = await api('/api/backup', {
+          method: 'POST', body: steps[2], timeout: 600000
+        });
+        if (!r3.ok) {
+          box.innerHTML = `<div class="notice err">${esc(r3.msg_cn || '还原失败')}</div>`;
+          toast(r3.msg_cn || '还原失败', 'err', 10000);
+          return;
+        }
+        const dd = r3.data || {};
+        box.innerHTML = `<div class="notice ok">${esc(r3.msg_cn || '还原完成')}</div>`;
+        toast(r3.msg_cn || '还原完成', 'ok', 10000);
+        bkLoad(false);
+        return dd.applied;
+      }, '确认还原');
+  })();
+}
+
+async function bkPrune() {
+  const c = (BK_DATA && BK_DATA.conf) || {};
+  const kc = c.keep_count || 0;
+  const kd = c.keep_days || 0;
+  if (kc === 0 && kd === 0) {
+    toast('当前设置是「不按份数、不按天数」清理，没有可清理的旧包', 'warn', 6000);
+    return;
+  }
+  const r = await api('/api/backup', {
+    method: 'POST', body: { op: 'prune', keep_count: kc, keep_days: kd }
+  });
+  toast(r.msg_cn, r.ok ? 'ok' : 'err');
+  if (r.ok) bkLoad(false);
+}
+
+async function bkSaveConf() {
+  const g = id => { const e = $('#' + id); return e ? e.value : ''; };
+  const conf = {
+    auto_enabled: !!(($('#bk-auto-en') || {}).checked),
+    auto_hour: g('bk-auto-hour'),
+    keep_count: g('bk-keep-count'),
+    keep_days: g('bk-keep-days'),
+  };
+  const r = await api('/api/backup', { method: 'POST', body: { op: 'conf', conf } });
+  toast(r.msg_cn, r.ok ? 'ok' : 'err', 8000);
+  if (r.ok) {
+    if (conf.auto_enabled && r.data && r.data.timer_applied === false) {
+      toast('设置已保存，但定时器未成功启用（详见下方状态表）', 'warn', 10000);
+    }
+    bkLoad(false);
+  }
+}
+
+/* ============ 告警与通知中心（1.0.7） ============ */
+let AL_DATA = null;
+const AL_LV = { critical: { n: '严重', c: 'err' }, warn: { n: '警告', c: 'warn' },
+                info: { n: '提示', c: 'info' } };
+
+async function viewAlert() {
+  $('#view').innerHTML = `
+    <div class="card">
+      <h3>它解决什么问题
+        <button class="ghost small" id="al-reload" style="float:right">重新读取</button></h3>
+      <p class="desc">在此之前，这套系统是「坏了你自己来看」—— 日志、快照、流日志
+        全都齐全，但没有任何东西会在你睡觉或出门的时候告诉你「家里断网了」。
+        断 4 小时和断 4 分钟，对在家办公的人差别巨大。</p>
+      <p class="desc">判定和推送都由后台定时任务完成，<b>不需要你打开这个页面</b>。
+        这里只是配置阈值、添加通知通道、查看历史。</p>
+      <div id="al-top"><p class="desc">正在读取…</p></div>
+    </div>
+
+    <div class="card">
+      <h3>通知通道</h3>
+      <p class="desc">告警要送到哪里去。至少配一个并勾上「启用」，否则规则命中了也只
+        出现在下面的历史记录里。建议手机推送与邮件各配一个作为双保险。</p>
+      <div id="al-ch"></div>
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="al-add-bark">添加 Bark</button>
+        <button class="primary" id="al-add-smtp">添加邮件</button>
+        <button class="primary" id="al-add-hook">添加群机器人</button>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="ghost" id="al-test">发一条测试消息</button>
+      </div>
+      <div id="al-test-out" class="hidden" style="margin-top:12px"></div>
+    </div>
+
+    <div class="card">
+      <h3>告警规则与阈值</h3>
+      <p class="desc">每条规则下面都写了「为什么是这个数」。阈值太松会漏报，
+        太紧会变成每天几十条推送的噪音，最后你直接把通知静音 —— 那就白配了。</p>
+      <div id="al-rules"><p class="desc">正在读取…</p></div>
+    </div>
+
+    <div class="card">
+      <h3>总开关与推送策略</h3>
+      <div id="al-pol"><p class="desc">正在读取…</p></div>
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="al-save">保存设置</button>
+        <button class="ghost" id="al-run">立即检测一次</button>
+      </div>
+      <div id="al-run-out" class="hidden" style="margin-top:12px"></div>
+    </div>
+
+    <div class="card">
+      <h3>实时探测值
+        <span class="tag gray" id="al-probe-ts"></span></h3>
+      <p class="desc">这是判定用的原始数据。阈值调之前先看看这里的实际数值合不合理。</p>
+      <div id="al-probes"><p class="desc">正在读取…</p></div>
+    </div>
+
+    <div class="card">
+      <h3>告警历史
+        <span class="tag gray" id="al-hcnt"></span>
+        <button class="ghost small danger" id="al-clear" style="float:right">清空历史</button></h3>
+      <p class="desc">冷却状态也会一并清空，所以清完之后下一次命中会立刻推送。</p>
+      <div id="al-hist"><p class="desc">正在读取…</p></div>
+    </div>`;
+  $('#al-reload').onclick = () => alLoad(true);
+  $('#al-save').onclick = alSave;
+  $('#al-run').onclick = alRun;
+  $('#al-test').onclick = alTest;
+  $('#al-clear').onclick = alClear;
+  $('#al-add-bark').onclick = () => alAddChannel('bark');
+  $('#al-add-smtp').onclick = () => alAddChannel('smtp');
+  $('#al-add-hook').onclick = () => alAddChannel('webhook');
+  alLoad(false);
+}
+
+function alRenderTop(d) {
+  const u = d.units || {};
+  const on = d.conf && d.conf.enabled;
+  const t = u['drouter-alertd.timer'];
+  const tv = t && (t.active !== undefined ? t.active : t);
+  const tag = tv === 'active' ? '<span class="tag ok">运行中</span>'
+    : tv === 'failed' ? '<span class="tag err">失败</span>'
+    : on ? '<span class="tag warn">已启用但未运行</span>'
+    : '<span class="tag gray">已停用</span>';
+  $('#al-top').innerHTML = `
+    <table class="kv">
+      <tr><td>告警总开关</td><td>${on
+        ? '<span class="tag ok">已启用</span>' : '<span class="tag gray">未启用</span>'}</td></tr>
+      <tr><td>定时检测</td><td>${tag}</td></tr>
+      <tr><td>检测间隔</td><td>${(d.conf.interval_sec / 60).toFixed(0)} 分钟</td></tr>
+      <tr><td>下次执行</td><td class="mono">${esc(d.next || '未启用')}</td></tr>
+      <tr><td>已启用通道</td><td>${d.enabled_ch || 0} 个${
+        d.enabled_ch ? '' : ' <span class="tag warn">没有通道，告警只记历史不发出去</span>'}</td></tr>
+      <tr><td>上次检测</td><td>${d.last && d.last.msg_cn
+        ? esc(d.last.msg_cn) + '<br><span class="desc mono" style="font-size:11px">'
+          + esc(d.last.ts) + '</span>' : '<span class="desc">暂无记录</span>'}</td></tr>
+      ${d.quiet_now ? '<tr><td>免打扰</td><td><span class="tag info">当前处于免打扰时段'
+        + '（严重告警仍会推送）</span></td></tr>' : ''}
+    </table>
+    ${on && tv !== 'active'
+      ? '<div class="notice warn" style="margin-top:10px">总开关是开的，但定时器没在跑。'
+        + '点一次「保存设置」会重写单元并尝试启用；如果仍不生效，'
+        + '在 Web 终端里执行 <span class="mono">systemctl status drouter-alertd.timer</span> 看原因。</div>'
+      : ''}`;
+}
+
+function alRenderChannels(d) {
+  const chs = (d.conf && d.conf.channels) || [];
+  if (!chs.length) {
+    $('#al-ch').innerHTML = '<p class="desc">还没有添加任何通知通道。'
+      + '从下面三个按钮里挑一个开始 —— 手机推送最省事。</p>';
+    return;
+  }
+  const meta = {};
+  (d.channel_types || []).forEach(t => { meta[t.k] = t; });
+  $('#al-ch').innerHTML = chs.map((c, i) => {
+    const m = meta[c.type] || { n: c.type, d: '' };
+    const f = [];
+    if (c.type === 'bark') {
+      f.push(['推送地址 / Key', 'url', 'https://api.day.app/你的Key',
+        '留空会当成只填 Key 处理，自动补成官方地址']);
+    } else if (c.type === 'smtp') {
+      f.push(['SMTP 服务器', 'host', 'smtp.qq.com', '']);
+      f.push(['端口', 'port', '465', '465 走 SSL，587 走 STARTTLS，25 一般是明文']);
+      f.push(['账号', 'user', 'you@qq.com', '']);
+      f.push(['授权码 / 密码', 'pass', '', '留空表示不修改已保存的密码']);
+      f.push(['发件人', 'from', '', '留空则用账号']);
+      f.push(['收件人', 'to', 'you@qq.com', '多个用逗号分隔']);
+    } else {
+      f.push(['Webhook 地址', 'url',
+        'https://oapi.dingtalk.com/robot/send?access_token=xxx',
+        '支持钉钉 / 企业微信 / 飞书，按地址自动选报文格式']);
+    }
+    return `<div class="dep-item" style="margin-bottom:12px">
+      <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
+        <b>${esc(c.name || m.n)}</b>
+        <span class="tag gray">${esc(m.n)}</span>
+        ${c.enabled ? '<span class="tag ok">已启用</span>'
+          : '<span class="tag gray">未启用</span>'}
+        <label class="switch" style="margin-left:auto">
+          <input type="checkbox" data-al-en="${i}"${c.enabled ? ' checked' : ''}><i></i>
+        </label>
+      </div>
+      <p class="desc" style="margin:4px 0 8px">${esc(m.d)}</p>
+      ${f.map(([lb, key, ph, hint]) => `<div class="row" style="align-items:center;gap:10px;margin-bottom:6px">
+        <span style="width:130px" class="desc">${esc(lb)}</span>
+        <input type="${key === 'pass' ? 'password' : 'text'}" data-al-c="${i}" data-al-k="${key}"
+          value="${esc(c[key] == null ? '' : c[key])}" placeholder="${esc(ph)}"
+          style="flex:1;min-width:180px">
+      </div>${hint ? `<p class="desc" style="margin:-2px 0 6px 140px">${esc(hint)}</p>` : ''}`).join('')}
+      <div class="row" style="margin-top:6px">
+        <button class="ghost small" data-al-t1="${i}">单独测试</button>
+        <button class="ghost small danger" data-al-rm="${i}">删除</button>
+      </div>
+    </div>`;
+  }).join('');
+  $$('[data-al-rm]').forEach(b => b.onclick = () => alRmChannel(Number(b.dataset.alRm)));
+  $$('[data-al-t1]').forEach(b => b.onclick = () => alTest(b.dataset.alT1 != null
+    ? (AL_DATA.conf.channels[Number(b.dataset.alT1)] || {}).type : ''));
+}
+
+function alRenderRules(d) {
+  $('#al-rules').innerHTML = (d.rules || []).map(r => {
+    const step = r.step || 1;
+    return `<div class="dep-item" style="margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--line)">
+      <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
+        <b>${esc(r.name)}</b>
+        <span class="tag ${(AL_LV[r.lv] || {}).c || 'gray'}">${esc((AL_LV[r.lv] || {}).n || r.lv)}</span>
+        ${r.firing ? '<span class="tag err">当前命中中</span>' : ''}
+      </div>
+      <p class="desc" style="margin:4px 0 6px">${esc(r.why)}</p>
+      <div class="row" style="align-items:center;gap:8px">
+        <span class="desc">阈值</span>
+        <input type="number" data-al-r="${esc(r.key)}" value="${esc(r.value)}"
+          min="${esc(r.min)}" max="${esc(r.max)}" step="${esc(step)}" style="width:110px">
+        <span class="desc">${esc(r.unit || '')}</span>
+        <span class="desc">（可填 ${esc(r.min)} – ${esc(r.max)}，默认 ${esc(r.default)}）</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function alRenderPol(d) {
+  const c = d.conf || {};
+  $('#al-pol').innerHTML = `
+    <div class="row" style="align-items:center;gap:10px;margin-bottom:10px">
+      <span>启用告警</span>
+      <label class="switch"><input type="checkbox" id="al-enabled"${c.enabled ? ' checked' : ''}><i></i></label>
+      <span class="desc">关掉后仍然会探测，但不会推送任何消息</span>
+    </div>
+    <div class="row" style="align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+      <span>检测间隔</span>
+      <input type="number" id="al-interval" min="60" max="3600" step="60"
+        value="${esc(c.interval_sec || 300)}" style="width:110px"><span class="desc">秒（60–3600）</span>
+      <span style="margin-left:16px">同一条规则最短重复间隔</span>
+      <input type="number" id="al-cooldown" min="1" max="1440"
+        value="${esc(c.cooldown_min || 30)}" style="width:90px"><span class="desc">分钟</span>
+    </div>
+    <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
+      <span>免打扰时段</span>
+      <input type="time" id="al-qfrom" value="${esc(c.quiet_from || '')}" style="width:130px">
+      <span class="desc">至</span>
+      <input type="time" id="al-qto" value="${esc(c.quiet_to || '')}" style="width:130px">
+      <span class="desc">留空表示不设。跨零点（如 23:00 → 07:00）也支持</span>
+    </div>
+    <p class="desc" style="margin-top:8px">
+      免打扰只压「警告」和「提示」，<b>严重告警（外网中断）永远会推送</b> ——
+      「半夜别吵我」不包括「家里断网了」。</p>`;
+}
+
+function alRenderProbes(p) {
+  if (!p || !Object.keys(p).length) {
+    $('#al-probes').innerHTML = '<p class="desc">尚无探测数据。点一次「立即检测」就会刷新。</p>';
+    return;
+  }
+  const rows = [];
+  const w = p.wan || {};
+  rows.push(['外网连通性', w.up
+    ? '<span class="tag ok">正常</span> 网关 ' + esc(w.gw || '未知')
+      + (w.loss_pct != null ? '，丢包 ' + w.loss_pct + '%' : '')
+    : '<span class="tag err">不可达</span> ' + esc(w.why || ''),
+    w.up ? 'ok' : 'err']);
+  const d = p.disk || {};
+  if (d.pct != null) {
+    rows.push(['最满的磁盘', esc(d.mount || '/') + ' · 已用 ' + d.pct
+      + '%（剩余 ' + esc(d.avail || '未知') + '）',
+      d.pct >= 85 ? 'err' : d.pct >= 75 ? 'warn' : 'ok']);
+  }
+  if (p.temp && p.temp.c != null) {
+    rows.push(['CPU 温度', p.temp.c + ' ℃（来源 ' + esc(p.temp.src || '未知') + '）',
+      p.temp.c >= 80 ? 'err' : p.temp.c >= 70 ? 'warn' : 'ok']);
+  }
+  const m = p.mem || {};
+  if (m.pct != null) {
+    rows.push(['内存', '已用 ' + m.pct + '%（可用 ' + m.avail_mb + ' MB / 共 '
+      + m.total_mb + ' MB）', m.pct >= 92 ? 'err' : m.pct >= 80 ? 'warn' : 'ok']);
+  }
+  const l = p.load || {};
+  if (l.load1 != null) {
+    rows.push(['系统负载', '1 分钟 ' + l.load1 + ' · 5 分钟 ' + l.load5
+      + ' · 15 分钟 ' + l.load15, l.load1 >= 3 ? 'warn' : 'ok']);
+  }
+  const lt = p.latency || {};
+  if (lt.ms != null || lt.loss_pct != null) {
+    rows.push(['到 ' + esc(lt.target || '网关') + ' 的延迟',
+      (lt.ms != null ? lt.ms + ' ms' : '超时')
+      + (lt.loss_pct != null ? ' · 丢包 ' + lt.loss_pct + '%' : ''),
+      (lt.loss_pct != null && lt.loss_pct >= 30) ? 'err' : 'ok']);
+  }
+  if (p.backup_fail != null) {
+    rows.push(['自动备份连续失败', p.backup_fail + ' 次',
+      p.backup_fail >= 2 ? 'warn' : 'ok']);
+  }
+  if (p.snapshot_fail != null) {
+    rows.push(['自动快照连续失败', p.snapshot_fail + ' 次',
+      p.snapshot_fail >= 3 ? 'warn' : 'ok']);
+  }
+  $('#al-probes').innerHTML = `<table class="tbl"><thead><tr>
+    <th>探测项</th><th>当前值</th></tr></thead><tbody>${rows.map(([a, b, c]) =>
+      `<tr><td>${esc(a)}</td><td>${b}</td></tr>`).join('')}</tbody></table>`;
+}
+
+function alRenderHist(items) {
+  $('#al-hcnt').textContent = (items || []).length + ' 条';
+  if (!items || !items.length) {
+    $('#al-hist').innerHTML = '<p class="desc">还没有任何告警记录。'
+      + '这说明要么一切正常，要么告警没启用 —— 看上面的总开关。</p>';
+    return;
+  }
+  $('#al-hist').innerHTML = `<table class="tbl">
+    <thead><tr><th>时间</th><th>级别</th><th>内容</th><th>推送</th></tr></thead>
+    <tbody>${items.map(x => {
+      const lv = AL_LV[x.lv] || { n: x.lv, c: 'gray' };
+      return `<tr>
+        <td class="mono" style="font-size:12px">${esc(x.ts || '')}</td>
+        <td><span class="tag ${lv.c}">${esc(lv.n)}</span></td>
+        <td>${esc(x.msg_cn || '')}</td>
+        <td>${x.key === 'test' ? '<span class="tag info">测试</span>'
+          : x.ok ? '<span class="tag ok">已送达</span>'
+          : '<span class="tag err">失败</span>'}
+          ${(x.errs || []).length ? '<br><span class="desc" style="font-size:11px">'
+            + esc((x.errs || []).join('；')) + '</span>' : ''}</td>
+      </tr>`;
+    }).join('')}</tbody></table>`;
+}
+
+async function alLoad(toastIt) {
+  const r = await api('/api/alert', { method: 'GET' });
+  if (!r.ok) {
+    $('#al-top').innerHTML = `<div class="notice err">${esc(r.msg_cn || '读取失败')}</div>`;
+    return;
+  }
+  AL_DATA = r.data || {};
+  alRenderTop(AL_DATA);
+  alRenderChannels(AL_DATA);
+  alRenderRules(AL_DATA);
+  alRenderPol(AL_DATA);
+  alRenderProbes((AL_DATA.state || {}).probes);
+  alRenderHist(AL_DATA.history);
+  const st = (AL_DATA.state || {}).ts;
+  $('#al-probe-ts').textContent = st
+    ? '数据来自 ' + new Date(st * 1000).toLocaleString('zh-CN') : '';
+  if (toastIt) toast('已重新读取', 'ok');
+}
+
+function alChPayload() {
+  // 把表单里的开关与输入框收集回通道数组
+  const base = ((AL_DATA && AL_DATA.conf && AL_DATA.conf.channels) || []).map(c =>
+    Object.assign({}, c));
+  $$('[data-al-en]').forEach(el => {
+    const i = Number(el.dataset.alEn);
+    if (base[i]) base[i].enabled = el.checked;
+  });
+  $$('[data-al-c]').forEach(el => {
+    const i = Number(el.dataset.alC);
+    const k = el.dataset.alK;
+    if (base[i]) base[i][k] = el.value;
+  });
+  return base;
+}
+
+function alAddChannel(type) {
+  if (!AL_DATA) return;
+  const chs = alChPayload();
+  const names = { bark: '手机推送', smtp: '邮件通知', webhook: '群机器人' };
+  chs.push({ type, name: names[type] || type, enabled: true, url: '',
+             host: '', port: type === 'smtp' ? 465 : '', user: '', pass: '',
+             from: '', to: '', tls: true });
+  AL_DATA.conf.channels = chs;
+  alRenderChannels(AL_DATA);
+  toast('已添加「' + (names[type] || type) + '」，填完内容记得点「保存设置」', 'ok', 6000);
+}
+
+function alRmChannel(i) {
+  const chs = alChPayload();
+  const c = chs[i];
+  if (!c) return;
+  const nm = c.name || c.type;
+  chs.splice(i, 1);
+  AL_DATA.conf.channels = chs;
+  alRenderChannels(AL_DATA);
+  toast('已移除「' + nm + '」，点「保存设置」后生效', 'ok', 5000);
+}
+
+async function alSave() {
+  const rules = {};
+  $$('[data-al-r]').forEach(el => { rules[el.dataset.alR] = el.value; });
+  const conf = {
+    enabled: !!(($('#al-enabled') || {}).checked),
+    interval_sec: ($('#al-interval') || {}).value,
+    cooldown_min: ($('#al-cooldown') || {}).value,
+    quiet_from: ($('#al-qfrom') || {}).value || '',
+    quiet_to: ($('#al-qto') || {}).value || '',
+    rules,
+    channels: alChPayload(),
+  };
+  const r = await api('/api/alert', { method: 'POST', body: { op: 'conf', conf } });
+  toast(r.msg_cn, r.ok ? 'ok' : 'err', 8000);
+  if (r.ok) {
+    if (conf.enabled && r.data && r.data.timer_applied === false) {
+      toast('设置已保存，但定时器未成功启用，请看页面顶部的状态', 'warn', 10000);
+    }
+    alLoad(false);
+  }
+}
+
+async function alRun() {
+  const box = $('#al-run-out');
+  box.classList.remove('hidden');
+  box.innerHTML = '<p class="desc">正在检测…（含一次到网关的 ping，约 3 秒）</p>';
+  const r = await api('/api/alert', { method: 'POST', body: { op: 'run', force: true } },
+    );
+  if (!r.ok) {
+    box.innerHTML = `<div class="notice err">${esc(r.msg_cn || '检测失败')}</div>`;
+    return;
+  }
+  const d = r.data || {};
+  const hits = d.hits || [];
+  const skipped = d.skipped || [];
+  box.innerHTML = `
+    <div class="notice ${hits.length ? 'warn' : 'ok'}">${esc(r.msg_cn || '检测完成')}</div>
+    ${hits.length ? '<table class="tbl" style="margin-top:8px"><thead><tr>'
+      + '<th>规则</th><th>级别</th><th>命中内容</th></tr></thead><tbody>'
+      + hits.map(h => {
+        const lv = AL_LV[h.lv] || { n: h.lv, c: 'gray' };
+        return '<tr><td>' + esc(h.key) + '</td><td><span class="tag ' + lv.c + '">'
+          + esc(lv.n) + '</span></td><td>' + esc(h.msg_cn) + '</td></tr>';
+      }).join('') + '</tbody></table>' : ''}
+    ${skipped.length ? '<details style="margin-top:8px"><summary>被跳过的 '
+      + skipped.length + ' 条</summary><ul class="tight">'
+      + skipped.map(s => '<li>' + esc(s.msg_cn) + ' —— ' + esc(s.why)
+        + '</li>').join('') + '</ul></details>' : ''}
+    <p class="desc" style="margin-top:8px">提示：这里勾了「立即检测」会绕过冷却期强制推送，
+      用来验证通道是否真的通。日常检测不需要这么做。</p>`;
+  alLoad(false);
+}
+
+async function alTest(type) {
+  const box = $('#al-test-out');
+  box.classList.remove('hidden');
+  box.innerHTML = '<p class="desc">正在发送测试消息…</p>';
+  const r = await api('/api/alert', { method: 'POST', body: { op: 'test', type: type || '' } });
+  const d = r.data || {};
+  const rows = (d.results || []).map(x => `<tr>
+    <td>${esc(x.name)}</td>
+    <td>${x.ok ? '<span class="tag ok">成功</span>' : '<span class="tag err">失败</span>'}</td>
+    <td class="desc">${esc(x.msg_cn || '')}</td></tr>`).join('');
+  box.innerHTML = `<div class="notice ${r.ok ? 'ok' : 'err'}">${esc(r.msg_cn || '')}</div>
+    ${rows ? '<table class="tbl" style="margin-top:8px"><thead><tr><th>通道</th>'
+      + '<th>结果</th><th>说明</th></tr></thead><tbody>' + rows + '</tbody></table>' : ''}
+    ${r.ok ? '' : '<p class="desc" style="margin-top:8px">通道配置没保存也会导致发送失败 —— '
+      + '加完通道记得点一次「保存设置」。</p>'}`;
+}
+
+function alClear() {
+  modal('清空告警历史',
+    `<p>确定清空全部告警历史吗？</p>
+     <p class="desc">同时会清掉每条规则的冷却状态，所以清完之后下一次命中会立刻推送
+     （而不是继续等冷却期走完）。</p>`,
+    async () => {
+      const r = await api('/api/alert', { method: 'POST', body: { op: 'clear' } });
+      toast(r.msg_cn, r.ok ? 'ok' : 'err');
+      if (r.ok) alLoad(false);
+    }, '清空');
+}
+
+/* ============ WireGuard VPN（1.0.7） ============ */
+let VPN_DATA = null;
+
+async function viewVpn() {
+  $('#view').innerHTML = `
+    <div class="card">
+      <h3>远程连回家里
+        <button class="ghost small" id="vp-reload" style="float:right">重新读取</button></h3>
+      <p class="desc">人在外面想回内网拿文件、访问家里的 NAS，用它。
+        Debian 13 的内核<b>自带 WireGuard</b>，不需要装任何第三方软件，
+        性能也远好于 OpenVPN。</p>
+      <p class="desc">工作方式是：给每台设备（手机 / 笔记本）生成一份独立配置，
+        导入对方的 WireGuard 客户端 App，连上之后就能像在家一样访问内网地址。</p>
+      <div id="vp-top"><p class="desc">正在读取…</p></div>
+    </div>
+
+    <div class="card">
+      <h3>服务端设置</h3>
+      <p class="desc">保存只写配置文件，<b>不会启动服务</b>；点「保存并应用」才会真正生效。
+        改动这两个动作是分开的，和其它模块的「保存 / 生效」一致。</p>
+      <div id="vp-conf"><p class="desc">正在读取…</p></div>
+      <div id="vp-warn"></div>
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="vp-apply">保存并应用</button>
+        <button class="ghost" id="vp-save">仅保存</button>
+        <button class="ghost" id="vp-stop">停止服务</button>
+      </div>
+      <div id="vp-out" class="hidden" style="margin-top:12px"></div>
+    </div>
+
+    <div class="card">
+      <h3>客户端设备
+        <span class="tag gray" id="vp-pcnt"></span></h3>
+      <p class="desc">每台设备一套独立密钥。删除某台设备等于吊销它的访问权限 ——
+        手机丢了就删掉那一条，比改密码快得多。</p>
+      <div id="vp-peers"><p class="desc">正在读取…</p></div>
+      <div class="row" style="margin-top:12px">
+        <input type="text" id="vp-new-name" placeholder="设备名称，比如「我的手机」"
+          style="flex:1;min-width:200px">
+        <button class="primary" id="vp-add">添加设备</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>连接状态</h3>
+      <p class="desc">握手时间是很久以前（比如几个月前）说明这台设备很久没连了，
+        或者配置已经失效。</p>
+      <div id="vp-live"><p class="desc">正在读取…</p></div>
+    </div>
+
+    <div class="card">
+      <h3>危险操作</h3>
+      <p class="desc">删除全部 VPN 配置、密钥与放行规则。所有人立刻连不上。</p>
+      <button class="danger" id="vp-wipe">删除全部 VPN 配置</button>
+    </div>`;
+  $('#vp-reload').onclick = () => vpnLoad(true);
+  $('#vp-save').onclick = () => vpnSave(false);
+  $('#vp-apply').onclick = () => vpnSave(true);
+  $('#vp-stop').onclick = vpnStop;
+  $('#vp-add').onclick = vpnAddPeer;
+  $('#vp-wipe').onclick = vpnWipe;
+  vpnLoad(false);
+}
+
+function vpnRenderTop(d) {
+  const c = d.conf || {};
+  const live = d.live || {};
+  let env = '';
+  if (d.installed === 'no') {
+    env = '<div class="notice err">本机内核或工具不支持 WireGuard，'
+      + '无法启动服务。<span class="mono">Debian 13 官方内核自带 WireGuard，'
+      + '出现这个提示通常说明跑在精简容器里。</span></div>';
+  } else if (!d.has_systemd) {
+    env = '<div class="notice warn">当前环境没有 systemd（容器形态）。'
+      + '服务会由 drouter 直接管理接口，功能可用，但不能用 '
+      + '<span class="mono">systemctl</span> 查看状态。</div>';
+  }
+  $('#vp-top').innerHTML = env + `<table class="kv">
+    <tr><td>服务状态</td><td>${live.up
+      ? '<span class="tag ok">运行中</span>' : '<span class="tag gray">未启动</span>'}</td></tr>
+    <tr><td>配置开关</td><td>${c.enabled
+      ? '<span class="tag ok">已开启</span>' : '<span class="tag gray">已关闭</span>'}</td></tr>
+    <tr><td>监听端口</td><td class="mono">UDP ${c.port || '未设置'}${
+      d.port_busy ? ' <span class="tag warn">该端口当前被其他程序占用</span>' : ''}</td></tr>
+    <tr><td>地址池</td><td class="mono">${esc(c.pool || '')}${
+      (d.pool_conflict || []).length
+        ? ' <span class="tag err">与内网网段 ' + esc(d.pool_conflict.join('、'))
+          + ' 重叠，会导致路由冲突</span>' : ''}</td></tr>
+    <tr><td>本机内网网段</td><td class="mono">${esc((d.lan_nets || []).join('、') || '未识别')}</td></tr>
+    <tr><td>配置文件</td><td class="mono" style="font-size:11px">${esc(d.path || '')}</td></tr>
+  </table>`;
+}
+
+function vpnRenderConf(d) {
+  const c = d.conf || {};
+  const sw = (id, on) =>
+    `<label class="switch"><input type="checkbox" id="${id}"${on ? ' checked' : ''}><i></i></label>`;
+  $('#vp-conf').innerHTML = `
+    <div class="row" style="align-items:center;gap:10px;margin-bottom:10px">
+      <span>启用 VPN 服务端</span>${sw('vp-enabled', c.enabled)}
+    </div>
+    <div class="row" style="align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+      <span>监听端口</span>
+      <input type="number" id="vp-port" min="1" max="65535" value="${esc(c.port || 51820)}" style="width:110px">
+      <span class="desc">UDP 端口。占用时会自动换一个（换完会明确告诉你）</span>
+    </div>
+    <div class="row" style="align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+      <span>客户端地址池</span>
+      <input type="text" id="vp-pool" value="${esc(c.pool || '')}" style="width:170px">
+      <span class="desc">必须是私有网段，且不能和内网网段重叠</span>
+    </div>
+    <div class="row" style="align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+      <span>对外地址 (Endpoint)</span>
+      <input type="text" id="vp-ep" value="${esc(c.endpoint_host || '')}"
+        placeholder="公网 IP 或 DDNS 域名" style="flex:1;min-width:200px">
+      <button class="ghost small" id="vp-ep-guess">检测可用地址</button>
+    </div>
+    <p class="desc" id="vp-ep-hint" style="margin:-4px 0 10px"></p>
+    <div class="row" style="align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+      <span>保活间隔</span>
+      <input type="number" id="vp-ka" min="0" max="300" value="${esc(c.keepalive || 25)}" style="width:90px">
+      <span class="desc">秒。NAT 后面的设备需要它才能保持在线，0 表示关闭</span>
+    </div>
+    <div class="row" style="align-items:center;gap:10px;margin-bottom:10px">
+      <span>下发给客户端的 DNS</span>
+      <input type="text" id="vp-dns" value="${esc(c.dns || '')}"
+        placeholder="留空则用客户端自己的" style="width:200px">
+    </div>
+    <div class="row" style="align-items:center;gap:10px;margin-bottom:10px">
+      <span>全部流量经过本机（Exit Node）</span>${sw('vp-exit', c.exit_node)}
+    </div>
+    <p class="desc" style="color:var(--warn)">
+      打开这一项，客户端的所有上网流量都会从你家出去再出去（按两倍流量计费），
+      通常只在「人在国外需要用家里的宽带」时才开。</p>`;
+  const b = $('#vp-ep-guess');
+  if (b) b.onclick = vpnGuessEp;
+}
+
+function vpnRenderPeers(d) {
+  const ps = (d.conf && d.conf.peers) || [];
+  const live = d.live || {};
+  const byIp = {};
+  (live.peers || []).forEach(x => { byIp[(x.allowed || '').replace('/32', '')] = x; });
+  $('#vp-pcnt').textContent = ps.length + ' 台';
+  if (!ps.length) {
+    $('#vp-peers').innerHTML = '<p class="desc">还没有客户端。在下面填个设备名称就能创建。</p>';
+    return;
+  }
+  $('#vp-peers').innerHTML = `<table class="tbl">
+    <thead><tr><th>设备</th><th>地址</th><th>状态</th><th>最近握手</th>
+      <th class="nowrap">操作</th></tr></thead>
+    <tbody>${ps.map(x => {
+      const l = byIp[x.ip];
+      const hs = l && l.handshake ? l.handshake.replace('T', ' ') : '';
+      return `<tr>
+      <td><b>${esc(x.name)}</b>${x.note ? '<br><span class="desc" style="font-size:11px">'
+        + esc(x.note) + '</span>' : ''}</td>
+      <td class="mono">${esc(x.ip)}</td>
+      <td>${!x.enabled ? '<span class="tag gray">已停用</span>'
+        : !x.has_key ? '<span class="tag err">缺密钥</span>'
+        : l ? '<span class="tag ok">已连接</span>' : '<span class="tag gray">未连接</span>'}</td>
+      <td class="mono" style="font-size:11px">${esc(hs || '—')}${
+        l ? '<br><span class="desc" style="font-size:10px">↓' + fmtBytes(l.rx)
+          + ' ↑' + fmtBytes(l.tx) + '</span>' : ''}</td>
+      <td class="nowrap">
+        <button class="small" data-vp-cf="${esc(x.id)}">下载配置</button>
+        <button class="small" data-vp-tg="${esc(x.id)}">${x.enabled ? '停用' : '启用'}</button>
+        <button class="small danger" data-vp-rm="${esc(x.id)}">删除</button>
+      </td></tr>`;
+    }).join('')}</tbody></table>`;
+  $$('[data-vp-cf]').forEach(b => b.onclick = () => vpnPeerConf(b.dataset.vpCf));
+  $$('[data-vp-tg]').forEach(b => b.onclick = (e) => vpnPeerToggle(
+    b.dataset.vpTg, e.target.textContent === '启用'));
+  $$('[data-vp-rm]').forEach(b => b.onclick = () => vpnPeerDel(b.dataset.vpRm));
+}
+
+function vpnRenderLive(d) {
+  const live = d.live || {};
+  if (!live.up) {
+    $('#vp-live').innerHTML = '<p class="desc">服务未启动，暂无连接信息。</p>';
+    return;
+  }
+  $('#vp-live').innerHTML = `<table class="kv">
+    <tr><td>接口</td><td class="mono">${esc(d.path || '').split('/')[-1]}</td></tr>
+    <tr><td>实际监听端口</td><td class="mono">UDP ${live.listen_port || '未知'}</td></tr>
+    <tr><td>已连接设备</td><td>${(live.peers || []).length} 台</td></tr>
+  </table>`;
+}
+
+async function vpnLoad(toastIt) {
+  const r = await api('/api/vpn', { method: 'GET' });
+  if (!r.ok) {
+    $('#vp-top').innerHTML = `<div class="notice err">${esc(r.msg_cn || '读取失败')}</div>`;
+    return;
+  }
+  VPN_DATA = r.data || {};
+  vpnRenderTop(VPN_DATA);
+  vpnRenderConf(VPN_DATA);
+  vpnRenderPeers(VPN_DATA);
+  vpnRenderLive(VPN_DATA);
+  const warn = $('#vp-warn');
+  if ((VPN_DATA.pool_conflict || []).length) {
+    warn.innerHTML = '<div class="notice err" style="margin-top:10px">客户端地址池与本机内网网段'
+      + '重叠，两套路由会互相打架，表现为「连上了但访问不了内网」。'
+      + '请换一个不重叠的地址池。</div>';
+  } else {
+    warn.innerHTML = '';
+  }
+  if (toastIt) toast('已重新读取', 'ok');
+}
+
+async function vpnGuessEp() {
+  const r = await api('/api/vpn', { method: 'POST', body: { op: 'endpoint' } });
+  const box = $('#vp-ep-hint');
+  if (!r.ok) { box.textContent = r.msg_cn || '检测失败'; return; }
+  const cs = (r.data && r.data.candidates) || [];
+  box.innerHTML = '候选：' + cs.map(c =>
+    `<span class="tag ${c.v ? 'ok' : 'warn'}">${esc(c.n)}${c.v ? '：' + esc(c.v) : ''}</span>`
+  ).join(' ');
+  const good = cs.find(c => c.v);
+  if (good) {
+    const e = $('#vp-ep');
+    if (e && !e.value) e.value = good.v;
+    box.innerHTML += ' <span class="desc">（已填入第一个可用候选，可手动改）</span>';
+  }
+}
+
+function vpnCollect() {
+  const c = VPN_DATA && VPN_DATA.conf ? VPN_DATA.conf : {};
+  const g = id => { const e = $('#' + id); return e ? e.value : ''; };
+  return {
+    enabled: !!(($('#vp-enabled') || {}).checked),
+    port: g('vp-port'),
+    pool: g('vp-pool'),
+    endpoint_host: g('vp-ep'),
+    keepalive: g('vp-ka'),
+    dns: g('vp-dns'),
+    exit_node: !!(($('#vp-exit') || {}).checked),
+    lan_allow: c.lan_allow !== false,
+  };
+}
+
+async function vpnSave(apply) {
+  const conf = vpnCollect();
+  const box = $('#vp-out');
+  box.classList.remove('hidden');
+  if (conf.exit_node && apply
+      && !confirm('确定要启用「全部流量经过本机」吗？\n\n'
+        + '开启后，每台连上来的设备的所有上网流量都会从你家出去再出去，'
+        + '会消耗双倍带宽，也会被上游运营商看到。'
+        + '只在「人在国外、需要借用家里的宽带」时才该开。')) return;
+  box.innerHTML = '<p class="desc">正在保存…</p>';
+  let r = await api('/api/vpn', { method: 'POST', body: { op: 'save', conf } });
+  if (!r.ok) {
+    box.innerHTML = `<div class="notice err">${esc(r.msg_cn || '保存失败')}</div>`;
+    toast(r.msg_cn || '保存失败', 'err', 8000);
+    return;
+  }
+  if (r.data && r.data.port_swapped) {
+    box.innerHTML += `<div class="notice warn" style="margin-top:8px">${
+      esc(r.msg_cn || '')}</div>`;
+  }
+  if (!apply) {
+    box.innerHTML += `<div class="notice ok" style="margin-top:8px">${
+      esc(r.msg_cn || '已保存')}</div>
+      <p class="desc" style="margin-top:6px">配置已写入但服务未启动。
+      点「保存并应用」才会真正开始监听。</p>`;
+    toast(r.msg_cn || '已保存', 'ok');
+    vpnLoad(false);
+    return;
+  }
+  box.innerHTML += '<p class="desc" style="margin-top:8px">正在启动服务…</p>';
+  r = await api('/api/vpn', {
+    method: 'POST',
+    body: { op: 'apply', conf, confirm_exit: conf.exit_node ? true : undefined }
+  });
+  if (!r.ok) {
+    const j = (r.data && r.data.journal) || '';
+    box.innerHTML = `<div class="notice err">${esc(r.msg_cn || '启动失败')}</div>
+      ${j ? '<details style="margin-top:8px"><summary>查看服务日志</summary>'
+        + '<pre class="mono" style="font-size:11px;white-space:pre-wrap">'
+        + esc(j) + '</pre></details>' : ''}`;
+    toast(r.msg_cn || '启动失败', 'err', 10000);
+    return;
+  }
+  box.innerHTML = `<div class="notice ok">${esc(r.msg_cn || '已应用')}</div>`;
+  toast(r.msg_cn || '已应用', 'ok', 8000);
+  vpnLoad(false);
+}
+
+async function vpnStop() {
+  const r = await api('/api/vpn', { method: 'POST', body: { op: 'stop' } });
+  toast(r.msg_cn, r.ok ? 'ok' : 'err');
+  if (r.ok) vpnLoad(false);
+}
+
+async function vpnAddPeer() {
+  const e = $('#vp-new-name');
+  const name = e ? e.value.trim() : '';
+  if (!name) { toast('请先填写设备名称', 'warn'); return; }
+  const r = await api('/api/vpn', { method: 'POST', body: { op: 'peer_add', name } });
+  if (!r.ok) { toast(r.msg_cn || '创建失败', 'err', 8000); return; }
+  const d = r.data || {};
+  if (e) e.value = '';
+  // 私钥只在这里出现一次，必须让用户当场下载
+  const conf = d.client_conf || '';
+  modal('客户端已创建 —— 请立即下载配置',
+    `<p>设备 <b>${esc((d.peer || {}).name || '')}</b> 已分配地址
+      <span class="mono">${esc((d.peer || {}).ip || '')}</span>。</p>
+     <p class="desc">下面这份配置<b>含私钥</b>，只显示这一次。关掉这个窗口就
+      只能重新下载（私钥仍存在机器上，但你自己看不到它）。</p>
+     <p class="desc" style="margin-top:8px"><b>怎么用：</b></p>
+     <ol class="tight" style="margin:6px 0 0 18px">
+       <li>手机装 WireGuard 官方 App（App Store / 应用商店搜 WireGuard）</li>
+       <li>点「+」→「从文件或二维码导入」</li>
+       <li>选下面这份 <span class="mono">${esc(d.config_name || '')}</span></li>
+       <li>连上后就能直接访问内网地址了</li>
+     </ol>
+     <pre class="mono" style="font-size:11px;white-space:pre-wrap;max-height:220px;
+       overflow:auto;background:var(--bg2);padding:10px;border-radius:8px;margin-top:10px"
+       >${esc(conf) || '（服务端密钥尚未生成，请先点一次「保存并应用」）'}</pre>`,
+    // onOk 放「下载」：这样窗口右上角的取消和这个按钮都能拿到配置。
+    // 传 null 会让用户只能自己复制粘贴，容易漏掉第 3 行 AllowedIPs。
+    () => vpnDownloadConf(d.config_name, conf), '下载配置文件');
+  const box = $('#vp-out');
+  box.classList.remove('hidden');
+  box.innerHTML = `<div class="notice ok">设备已创建。配置含私钥，
+    请点上方窗口里的「下载配置文件」保存到本地。</div>
+    <div class="row" style="margin-top:10px">
+      <button class="primary" id="vp-dl-conf">下载配置文件</button>
+    </div>`;
+  const b = $('#vp-dl-conf');
+  if (b) b.onclick = () => vpnDownloadConf(d.config_name, conf);
+  vpnLoad(false);
+}
+
+function vpnDownloadConf(name, text) {
+  const blob = new Blob([text || ''], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name || 'drouter-wg.conf';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  toast('已开始下载 ' + (name || '配置文件'), 'ok');
+}
+
+async function vpnPeerConf(id) {
+  const r = await api('/api/vpn', { method: 'POST', body: { op: 'peer_conf', id } });
+  if (!r.ok) { toast(r.msg_cn || '生成失败', 'err', 8000); return; }
+  const d = r.data || {};
+  modal('客户端配置（' + id + '）',
+    `<p class="desc"><b>含私钥，请妥善保管</b>，不要发到群里。</p>
+     <pre class="mono" style="font-size:11px;white-space:pre-wrap;max-height:320px;
+       overflow:auto;background:var(--bg2);padding:10px;border-radius:8px;margin-top:8px"
+     >${esc(d.client_conf || '')}</pre>`,
+    () => vpnDownloadConf(d.config_name, d.client_conf), '下载');
+}
+
+async function vpnPeerToggle(id, on) {
+  const r = await api('/api/vpn', { method: 'POST', body: { op: 'peer_toggle', id, enabled: on } });
+  toast(r.msg_cn, r.ok ? 'ok' : 'err');
+  if (r.ok) vpnLoad(false);
+}
+
+function vpnPeerDel(id) {
+  modal('删除客户端',
+    `<p>确定删除设备 <b class="mono">${esc(id)}</b> 吗？</p>
+     <p class="desc">它的密钥会被清除，<b>已导入该配置的设备立刻连不上</b>。
+     手机丢了就删掉对应那一条 —— 这是最快的吊销方式。</p>`,
+    async () => {
+      const r = await api('/api/vpn', { method: 'POST', body: { op: 'peer_del', id } });
+      toast(r.msg_cn, r.ok ? 'ok' : 'err');
+      if (r.ok) vpnLoad(false);
+    }, '删除');
+}
+
+function vpnWipe() {
+  modal('删除全部 VPN 配置',
+    `<p class="desc" style="color:var(--err)">这会删除服务端密钥、全部客户端配置
+      和防火墙放行规则。</p>
+     <p>所有已导入配置的设备<b>立刻连不上</b>，需要重新逐台创建。</p>`,
+    async () => {
+      const r = await api('/api/vpn', { method: 'POST', body: { op: 'delete_all' } });
+      toast(r.msg_cn, r.ok ? 'ok' : 'err', 8000);
+      if (r.ok) vpnLoad(false);
+    }, '确认删除');
+}
+
+/* ============ 用量统计（1.0.7） ============ */
+let QT_DATA = null;
+let QT_REPORT = null;
+let QT_MONTH = '';
+
+async function viewQuota() {
+  $('#view').innerHTML = `
+    <div class="card">
+      <h3>谁用了多少流量
+        <button class="ghost small" id="qt-reload" style="float:right">重新读取</button></h3>
+      <p class="desc">按设备统计这个月用了多少流量、按什么服务用掉的。
+        工作室场景下还能按预设比例把话费分摊到人头或机器上。</p>
+      <p class="desc">数据来源是「连接与流日志」里的连接跟踪事件，
+        由后台每 10 分钟聚合一次。这里点查询<b>不会</b>去扫原始日志
+        （那会有几百 MB，在 4GB 内存的机器上会直接把进程打死）。</p>
+      <div id="qt-top"><p class="desc">正在读取…</p></div>
+    </div>
+
+    <div class="card">
+      <h3>本月用量排行
+        <span class="tag gray" id="qt-month"></span>
+        <select id="qt-mpick" style="float:right;max-width:180px">
+          <option value="">选择月份…</option>
+        </select></h3>
+      <div id="qt-devs"><p class="desc">正在读取…</p></div>
+    </div>
+
+    <div class="card">
+      <h3>按服务分类</h3>
+      <p class="desc">看看流量主要花在什么上。视频流、网盘同步、Windows 更新
+        通常是前几名。</p>
+      <div id="qt-svc"><p class="desc">正在读取…</p></div>
+    </div>
+
+    <div class="card">
+      <h3>每日趋势</h3>
+      <div id="qt-days"><p class="desc">正在读取…</p></div>
+    </div>
+
+    <div class="card">
+      <h3>套餐与费用分摊</h3>
+      <p class="desc">填了套餐流量和月租之后，下面会算出总费用和两种分摊口径。
+        「按用量分摊」是各设备实际占比；「按预设比例分摊」是你给每台设备
+        指定应承担的百分比（老板按人头、机器按台数这种）。</p>
+      <div id="qt-bill-cfg"><p class="desc">正在读取…</p></div>
+      <div id="qt-bill" style="margin-top:12px"></div>
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="qt-save">保存设置</button>
+        <button class="ghost" id="qt-agg">立即聚合一次</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>数据维护
+        <button class="ghost small danger" id="qt-reset" style="float:right">清空全部统计</button></h3>
+      <p class="desc">清空后从下一轮聚合重新开始，历史数据无法恢复。</p>
+    </div>`;
+  $('#qt-reload').onclick = () => qtLoad(true);
+  $('#qt-save').onclick = qtSave;
+  $('#qt-agg').onclick = qtAggregate;
+  $('#qt-reset').onclick = qtReset;
+  $('#qt-mpick').onchange = e => { QT_MONTH = e.target.value; qtReport(); };
+  qtLoad(false);
+}
+
+function qtRenderTop(d) {
+  const c = d.conf || {};
+  const u = d.units || {};
+  const tv = u['drouter-quotad.timer'] && (u['drouter-quotad.timer'].active
+    !== undefined ? u['drouter-quotad.timer'].active : u['drouter-quotad.timer']);
+  const lag = d.lag_bytes;
+  let env = '';
+  if (!d.has_archive) {
+    env = '<div class="notice warn">还没找到统一日志归档文件。'
+      + '请先到「日志与审计 → 连接与流日志」确认统一日志已启用，'
+      + '否则这里永远不会有数据。</div>';
+  } else if (!c.enabled) {
+    env = '<div class="notice warn">自动聚合未启用，新流量不会被统计。'
+      + '在下面勾上「启用自动聚合」并保存。</div>';
+  } else if (tv !== 'active') {
+    env = '<div class="notice warn">自动聚合已开启但定时器没在跑。'
+      + '点一次「保存设置」会重写单元并尝试启用。</div>';
+  }
+  const fresh = lag == null ? '未知'
+    : lag < 1048576 ? (lag / 1024).toFixed(0) + ' KB'
+    : (lag / 1048576).toFixed(1) + ' MB';
+  $('#qt-top').innerHTML = env + `<table class="kv">
+    <tr><td>聚合定时器</td><td>${tv === 'active'
+      ? '<span class="tag ok">运行中</span>'
+      : tv === 'failed' ? '<span class="tag err">失败</span>'
+      : '<span class="tag gray">未运行</span>'}</td></tr>
+    <tr><td>聚合间隔</td><td>${c.interval_min || 10} 分钟</td></tr>
+    <tr><td>下次执行</td><td class="mono">${esc(d.next || '未启用')}</td></tr>
+    <tr><td>上次聚合</td><td>${d.last && d.last.msg_cn
+      ? esc(d.last.msg_cn) + '<br><span class="desc mono" style="font-size:11px">'
+        + esc(d.last.ts) + '</span>' : '<span class="desc">暂无记录</span>'}</td></tr>
+    <tr><td>待聚合数据</td><td>${fresh}</td></tr>
+    <tr><td>统计库大小</td><td>${fmtBytes(d.agg_size || 0)}</td></tr>
+  </table>`;
+}
+
+function qtBar(pct, color) {
+  const w = Math.max(0, Math.min(100, Number(pct) || 0));
+  return `<div style="background:var(--line);height:8px;border-radius:4px;
+    overflow:hidden;min-width:60px">
+    <div style="width:${w}%;height:100%;background:${color || 'var(--pri)'}"></div>
+  </div>`;
+}
+
+function qtRenderReport(r) {
+  QT_MONTH = r.month || QT_MONTH;
+  $('#qt-month').textContent = r.month || '';
+  const pk = $('#qt-mpick');
+  if (pk) {
+    const ms = r.months || [];
+    pk.innerHTML = '<option value="">选择月份…</option>' + ms.map(m =>
+      `<option value="${esc(m)}"${m === r.month ? ' selected' : ''}>${esc(m)}</option>`
+    ).join('');
+  }
+  if (r.empty) {
+    $('#qt-devs').innerHTML = `<div class="notice warn">${esc(r.msg_cn || '')}</div>`;
+    $('#qt-svc').innerHTML = '<p class="desc">暂无数据</p>';
+    $('#qt-days').innerHTML = '<p class="desc">暂无数据</p>';
+    $('#qt-bill').innerHTML = '';
+    return;
+  }
+  // 设备排行
+  $('#qt-devs').innerHTML = `
+    <div class="notice info" style="margin-bottom:10px">${esc(r.note || '')}</div>
+    <table class="tbl"><thead><tr>
+      <th>设备</th><th>IP</th><th>MAC</th><th>用量</th><th>占比</th><th>连接数</th>
+    </tr></thead><tbody>${(r.devices || []).map(d => `<tr data-qt-dev="${esc(d.ip)}"
+        style="cursor:pointer">
+      <td><b>${esc(d.name)}</b>${d.mac ? '' : ' <span class="tag warn">无租约</span>'}</td>
+      <td class="mono">${esc(d.ip)}</td>
+      <td class="mono" style="font-size:11px">${esc(d.mac || '—')}</td>
+      <td>${fmtBytes(d.b)}</td>
+      <td style="min-width:90px">${qtBar(d.pct)}<br>
+        <span class="desc" style="font-size:11px">${d.pct}%</span></td>
+      <td>${d.n}</td>
+    </tr>`).join('')}</tbody></table>
+    <p class="desc" style="margin-top:8px">点任意一行看这台设备的明细。</p>`;
+  $$('[data-qt-dev]').forEach(tr => tr.onclick = () => qtDevice(tr.dataset.qtDev));
+  // 服务分类
+  const sv = r.services || [];
+  $('#qt-svc').innerHTML = sv.length ? `<table class="tbl">
+    <thead><tr><th>服务</th><th>用量</th><th>占比</th><th>连接数</th></tr></thead>
+    <tbody>${sv.slice(0, 15).map(s => `<tr>
+      <td>${esc(s.svc)}</td><td>${fmtBytes(s.b)}</td>
+      <td style="min-width:90px">${qtBar(s.pct)}<br>
+        <span class="desc" style="font-size:11px">${s.pct}%</span></td>
+      <td>${s.n}</td></tr>`).join('')}</tbody></table>
+    ${sv.length > 15 ? '<p class="desc">只显示前 15 项。</p>' : ''}`
+    : '<p class="desc">暂无数据</p>';
+  // 每日趋势
+  const ds = r.days || [];
+  if (!ds.length) {
+    $('#qt-days').innerHTML = '<p class="desc">暂无数据</p>';
+  } else {
+    const max = Math.max(...ds.map(x => x.b), 1);
+    $('#qt-days').innerHTML = `<div style="display:flex;align-items:flex-end;gap:2px;
+      height:120px;padding:8px;background:var(--bg2);border-radius:8px;overflow-x:auto">
+      ${ds.map(x => `<div title="${esc(x.d)}：${fmtBytes(x.b)}"
+        style="flex:1;min-width:8px;height:${Math.max(3, x.b * 100 / max)}%;
+        background:var(--pri);border-radius:2px 2px 0 0"></div>`).join('')}
+    </div>
+    <div class="row" style="justify-content:space-between;margin-top:4px">
+      <span class="desc">${esc(ds[0].d)}</span>
+      <span class="desc">${esc(ds[ds.length - 1].d)}</span>
+    </div>
+    <p class="desc" style="margin-top:6px">峰值 ${fmtBytes(max)}</p>`;
+  }
+  qtRenderBill(r);
+}
+
+function qtRenderBill(r) {
+  const b = r.bill || {};
+  const c = b.currency || '¥';
+  if (!b.price) {
+    $('#qt-bill').innerHTML = '<p class="desc">填了「月租」之后这里会算出费用分摊。</p>';
+    return;
+  }
+  const row = x => `<tr><td>${esc(x.name)}</td>
+    <td class="mono" style="font-size:11px">${esc(x.ip || '')}</td>
+    <td>${x.gb != null ? x.gb + ' GB' : (x.pct != null ? x.pct + '%' : '—')}</td>
+    <td><b>${c}${x.money}</b></td></tr>`;
+  $('#qt-bill').innerHTML = `
+    <table class="kv" style="margin-bottom:12px">
+      <tr><td>套餐流量</td><td>${b.total_gb || 0} GB</td></tr>
+      <tr><td>本月已用</td><td>${b.used_gb || 0} GB${
+        b.total_gb && b.used_gb > b.total_gb
+          ? ' <span class="tag warn">已超出套餐 ' + (b.used_gb - b.total_gb).toFixed(1)
+            + ' GB</span>' : ''}</td></tr>
+      <tr><td>本月费用</td><td><b style="font-size:16px">${c}${b.price}</b>${
+        b.used_gb > b.total_gb ? ' <span class="desc">（含超出部分估算）</span>' : ''}</td></tr>
+    </table>
+    <h4>口径一：按实际用量分摊</h4>
+    <table class="tbl"><thead><tr><th>设备</th><th>IP</th><th>用量</th><th>应摊</th></tr></thead>
+    <tbody>${(b.by_usage || []).map(row).join('')}</tbody></table>
+    ${(b.by_alloc || []).length ? `
+      <h4 style="margin-top:14px">口径二：按预设比例分摊</h4>
+      <table class="tbl"><thead><tr><th>设备</th><th></th><th>比例</th><th>应摊</th></tr></thead>
+      <tbody>${b.by_alloc.map(row).join('')}</tbody></table>
+      <p class="desc" style="margin-top:6px">在下面「分摊比例」里给设备填百分比。
+        没填的会归到「未指定」。</p>` : ''}`;
+}
+
+async function qtLoad(toastIt) {
+  const r = await api('/api/quota', { method: 'GET' });
+  if (!r.ok) {
+    $('#qt-top').innerHTML = `<div class="notice err">${esc(r.msg_cn || '读取失败')}</div>`;
+    return;
+  }
+  QT_DATA = r.data || {};
+  qtRenderTop(QT_DATA);
+  qtRenderBillConf(QT_DATA.conf || {});
+  await qtReport();
+  if (toastIt) toast('已重新读取', 'ok');
+}
+
+async function qtReport() {
+  const q = QT_MONTH ? '?month=' + encodeURIComponent(QT_MONTH) : '';
+  const r = await api('/api/quota' + q, { method: 'GET' });
+  if (!r.ok) {
+    $('#qt-devs').innerHTML = `<div class="notice err">${esc(r.msg_cn || '查询失败')}</div>`;
+    return;
+  }
+  const d = r.data || {};
+  if (!QT_MONTH) QT_MONTH = d.month || '';
+  QT_REPORT = d;
+  qtRenderReport(d);
+}
+
+function qtRenderBillConf(c) {
+  const sw = (id, on) =>
+    `<label class="switch"><input type="checkbox" id="${id}"${on ? ' checked' : ''}><i></i></label>`;
+  $('#qt-bill-cfg').innerHTML = `
+    <div class="row" style="align-items:center;gap:10px;margin-bottom:10px">
+      <span>启用自动聚合</span>${sw('qt-enabled', c.enabled)}
+      <span style="margin-left:16px">聚合间隔</span>
+      <input type="number" id="qt-int" min="5" max="240" value="${esc(c.interval_min || 10)}"
+        style="width:90px"><span class="desc">分钟</span>
+    </div>
+    <div class="row" style="align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+      <span>套餐流量</span>
+      <input type="number" id="qt-tgb" min="0" step="1" value="${esc(c.plan_total_gb || 0)}"
+        style="width:120px"><span class="desc">GB / 月</span>
+      <span style="margin-left:16px">月租</span>
+      <input type="number" id="qt-price" min="0" step="1" value="${esc(c.plan_price || 0)}"
+        style="width:110px">
+      <input type="text" id="qt-cur" value="${esc(c.currency || '¥')}" style="width:60px">
+    </div>
+    <div id="qt-alloc"></div>`;
+  qtRenderAlloc(c);
+}
+
+function qtRenderAlloc(c) {
+  const devs = (QT_REPORT && QT_REPORT.devices) || [];
+  const allocs = c.alloc || {};
+  if (!devs.length) {
+    $('#qt-alloc').innerHTML = '<p class="desc">先查一次用量报表，'
+      + '这里就能给每台设备填「应承担百分之多少」了。</p>';
+    return;
+  }
+  $('#qt-alloc').innerHTML = `<h4>分摊比例（可选）</h4>
+    <p class="desc">留空表示按实际用量算。填了数字就按你填的比例分，
+      适合「人头均摊」「按台数」这种和用量无关的算法。</p>
+    <table class="tbl"><thead><tr><th>设备</th><th>MAC</th><th>应承担</th></tr></thead>
+    <tbody>${devs.map(d => {
+      const key = d.mac || d.ip;
+      return `<tr><td>${esc(d.name)}</td>
+        <td class="mono" style="font-size:11px">${esc(d.mac || d.ip)}</td>
+        <td><input type="number" min="0" max="100" step="0.1"
+          data-qt-al="${esc(key)}" value="${esc(allocs[key] || '')}"
+          placeholder="按用量" style="width:100px"> %</td></tr>`;
+    }).join('')}</tbody></table>`;
+}
+
+async function qtSave() {
+  const g = id => { const e = $('#' + id); return e ? e.value : ''; };
+  const alloc = {};
+  $$('[data-qt-al]').forEach(el => {
+    const v = String(el.value || '').trim();
+    if (v !== '') alloc[el.dataset.qtAl] = v;
+  });
+  const conf = {
+    enabled: !!(($('#qt-enabled') || {}).checked),
+    interval_min: g('qt-int'),
+    plan_total_gb: g('qt-tgb'),
+    plan_price: g('qt-price'),
+    currency: g('qt-cur') || '¥',
+    alloc,
+  };
+  const r = await api('/api/quota', { method: 'POST', body: { op: 'conf', conf } });
+  toast(r.msg_cn, r.ok ? 'ok' : 'err', 8000);
+  if (r.ok) {
+    if (conf.enabled && r.data && r.data.timer_applied === false) {
+      toast('设置已保存，但定时器未成功启用，请看页面顶部', 'warn', 10000);
+    }
+    // 先刷报表拿到最新设备列表，再重画分摊表 ——
+    // 否则新出现的设备在这一轮里没法填比例
+    await qtReport();
+    qtRenderBillConf(QT_DATA.conf || {});
+  }
+}
+
+async function qtAggregate() {
+  toast('正在聚合…', 'ok', 4000);
+  const r = await api('/api/quota', { method: 'POST', body: { op: 'aggregate' } },
+    );
+  toast(r.msg_cn, r.ok ? 'ok' : 'err', 8000);
+  if (r.ok) qtLoad(false);
+}
+
+async function qtDevice(ip) {
+  const r = await api('/api/quota', {
+    method: 'POST', body: { op: 'device', ip, month: QT_MONTH }, timeout: 180000
+  });
+  if (!r.ok) { toast(r.msg_cn || '查询失败', 'err'); return; }
+  const d = r.data || {};
+  if (d.empty) { toast(d.msg_cn || '无数据', 'warn'); return; }
+  const max = Math.max(...(d.days || []).map(x => x.b), 1);
+  modal(d.name + ' · ' + d.month,
+    `<table class="kv" style="margin-bottom:10px">
+      <tr><td>IP</td><td class="mono">${esc(d.ip)}</td></tr>
+      <tr><td>MAC</td><td class="mono">${esc(d.mac || '未知')}</td></tr>
+      <tr><td>本月合计</td><td><b>${fmtBytes(d.total_b)}</b></td></tr>
+    </table>
+    <h4>每日</h4>
+    <div style="display:flex;align-items:flex-end;gap:2px;height:80px;
+      padding:6px;background:var(--bg2);border-radius:8px;overflow-x:auto">
+      ${(d.days || []).map(x => `<div title="${esc(x.d)}：${fmtBytes(x.b)}"
+        style="flex:1;min-width:8px;height:${Math.max(3, x.b * 100 / max)}%;
+        background:var(--pri);border-radius:2px 2px 0 0"></div>`).join('')}
+    </div>
+    <h4 style="margin-top:12px">按服务</h4>
+    <table class="tbl"><thead><tr><th>服务</th><th>用量</th><th>占比</th></tr></thead>
+    <tbody>${(d.services || []).slice(0, 10).map(s => `<tr>
+      <td>${esc(s.svc)}</td><td>${fmtBytes(s.b)}</td>
+      <td style="min-width:80px">${qtBar(s.pct)}<br>
+        <span class="desc" style="font-size:11px">${s.pct}%</span></td>
+    </tr>`).join('')}</tbody></table>`, null, '关闭');
+}
+
+function qtReset() {
+  modal('清空全部用量统计',
+    `<p>确定清空吗？</p>
+     <p class="desc">会删除已聚合的历史数据与聚合游标，统计将从零重新开始。
+     这一步<b>无法恢复</b>。</p>`,
+    async () => {
+      const r = await api('/api/quota', { method: 'POST', body: { op: 'reset' } });
+      toast(r.msg_cn, r.ok ? 'ok' : 'err');
+      if (r.ok) { QT_MONTH = ''; qtLoad(false); }
+    }, '清空');
 }
 
 function ulQuery() {
