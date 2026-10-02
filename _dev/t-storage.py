@@ -24,7 +24,7 @@ tree = ast.parse(code)
 
 WANT_FN = ['_blk_sysfs', '_dev_bus', '_walk_blk', '_sysfs_model',
            '_dev_is_system', '_fs_meta', '_fs_tool_ready', '_read_fstab',
-           '_backup_fstab', 'act_storage']
+           '_backup_fstab', '_safe_mnt_seg', '_mnt_target_error', 'act_storage']
 WANT_AS = ['FS_TYPES', '_CRITICAL_MOUNTS']
 
 picked = []
@@ -68,6 +68,7 @@ def _fail(msg, code='ERR', data=None):
 
 
 ns = {'os': os, 'json': json, 'shutil': shutil, 'time': __import__('time'),
+      're': __import__('re'),
       'sh': fake_sh, 'log': fake_log, 'GEN': GEN,
       'ok': _ok, 'fail': _fail,
       '_storage_device_rows': lambda: STATE['devices'],

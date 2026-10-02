@@ -7,6 +7,8 @@ Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Type=oneshot
 User=root
 ExecStart=/usr/bin/python3 /opt/drouter/backend/drouter-snapshotd.py
+# oneshot 打完包就退出，但 tar 大目录时也会有内存尖峰，给个上限兜底
+MemoryMax=300M
 
 [Install]
 WantedBy=multi-user.target

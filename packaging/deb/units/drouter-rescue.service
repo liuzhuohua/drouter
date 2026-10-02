@@ -10,6 +10,9 @@ User=root
 ExecStart=/usr/bin/python3 /opt/drouter/backend/drouter-rescue.py
 Restart=always
 RestartSec=5
+# 救援通道是「最后的入口」：本身只是个小 HTTP 服务，几十 MB 足够。
+# 给它也装上内存闸 —— 真到内存泄漏那天，不能让它把本就紧张的机器拖死
+MemoryMax=150M
 StandardOutput=journal
 StandardError=journal
 NoNewPrivileges=false

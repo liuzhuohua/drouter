@@ -204,6 +204,8 @@ Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Type=oneshot
 User=root
 ExecStart=/usr/bin/python3 /opt/drouter/backend/drouter-snapshotd.py
+# oneshot 打完包就退出，但 tar 大目录时也会有内存尖峰，给个上限兜底
+MemoryMax=300M
 
 [Install]
 WantedBy=multi-user.target
@@ -238,6 +240,9 @@ User=root
 ExecStart=/usr/bin/python3 /opt/drouter/backend/drouter-rescue.py
 Restart=always
 RestartSec=5
+# 救援通道是「最后的入口」：本身只是个小 HTTP 服务，几十 MB 足够。
+# 给它也装上内存闸 —— 真到内存泄漏那天，不能让它把本就紧张的机器拖死
+MemoryMax=150M
 StandardOutput=journal
 StandardError=journal
 NoNewPrivileges=false

@@ -64,6 +64,11 @@ MAX_LINE = 8 * 1024 * 1024
 _started = time.time()
 _stats_lock = threading.Lock()
 STATS = {'requests': 0, 'errors': 0, 'by_action': {}}
+# 同时执行的特权动作上限。这些动作里有格式化磁盘、apt 安装、重启服务这类
+# 重活：客户端并发点几下就会同时跑好几个，2 vCPU 机器上直接把负载打满，
+# 还可能互相抢系统资源（apt 锁、nft 表）。
+MAX_ACTIONS = 6
+_action_sem = threading.BoundedSemaphore(MAX_ACTIONS)
 
 
 def log(level, code, msg_cn, detail=None):
@@ -111,14 +116,27 @@ class Handler(socketserver.StreamRequestHandler):
                     return
                 action = str(req.get('action') or '')
                 payload = req.get('payload') or {}
+                # 名额用完就明确告诉调用方「忙」，而不是把动作堆在线程池里
+                if not _action_sem.acquire(blocking=False):
+                    self._write({'ok': False, 'code': 'BUSY',
+                                 'msg_cn': '已有 %d 个特权操作在执行，请稍后再试'
+                                           % MAX_ACTIONS})
+                    return
                 t0 = time.time()
-                res = HELPER.run_action(action, payload)
+                try:
+                    res = HELPER.run_action(action, payload)
+                finally:
+                    _action_sem.release()
                 dt = (time.time() - t0) * 1000.0
                 with _stats_lock:
                     STATS['requests'] += 1
                     if not res.get('ok'):
                         STATS['errors'] += 1
                     a = STATS['by_action']
+                    # 键数上限：本地 drouter 用户可以发任意非法 action 字符串，
+                    # 每个都会在这里留下一条永久记录。
+                    if len(a) > 200 and action not in a:
+                        a.clear()
                     rec = a.get(action) or {'n': 0, 'ms': 0.0, 'max': 0.0}
                     rec['n'] += 1
                     rec['ms'] += dt

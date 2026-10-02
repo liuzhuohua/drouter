@@ -462,7 +462,7 @@ Drouter 是普通 Debian 软件包，跑在哪都行：
 
 路由器往往出现在**不方便接外网**的地方：机房、弱电箱、隔离网段、
 或者一台你根本不想让它联网的机器。所以 Release 里的
-`drouter-1.0.4-offline-amd64.tar.gz` 不是「只发一个 `.deb`」，
+`drouter-1.0.5-offline-amd64.tar.gz` 不是「只发一个 `.deb`」，
 而是把 **Drouter 本体 + 它跑起来需要的全部 Debian 依赖**一起打成了一个包。
 
 解包出来是这样：
@@ -470,8 +470,8 @@ Drouter 是普通 Debian 软件包，跑在哪都行：
 ```bash
 # 1) 把 tar.gz 拷到目标机（U 盘 / scp / 内网共享都行）
 # 2) 解包
-tar xzf drouter-1.0.4-offline-amd64.tar.gz
-cd drouter-1.0.4-offline-amd64
+tar xzf drouter-1.0.5-offline-amd64.tar.gz
+cd drouter-1.0.5-offline-amd64
 
 # 3) 一条命令装完（会自动 sudo）
 sudo bash install.sh
@@ -494,11 +494,11 @@ sudo bash install.sh
 <summary><b>包里到底装了什么（点开看）</b></summary>
 
 ```
-drouter-1.0.4-offline-amd64/
+drouter-1.0.5-offline-amd64/
 ├── install.sh                 安装脚本（自动提权 + 本地 file: 源，零外网）
 ├── README-离线安装.md          给不熟悉 Linux 的人看的逐步说明
 ├── SHA256SUMS                 237 条校验和（236 依赖 + 本体）
-├── drouter_1.0.4_all.deb      Drouter 本体（含 6 个 systemd 单元）
+├── drouter_1.0.5_all.deb      Drouter 本体（含 6 个 systemd 单元）
 └── debs/                      236 个依赖 .deb
     ├── nftables_*.deb         ├─ 直接依赖
     ├── dnsmasq_*.deb
@@ -535,9 +535,9 @@ drouter-1.0.4-offline-amd64/
 </details>
 
 **想要更小的包？** 如果你的目标机有网（哪怕是内网自建 apt 镜像），
-可以只拿 `drouter_1.0.4_all.deb`（约 435 KB），见下方「方式二」。
+可以只拿 `drouter_1.0.5_all.deb`（约 445 KB），见下方「方式二」。
 
-**已经装过依赖、只想升级本体？** 同样只用那个 435 KB 的 `.deb`
+**已经装过依赖、只想升级本体？** 同样只用那个 445 KB 的 `.deb`
 `dpkg -i` 覆盖安装即可，不必重新走离线包。
 
 ### 方式二：在线安装（目标机有网）
@@ -545,24 +545,24 @@ drouter-1.0.4-offline-amd64/
 如果目标机能连上 Debian 官方源（或内网 apt 镜像），只需要本体那一个文件：
 
 ```bash
-sudo apt install ./drouter_1.0.4_all.deb
+sudo apt install ./drouter_1.0.5_all.deb
 sudo drouter-ctl status
 ```
 
 > `apt install ./xxx.deb` 会自动把 `Depends` 交给 apt 去网上补齐 ——
-> 这正是它能「只发一个 435 KB 文件」的前提。
+> 这正是它能「只发一个 445 KB 文件」的前提。
 > 目标机没网时请走**方式一**，否则 apt 会卡在拉依赖上。
 
 ### 方式三：Docker（体验用）
 
-项目提供 `drouter-1.0.4-docker.tar`（约 169 MB，已含完整根文件系统）。
+项目提供 `drouter-1.0.5-docker.tar`（约 169 MB，已含完整根文件系统）。
 
 **方式 A：docker compose（推荐）**
 
 Release 里附了现成的 `docker-compose.yml`，直接下下来用：
 
 ```bash
-docker load -i drouter-1.0.4-docker.tar
+docker load -i drouter-1.0.5-docker.tar
 
 # 把 docker-compose.yml 放到当前目录
 docker compose up -d
@@ -572,7 +572,7 @@ docker compose ps          # 等 health 变 healthy
 **方式 B：docker run**
 
 ```bash
-docker load -i drouter-1.0.4-docker.tar
+docker load -i drouter-1.0.5-docker.tar
 
 docker run -d --name drouter --restart unless-stopped \
   --network host \
@@ -582,11 +582,11 @@ docker run -d --name drouter --restart unless-stopped \
   -v drouter-data:/opt/drouter/data \
   -v drouter-snapshots:/opt/drouter/snapshots \
   -v drouter-log:/var/log/drouter \
-  drouter:1.0.4
+  drouter:1.0.5
 ```
 
-两种方式加载后镜像标签都是 **`drouter:1.0.4`**（另有一个
-`liuzhuohua/drouter:1.0.4` 别名，同一个镜像）。
+两种方式加载后镜像标签都是 **`drouter:1.0.5`**（另有一个
+`liuzhuohua/drouter:1.0.5` 别名，同一个镜像）。
 
 访问 `https://<宿主IP>:8443/`，账号 `admin` / `admin123`。
 
@@ -618,17 +618,17 @@ docker run -d --name drouter --restart unless-stopped \
 git clone https://github.com/liuzhuohua/drouter.git
 cd drouter
 
-# 本体 deb（→ dist/drouter_1.0.4_all.deb，约 435 KB）
-bash packaging/build-deb.sh 1.0.4
+# 本体 deb（→ dist/drouter_1.0.5_all.deb，约 445 KB）
+bash packaging/build-deb.sh 1.0.5
 
 # 离线依赖库（→ dist/offline-deps/，236 个 .deb + Packages 索引）
 bash scripts/make-offline-deps.sh
 
-# 自包含离线包（→ dist/drouter-1.0.4-offline-amd64.tar.gz，约 83 MB）
-bash packaging/build-offline-bundle.sh 1.0.4
+# 自包含离线包（→ dist/drouter-1.0.5-offline-amd64.tar.gz，约 83 MB）
+bash packaging/build-offline-bundle.sh 1.0.5
 
-# Docker 镜像（→ dist/drouter-1.0.4-docker.tar，约 169 MB）
-bash packaging/build-docker.sh 1.0.4
+# Docker 镜像（→ dist/drouter-1.0.5-docker.tar，约 169 MB）
+bash packaging/build-docker.sh 1.0.5
 ```
 
 构建顺序上，`build-offline-bundle.sh` 会**自己**先调 `build-deb.sh`
@@ -960,7 +960,7 @@ sudo ss -tlnp | grep 8443        # 看端口有没有在听
 
 ```bash
 # 下载新版 deb
-sudo apt install ./drouter_1.0.4_all.deb    # 直接覆盖安装，配置保留
+sudo apt install ./drouter_1.0.5_all.deb    # 直接覆盖安装，配置保留
 ```
 
 配置在 `/etc/drouter/` 和 SQLite 里，`apt remove` 也会保留（`purge` 才删）。
@@ -984,6 +984,60 @@ sudo apt purge  drouter       # 连配置一起删
 ---
 
 ## 📝 更新日志
+
+### v1.0.5 — 深挖第二轮：堵提权/注入，给内存和并发装上闸
+
+纯修复与加固版本，无新增功能，**不改动配置存储格式**（老配置直接可用）。
+1.0.4 清完「假输入框」之后，这一轮把前后端再过一遍，主题是三类：
+**能被利用的安全缺陷、会慢慢吃掉资源的生命周期问题、以及低配置机器上的性能水位**。
+
+- **安全：改密码可以顺手拿到 root。** `chpasswd` 是按行读的，用户名或密码里
+  塞一个换行，第二行就会被当成另一条记录执行 —— 等于直接改 root 密码。
+  现在用户名/密码一律拒绝换行、回车与控制字符。同类还修了：删除用户从
+  「写死保护 root/ajeef」改成「保护全部 UID<1000 系统账号」；
+  WOL 唤醒的接口名/目标地址加白名单（原先拼进 `sh -c`）；
+  ACL 的 hosts 字段改用 `ipaddress` 严格校验（原先 `':' in h` 这种弱判断
+  能漏进 nftables 规则）；存储挂载点限定在 `/mnt|/media|/srv` 之下
+  （原先 `target=/etc` 会把 U 盘盖到 /etc 上，系统立刻不可用）。
+- **安全：文件管理器的目录穿越收口。** 拒绝清单从「文件级」扩到「目录级」
+  （`.ssh`、`/etc/sudoers.d`、`/etc/pam.d` 等），再加一道按文件名的拦截
+  （`authorized_keys`、`shadow`、`sudoers` …）—— 原先 `..` 绕一层就能
+  写到 root 的 SSH 密钥，等于开后门。
+- **安全：前端 201 处未转义的 `value="${...}"` 全部补 `esc()`**，
+  `href` 一律过 `httpUrl()` 只放行 http/https（防 `javascript:` 伪协议），
+  主题导出的注释同时剥掉 `/*` 与 `*/`（1.0.4 只剥了一半，照样能闭合注入）。
+- **丢数据：三个页面切走再回来，未保存的改动被静默冲掉。**
+  访问控制 / 文件共享 / DDNS 进入页面时都会无条件用服务端数据覆盖草稿。
+  现在页内任何改动都会登记「脏页」，再进页面时保留你的编辑；
+  保存成功才清除。这是全站唯一真正不可逆的丢数据路径。
+- **假功能：LAN 页的「网关地址 / 域名后缀」改了等于没改。**
+  这两个值实际由 dnsmasq 下发，页面却写进了谁也不会读的 `system` 模块死键。
+  现在与 DHCP 页 Option 3 同源。另外 UPnP 的「刷新映射表」按钮原先会
+  **顺手把服务启动**然后给你看一句静态提示 —— 现在走真正的只读接口
+  `read:upnpmap`，查询绝不再产生副作用。
+- **资源：PTY 终端三条命。** 缓冲区不再无上限（8MB 封顶，超出丢最旧）、
+  会话数用信号量真正卡住（原先是「先查再用」的竞态）、空闲会话有后台
+  线程定期回收（原先只在「满了」那一刻才顺手清）。离开终端页面时
+  前端也会主动断开会话，不再白占 30 分钟。
+- **资源：Web 服务并发与内存水位。** 工作线程 48 封顶（原先 `daemon_threads`
+  只是「退出不等待」，并不是限流）、请求体 16MB 封顶、会话表 500 封顶且
+  过期判断改用单调时钟（原先系统时间一回调，会话集体「永生」或集体过期）、
+  审计表 2 万行封顶自动裁剪、登录失败计数表封顶。
+- **资源：日志与快照不再能撑爆磁盘。** helper 自身日志 32MB 封顶自动轮转；
+  快照前检查剩余空间（<1GB 直接跳过并说明）；文件下载封顶从 512MB
+  收到 20MB —— 512MB 这个数字本来就超过了下载通道 32MB 的单条响应上限，
+  大文件只会静默失败，回退路径还会把 ~700MB 输出整个读进内存。
+- **性能：`/api/config` 从 16 次开关 SQLite 改成 1 次**；磁盘清理状态页的
+  递归扫描有 30 秒缓存（原先每进一次页面就全量 `os.walk` 一遍 /var/log）；
+  gzip 缓存按字节数设闸（24MB）；标签页在后台时心跳暂停、终端轮询降频。
+- **加固：全部 11 处「断电就剩半截」的配置写入改原子写**（临时文件 +
+  `os.replace`）；rescue 与 snapshot 两个 systemd 单元补上 `MemoryMax`
+  内存闸（连同 helper 重建单元的那处模板，三处同步）。
+- **修：DHCPv6「停用」不停用。** `enabled=false` 时 dhcpcd 配置里仍然输出
+  实际配置行，现在停用就只留注释。另修租约回收改用 `dhcp_release`
+  （已登记进依赖清单，未安装时自动退化为删租约文件 + 重载并如实告知）、
+  VLAN 只删自己创建的接口（原先按名字匹配，可能删掉用户手建的）、
+  探测公网前清掉过期结果文件（原先一次探测成功就永久显示「外网可达」）。
 
 ### v1.0.4 — 清「点了没反应」与「东西写错地方」这批缺陷
 

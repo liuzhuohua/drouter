@@ -14,6 +14,8 @@ const esc = s => {
   return String(s == null ? '' : s).replace(/[&<>"']/g,
     c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 };
+/* 只放行 http/https 链接：javascript:/data: 这类伪协议绝不能进 href */
+const httpUrl = u => { const s = String(u == null ? '' : u).trim(); return /^https?:\/\//i.test(s) ? s : ''; };
 const fmtBytes = n => {
   n = Number(n) || 0;
   const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0;
@@ -187,7 +189,7 @@ const PAGES = (() => {
    免得用户点了顶栏按钮却得到一个「当前页面无需保存」的假提示。 */
 const PAGE_MODULES = {
   iface:   { save: ['system'],            apply: [] },
-  lan:     { save: ['system'],            apply: [] },
+  lan:     { save: ['system', 'dnsmasq'], apply: [] },
   wan:     { save: ['pppoe'],             apply: ['pppoe'] },
   dhcp:    { save: ['dnsmasq'],           apply: ['dnsmasq'] },
   dns:     { save: ['dnsmasq'],           apply: ['dnsmasq'] },
@@ -324,6 +326,10 @@ function renderNav() {
 function stopPageTimers() {
   // 公网 IP 判定页有自己的一套轮询（含并发请求），交给它自己的停止函数
   if (typeof pubipProbeStopPoll === 'function') pubipProbeStopPoll();
+  // 离开 Web 终端页：本地轮询有 #ws-screen 守卫会自己停，但服务端 PTY 会话
+  // 不会主动断 —— 重进页面是全新表单、并不恢复旧会话，不断开就白占一个
+  // PTY 直到 30 分钟闲置回收。注意此时 S.page 还是「正要离开」的页面。
+  if (S.page === 'webshell' && typeof wsDisconnect === 'function' && WS.sid) wsDisconnect(true);
   // 以下都是 interval 型定时器，清掉后置 null，view 里会重新创建
   [DASH_TIMER, WANLOG_TIMER, FWL_TIMER, DK_TIMER].forEach(t => clearInterval(t));
   DASH_TIMER = WANLOG_TIMER = FWL_TIMER = DK_TIMER = null;
@@ -343,6 +349,17 @@ let NAV_GEN = 0;
 /* 视图内部调用的辅助：在 await 前取一次代次，返回后用它校验 */
 function navGen() { return NAV_GEN; }
 function navStale(g) { return g !== NAV_GEN; }
+
+/* 页面级「未保存草稿」登记 ——
+   ACL / 文件共享 / DDNS 三个页面的表单状态全在 S 里，而进入页面时会无条件
+   用服务端数据整体覆盖：用户在页内改了东西没保存、切去别的页再切回来，
+   草稿就被静默冲掉。这是全站唯一真正不可逆的丢数据路径。
+   约定：页内任何改动都 pageDirty(页名)；进入脏页时保留本地草稿直接重渲染；
+   保存成功（或成功拉到新数据）后 pageClean(页名)。 */
+const PAGE_DIRTY = {};
+function pageDirty(k) { PAGE_DIRTY[k] = 1; }
+function pageClean(k) { delete PAGE_DIRTY[k]; }
+function pageIsDirty(k) { return !!PAGE_DIRTY[k]; }
 
 function go(k) {
   // 先停掉上一个页面留下的所有轮询，再切页面。
@@ -735,7 +752,7 @@ async function viewIface() {
   }
 
   const roleOpts = v => IFACE_ROLES.map(o =>
-    `<option value="${o.v}" ${v === o.v ? 'selected' : ''}>${o.n}</option>`).join('');
+    `<option value="${esc(o.v)}" ${v === o.v ? 'selected' : ''}>${esc(o.n)}</option>`).join('');
 
   const drvTag = src => {
     if (!src) return '<span class="tag gray">未知</span>';
@@ -896,13 +913,13 @@ function viewWan() {
       </div>
       <div class="row">
         <label>服务名（可留空）<input id="pp-svc" value="${esc(p.service_name || '')}" placeholder="多数地区留空"></label>
-        <label>MTU<input id="pp-mtu" type="number" value="${p.mtu || 1492}"></label>
-        <label>MRU<input id="pp-mru" type="number" value="${p.mru || 1492}"></label>
+        <label>MTU<input id="pp-mtu" type="number" value="${esc(p.mtu || 1492)}"></label>
+        <label>MRU<input id="pp-mru" type="number" value="${esc(p.mru || 1492)}"></label>
       </div>
       <label class="switch"><input type="checkbox" id="pp-persist" ${p.persist !== false ? 'checked' : ''}><i></i>断线自动重连（persist）</label>
       <div class="row">
-        <label>重拨间隔（秒）<input id="pp-holdoff" type="number" value="${p.holdoff || 5}"></label>
-        <label>最大失败次数（0=无限）<input id="pp-maxfail" type="number" value="${p.maxfail || 0}"></label>
+        <label>重拨间隔（秒）<input id="pp-holdoff" type="number" value="${esc(p.holdoff || 5)}"></label>
+        <label>最大失败次数（0=无限）<input id="pp-maxfail" type="number" value="${esc(p.maxfail || 0)}"></label>
       </div>
       <p class="hint-inline">凭据保存在本机 SQLite 数据库中，应用时写入 <span class="mono">/etc/ppp/chap-secrets</span>（权限 600）。</p>
     </div>
@@ -1131,7 +1148,7 @@ function renderWanModePanel(mode) {
   if (mode === 'dhcp') {
     el.innerHTML = `
       <div class="kv"><b>地址获取</b><span>自动从上级 DHCP 服务器获取 IPv4 地址与网关</span></div>
-      <label>MTU<input id="dh-mtu" type="number" value="${p.dhcp_mtu || 1500}"></label>
+      <label>MTU<input id="dh-mtu" type="number" value="${esc(p.dhcp_mtu || 1500)}"></label>
       <label class="switch"><input type="checkbox" id="dh-dns" ${p.dhcp_use_dns !== false ? 'checked' : ''}><i></i>使用上级下发的 DNS</label>
       <p class="hint-inline">DHCP 模式下，WAN 口会自动获取地址；DNS 可沿用上级下发，也可在「DNS 服务」页面自行指定。</p>`;
     const mt = $('#dh-mtu'); if (mt) mt.oninput = () => { S.cfg.pppoe = Object.assign($w('pppoe'), { dhcp_mtu: Number(mt.value) }); setActionMsg('已修改，请点击保存并应用'); };
@@ -1206,10 +1223,10 @@ function viewLan() {
           ${S.ifaces.map(i => `<option value="${esc(i.name)}" ${sys.lan_iface === i.name ? 'selected' : ''}>${esc(i.name)} (${esc(i.mac)})</option>`).join('')}
         </select></label>
         <label>LAN 地址 / 掩码<input id="ln-addr" value="${esc(sys.lan_address || '192.168.7.3/24')}" placeholder="192.168.7.3/24"></label>
-        <label>MTU<input id="ln-mtu" type="number" value="${sys.lan_mtu || 1500}"></label>
+        <label>MTU<input id="ln-mtu" type="number" value="${esc(sys.lan_mtu || 1500)}"></label>
       </div>
       <div class="row">
-        <label>网关地址（下发给客户端）<input id="ln-gw" value="${esc(sys.gateway || '')}"></label>
+        <label>网关地址（下发给客户端）<input id="ln-gw" value="${esc($w('dnsmasq').option_gateway || '')}" placeholder="与 DHCP 页 Option 3 同源"></label>
         <label>域名后缀<input id="ln-dom" value="${esc($w('dnsmasq').domain || 'lan')}"></label>
       </div>
       <p class="hint-inline">当前系统实际地址：<span class="mono" id="ln-cur"></span></p>
@@ -1226,7 +1243,14 @@ function viewLan() {
     el.oninput = el.onchange = () => { S.cfg.system = Object.assign($w('system'), { [key]: conv ? conv(el.value) : el.value }); setActionMsg('已修改，请点击保存并应用'); };
   };
   bind('#ln-if', 'lan_iface'); bind('#ln-addr', 'lan_address');
-  bind('#ln-mtu', 'lan_mtu', Number); bind('#ln-gw', 'gateway'); bind('#ln-dom', 'domain');
+  bind('#ln-mtu', 'lan_mtu', Number);
+  // 网关 / 域名后缀实际由 dnsmasq 下发：render 只读 dnsmasq 模块，
+  // 原先错绑到 system.gateway / system.domain —— 那两个键谁也读不到，改了等于没改
+  const bindQ = (id, key) => {
+    const el = $(id); if (!el) return;
+    el.oninput = el.onchange = () => { S.cfg.dnsmasq = Object.assign($w('dnsmasq'), { [key]: el.value }); setActionMsg('已修改，请点击保存并应用'); };
+  };
+  bindQ('#ln-gw', 'option_gateway'); bindQ('#ln-dom', 'domain');
   api('/api/ifaces').then(r => {
     const i = (r.data || []).find(x => x.name === sys.lan_iface);
     const a = i && (i.addrs || []).find(x => x.family === 'inet');
@@ -1250,7 +1274,7 @@ function viewDhcp() {
         <label>起始地址<input id="dh-s" value="${esc(d.pool_start || '')}"></label>
         <label>结束地址<input id="dh-e" value="${esc(d.pool_end || '')}"></label>
         <label>子网掩码<input id="dh-m" value="${esc(d.pool_netmask || '255.255.255.0')}"></label>
-        <label>租期（秒）<input id="dh-t" type="number" value="${d.lease_time || 7200}"></label>
+        <label>租期（秒）<input id="dh-t" type="number" value="${esc(d.lease_time || 7200)}"></label>
       </div>
     </div>
     <div class="card">
@@ -1571,7 +1595,7 @@ function viewFw(kind) {
         </div>
         <div class="row">
           <label class="switch"><input type="checkbox" id="fw-logaccept" ${c.log_accept === true ? 'checked' : ''}><i></i>同时记录被放通的包（数据量大）</label>
-          <label style="flex:0 0 170px">日志限速（包/秒）<input id="fw-lograte" type="number" min="1" max="1000" value="${Number(c.log_rate || 20)}"></label>
+          <label style="flex:0 0 170px">日志限速（包/秒）<input id="fw-lograte" type="number" min="1" max="1000" value="${esc(Number(c.log_rate || 20))}"></label>
         </div>
         <p class="hint-inline">修改后请点击右上角「保存并应用」才会写入规则并生效。</p>
       </div>
@@ -1766,11 +1790,11 @@ function viewIpv6() {
       <div class="row">
         <label>WAN 接口<input id="dv-wan" value="${esc(d.wan_iface || 'ppp0')}"></label>
         <label>LAN 接口<input id="dv-lan" value="${esc(d.lan_iface || 'ens18')}"></label>
-        <label>子网前缀长度<input id="dv-plen" type="number" value="${d.prefix_len || 64}"></label>
+        <label>子网前缀长度<input id="dv-plen" type="number" value="${esc(d.prefix_len || 64)}"></label>
       </div>
       <div class="row">
         <label>SLA-ID 后缀<input id="dv-sla" value="${esc(d.sla_id || '::1')}"></label>
-        <label>IAID<input id="dv-iaid" type="number" value="${d.iaid || 0}"></label>
+        <label>IAID<input id="dv-iaid" type="number" value="${esc(d.iaid || 0)}"></label>
       </div>
       <label class="switch"><input type="checkbox" id="dv-pd" ${d.request_pd !== false ? 'checked' : ''}><i></i>请求前缀委派（PD）</label>
       <label class="switch"><input type="checkbox" id="dv-na" ${d.slaac ? 'checked' : ''}><i></i>同时请求接口地址（IA_NA）</label>
@@ -1783,20 +1807,20 @@ function viewIpv6() {
         <label>通告前缀（如运营商下发 /64）<input id="ra-pfx" value="${esc(r.prefix || '')}" placeholder="2408:xxxx:xxxx:xxxx::/64"></label>
       </div>
       <div class="row">
-        <label>最大通告间隔（秒）<input id="ra-max" type="number" value="${r.max_interval || 600}"></label>
-        <label>最小通告间隔（秒）<input id="ra-min" type="number" value="${r.min_interval || 200}"></label>
-        <label>默认路由生命期<input id="ra-life" type="number" value="${r.lifetime || 1800}"></label>
-        <label>跳数限制<input id="ra-hop" type="number" value="${r.hop_limit || 64}"></label>
+        <label>最大通告间隔（秒）<input id="ra-max" type="number" value="${esc(r.max_interval || 600)}"></label>
+        <label>最小通告间隔（秒）<input id="ra-min" type="number" value="${esc(r.min_interval || 200)}"></label>
+        <label>默认路由生命期<input id="ra-life" type="number" value="${esc(r.lifetime || 1800)}"></label>
+        <label>跳数限制<input id="ra-hop" type="number" value="${esc(r.hop_limit || 64)}"></label>
       </div>
       <div class="row">
-        <label>前缀有效生命期<input id="ra-vl" type="number" value="${r.valid_life || 86400}"></label>
-        <label>前缀首选生命期<input id="ra-pl" type="number" value="${r.pref_life || 14400}"></label>
+        <label>前缀有效生命期<input id="ra-vl" type="number" value="${esc(r.valid_life || 86400)}"></label>
+        <label>前缀首选生命期<input id="ra-pl" type="number" value="${esc(r.pref_life || 14400)}"></label>
         <label>RDNSS（下发 DNS）<input id="ra-rdnss" value="${esc(r.rdnss || '')}" placeholder="2400:3200::1"></label>
         <label>DNSSL（域名）<input id="ra-dnssl" value="${esc(r.dnssl || '')}" placeholder="lan"></label>
         <label>RDNSS 生命期（秒）<input id="ra-rdnss-life" type="number" min="60" max="9000"
-               value="${Number(r.rdnss_life || 600)}"></label>
+               value="${esc(Number(r.rdnss_life || 600))}"></label>
         <label>DNSSL 生命期（秒）<input id="ra-dnssl-life" type="number" min="60" max="9000"
-               value="${Number(r.dnssl_life || r.rdnss_life || 600)}"></label>
+               value="${esc(Number(r.dnssl_life || r.rdnss_life || 600))}"></label>
       </div>
       <p class="hint-inline">两个生命期决定客户端保留这份 DNS 多久。DNSSL 没填时跟随 RDNSS 的值；
       注意不要写成 <span class="mono">r.rdnss_life || 600</span> 之外的省略形式 —— 它们是数字输入框，
@@ -1824,9 +1848,9 @@ function viewIpv6() {
         <label>池前缀（可留空，取自 PD）<input id="v6p-prefix" value="${esc($w('radvd').pool_prefix || '')}" placeholder="2408:xxxx::/56"></label>
       </div>
       <div class="row">
-        <label>子网 ID 长度（借用主机位做子网）<input id="v6p-sub" type="number" value="${$w('radvd').pool_subnet_bits || 8}"></label>
-        <label>分配起始子网 ID<input id="v6p-start" type="number" value="${$w('radvd').pool_start || 1}"></label>
-        <label>分配结束子网 ID<input id="v6p-end" type="number" value="${$w('radvd').pool_end || 254}"></label>
+        <label>子网 ID 长度（借用主机位做子网）<input id="v6p-sub" type="number" value="${esc($w('radvd').pool_subnet_bits || 8)}"></label>
+        <label>分配起始子网 ID<input id="v6p-start" type="number" value="${esc($w('radvd').pool_start || 1)}"></label>
+        <label>分配结束子网 ID<input id="v6p-end" type="number" value="${esc($w('radvd').pool_end || 254)}"></label>
       </div>
     </div>
 
@@ -1834,7 +1858,7 @@ function viewIpv6() {
       <h3>池策略（Pool Policy）</h3>
       <p class="desc">对应 RouterOS 的 pool-policy，可多选。勾选的策略会在生成地址与 RA 通告时生效。</p>
       <div id="v6p-policies">
-        ${V6P_POLICIES.map(p => `<label class="switch"><input type="checkbox" class="v6pol" value="${p.v}"
+        ${V6P_POLICIES.map(p => `<label class="switch"><input type="checkbox" class="v6pol" value="${esc(p.v)}"
           ${(($w('radvd').pool_policy || ['recommend']).includes(p.v)) ? 'checked' : ''}><i></i>
           <b>${p.n}</b>　<span style="color:var(--txt3);font-size:12px">${p.d}</span></label>`).join('')}
       </div>
@@ -1934,7 +1958,7 @@ function viewDns() {
         <label>内网 DNS 服务器<input id="dn-l" value="${esc(d.dns_lan_server || '')}" placeholder="192.168.7.x（可留空）"></label>
       </div>
       <div class="row">
-        <label>缓存条数<input id="dn-cs" type="number" value="${d.dns_cache_size || 1000}"></label>
+        <label>缓存条数<input id="dn-cs" type="number" value="${esc(d.dns_cache_size || 1000)}"></label>
         <label>本地域名<input id="dn-dom" value="${esc(d.domain || 'lan')}"></label>
       </div>
       <label class="switch"><input type="checkbox" id="dn-neg" ${d.dns_negcache !== false ? 'checked' : ''}><i></i>缓存否定结果（no-negcache 的反向）</label>
@@ -2089,7 +2113,7 @@ function renderPfList() {
         <input data-f="name" value="${esc(r.name || '')}" placeholder="例如 群晖 DSM"></label>
       <label style="flex:0 0 110px;margin:0">协议
         <select data-f="proto">
-          ${['tcp', 'udp', 'tcp/udp'].map(p => `<option value="${p}" ${r.proto === p ? 'selected' : ''}>${PF_PROTO_CN[p]}</option>`).join('')}
+          ${['tcp', 'udp', 'tcp/udp'].map(p => `<option value="${esc(p)}" ${r.proto === p ? 'selected' : ''}>${PF_PROTO_CN[p]}</option>`).join('')}
         </select></label>
       <label style="flex:0 0 110px;margin:0">IP 版本
         <select data-f="family">
@@ -2139,6 +2163,12 @@ const ACL_DAY_CN = ['周日', '周一', '周二', '周三', '周四', '周五', 
 const ACL_ACTION_TAG = { block: 'err', allow: 'ok', limit: 'warn', log: 'gray' };
 
 async function viewAcl() {
+  // 有未保存草稿时不要拉服务端数据覆盖 —— 切走再回来，编辑内容原样保留
+  if (pageIsDirty('acl') && S.acl) {
+    renderAcl();
+    pageDirty('acl'); setActionMsg('本页有未保存的改动，已为你保留，记得「保存并应用」', 'warn');
+    return;
+  }
   $('#view').innerHTML = `<div class="card"><h3>访问控制 / 家长时间组</h3>
     <p class="desc">正在读取配置与联动状态…</p></div>`;
   const r = await api('/api/acl');
@@ -2153,6 +2183,7 @@ async function viewAcl() {
     groups: (d.groups || []).map(x => Object.assign({}, x)),
     rules: (d.rules || []).map(x => Object.assign({}, x)),
   });
+  pageClean('acl');
   renderAcl();
 }
 
@@ -2212,12 +2243,12 @@ function renderAcl() {
   const en = $('#acl-en');
   if (en) en.onchange = () => {
     S.acl.enable = en.target.checked;
-    setActionMsg('总开关已修改，请在下方点击「保存并应用」');
+    pageDirty('acl'); setActionMsg('总开关已修改，请在下方点击「保存并应用」');
   };
   $('#acl-add-grp').onclick = () => {
     S.acl.groups.push({ id: 'g' + Date.now().toString(36), name: '', hosts: [] });
     renderAclGroups();
-    setActionMsg('已新增一个空白设备组，请填写后保存');
+    pageDirty('acl'); setActionMsg('已新增一个空白设备组，请填写后保存');
   };
   $('#acl-add-tg').onclick = () => {
     S.acl.time_groups.push({
@@ -2225,7 +2256,7 @@ function renderAcl() {
       start: '00:00', end: '23:59',
     });
     renderAclTimeGroups();
-    setActionMsg('已新增一个空白时间组，请填写后保存');
+    pageDirty('acl'); setActionMsg('已新增一个空白时间组，请填写后保存');
   };
   $('#acl-add-rule').onclick = () => {
     S.acl.rules.push({
@@ -2233,7 +2264,7 @@ function renderAcl() {
       time_group: (S.acl.time_groups[0] || {}).id || '', apps: [],
     });
     renderAclRules();
-    setActionMsg('已新增一条空白规则，请填写后保存');
+    pageDirty('acl'); setActionMsg('已新增一条空白规则，请填写后保存');
   };
   $('#acl-preview').onclick = async () => {
     $('#acl-out').innerHTML = '<pre>正在渲染…</pre>';
@@ -2269,7 +2300,7 @@ function renderAclPresets() {
       start: p.start || '00:00', end: p.end || '23:59',
     });
     renderAclTimeGroups();
-    setActionMsg('已套用模板「' + p.name + '」，请点击保存并应用');
+    pageDirty('acl'); setActionMsg('已套用模板「' + p.name + '」，请点击保存并应用');
   });
 }
 
@@ -2299,7 +2330,7 @@ function renderAclGroups() {
       } else {
         S.acl.groups[i][f] = e.value;
       }
-      setActionMsg('已修改，请点击保存并应用');
+      pageDirty('acl'); setActionMsg('已修改，请点击保存并应用');
     };
   });
   $$('#acl-grps [data-del]').forEach(b => b.onclick = () => {
@@ -2309,7 +2340,7 @@ function renderAclGroups() {
     // 同步清理引用了该组的规则
     (S.acl.rules || []).forEach(r => { if (r.group === gid) r.group = ''; });
     renderAclGroups(); renderAclRules();
-    setActionMsg('已删除设备组，请点击保存并应用');
+    pageDirty('acl'); setActionMsg('已删除设备组，请点击保存并应用');
   });
   $$('#acl-grps [data-tpl]').forEach(b => b.onclick = () => {
     const i = Number(b.dataset.tpl);
@@ -2323,7 +2354,7 @@ function renderAclGroups() {
       if (t) { S.acl.groups[i].name = t.name; }
       $('#modal').classList.add('hidden');
       renderAclGroups();
-      setActionMsg('已套用模板名称，请补充地址后保存');
+      pageDirty('acl'); setActionMsg('已套用模板名称，请补充地址后保存');
     });
   });
 }
@@ -2361,7 +2392,7 @@ function renderAclTimeGroups() {
         const hint = row.querySelector('.hint-inline');
         if (hint) hint.textContent = aclCrossHint(S.acl.time_groups[i]);
       }
-      setActionMsg('已修改，请点击保存并应用');
+      pageDirty('acl'); setActionMsg('已修改，请点击保存并应用');
     };
   });
   $$('#acl-tgs [data-day]').forEach(e => e.onchange = () => {
@@ -2371,7 +2402,7 @@ function renderAclTimeGroups() {
     const set = new Set(t.days || []);
     if (e.target.checked) set.add(di); else set.delete(di);
     t.days = Array.from(set).sort();
-    setActionMsg('已修改，请点击保存并应用');
+    pageDirty('acl'); setActionMsg('已修改，请点击保存并应用');
   });
   $$('#acl-tgs [data-del]').forEach(b => b.onclick = () => {
     const i = Number(b.dataset.del);
@@ -2379,7 +2410,7 @@ function renderAclTimeGroups() {
     S.acl.time_groups.splice(i, 1);
     (S.acl.rules || []).forEach(r => { if (r.time_group === tid) r.time_group = ''; });
     renderAclTimeGroups(); renderAclRules();
-    setActionMsg('已删除时间组，请点击保存并应用');
+    pageDirty('acl'); setActionMsg('已删除时间组，请点击保存并应用');
   });
 }
 
@@ -2389,7 +2420,7 @@ function aclCrossHint(t) {
   const days = (t.days || []).length;
   if (!days) return '⚠ 未选择任何星期，该时间组不会命中任何流量。';
   if (toMin(s) > toMin(e)) {
-    return 'ℹ 本地时间跨零点（' + s + ' 次日 ' + e + '），会自动拆成两段；注意「生效星期」指的是<b>起始那天</b>。';
+    return 'ℹ 本地时间跨零点（' + esc(s) + ' 次日 ' + esc(e) + '），会自动拆成两段；注意「生效星期」指的是<b>起始那天</b>。';
   }
   if (toMin(s) < 8 * 60 && toMin(e) >= 8 * 60) {
     return 'ℹ 该时段横跨本地 08:00（UTC 日分界），会自动拆成两段写入内核。';
@@ -2443,7 +2474,7 @@ function renderAclRules() {
       const f = e.dataset.f;
       S.acl.rules[i][f] = (e.type === 'checkbox') ? e.checked : e.value;
       if (f === 'action') renderAclRules();
-      setActionMsg('已修改，请点击保存并应用');
+      pageDirty('acl'); setActionMsg('已修改，请点击保存并应用');
     };
   });
   $$('#acl-rules [data-app]').forEach(e => e.onchange = () => {
@@ -2452,12 +2483,12 @@ function renderAclRules() {
     const set = new Set(r.apps || []);
     if (e.target.checked) set.add(e.dataset.app); else set.delete(e.dataset.app);
     r.apps = Array.from(set);
-    setActionMsg('已修改，请点击保存并应用');
+    pageDirty('acl'); setActionMsg('已修改，请点击保存并应用');
   });
   $$('#acl-rules [data-del]').forEach(b => b.onclick = () => {
     S.acl.rules.splice(Number(b.dataset.del), 1);
     renderAclRules();
-    setActionMsg('已删除规则，请点击保存并应用');
+    pageDirty('acl'); setActionMsg('已删除规则，请点击保存并应用');
   });
 }
 
@@ -2472,6 +2503,12 @@ function sb() {
 }
 
 async function viewNfs() {
+  // 有未保存草稿时保留本地编辑，不用服务端数据覆盖
+  if (pageIsDirty('nfs') && S.share) {
+    renderShare();
+    pageDirty('nfs'); setActionMsg('本页有未保存的改动，已为你保留，记得「保存并应用」', 'warn');
+    return;
+  }
   $('#view').innerHTML = `<div class="card"><h3>内网文件共享</h3>
     <p class="desc">正在读取共享配置与依赖状态…</p></div>`;
   const r = await api('/api/share');
@@ -2483,6 +2520,7 @@ async function viewNfs() {
   S.shareData = r.data || {};
   S.share = (r.data || {}).cfg || {};
   sb();
+  pageClean('nfs');
   renderShare();
 }
 
@@ -2563,7 +2601,7 @@ function renderShare() {
       端口已固定，便于防火墙精确放通。</p>
       <label class="switch"><input type="checkbox" id="sh-nfs" ${nfsOn ? 'checked' : ''}><i></i>启用 NFS 文件共享</label>
       <div class="row" style="margin-top:10px">
-        <label>服务线程数<input id="sh-th" type="number" value="${nfCfg.threads || 8}" min="1" max="128"></label>
+        <label>服务线程数<input id="sh-th" type="number" value="${esc(nfCfg.threads || 8)}" min="1" max="128"></label>
       </div>
       <p class="hint-inline">线程数决定并发处理能力，家用 4–16 足够；调大反而会占用内存。</p>
       <h4 style="margin:16px 0 8px">导出目录</h4>
@@ -2607,7 +2645,7 @@ function renderShare() {
     e.onchange = () => {
       const t = sub ? sb()[sub] : sb();
       t[k] = e.target.checked;
-      setActionMsg('已修改，请点击保存并应用');
+      pageDirty('nfs'); setActionMsg('已修改，请点击保存并应用');
     };
   };
   sw('#sh-smb', 'enable_smb'); sw('#sh-nfs', 'enable_nfs');
@@ -2617,7 +2655,7 @@ function renderShare() {
     e.oninput = () => {
       const t = sub ? sb()[sub] : sb();
       t[k] = e.type === 'number' ? Number(e.value) : e.value;
-      setActionMsg('已修改，请点击保存并应用');
+      pageDirty('nfs'); setActionMsg('已修改，请点击保存并应用');
     };
   };
   tx('#sh-wg', 'workgroup', 'samba'); tx('#sh-ss', 'server_string', 'samba');
@@ -2626,12 +2664,12 @@ function renderShare() {
   $('#sh-add-share').onclick = () => {
     sb().samba.shares.push(newShare());
     renderShareList();
-    setActionMsg('已新增一个共享，请填写后保存');
+    pageDirty('nfs'); setActionMsg('已新增一个共享，请填写后保存');
   };
   $('#sh-add-exp').onclick = () => {
     sb().nfs.exports.push(newExport());
     renderExportList();
-    setActionMsg('已新增一个 NFS 导出，请填写后保存');
+    pageDirty('nfs'); setActionMsg('已新增一个 NFS 导出，请填写后保存');
   };
   $('#sh-tpl-share').onclick = () => {
     const tpls = D.dir_templates || [];
@@ -2653,7 +2691,7 @@ function renderShare() {
       }
       $('#modal').classList.add('hidden');
       renderShareList();
-      setActionMsg('已套用模板，请补充地址后保存');
+      pageDirty('nfs'); setActionMsg('已套用模板，请补充地址后保存');
     });
   };
   $('#sh-preview').onclick = async () => {
@@ -2858,7 +2896,7 @@ async function stgShare(d) {
   sb().samba.shares.push(s);
   if (!sb().enable_smb) sb().enable_smb = true;
   renderShare();
-  setActionMsg('已把 ' + d.mountpoint + ' 加入 SMB 共享，请点击保存并应用');
+  pageDirty('nfs'); setActionMsg('已把 ' + d.mountpoint + ' 加入 SMB 共享，请点击保存并应用');
   toast('已加入 SMB 共享列表：' + d.mountpoint, 'ok', 4000);
 }
 
@@ -2895,7 +2933,7 @@ function renderShareList() {
       <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-top:8px">
         <label style="flex:0 0 170px;margin:0">访问方式
           <select data-f="mode">
-            ${Object.keys(MODE).map(k => `<option value="${k}" ${(s.mode || 'auth') === k ? 'selected' : ''}>${MODE[k]}</option>`).join('')}
+            ${Object.keys(MODE).map(k => `<option value="${esc(k)}" ${(s.mode || 'auth') === k ? 'selected' : ''}>${MODE[k]}</option>`).join('')}
           </select></label>
         <label style="flex:1 1 220px;margin:0">备注
           <input data-f="comment" value="${esc(s.comment || '')}" placeholder="例如 全家共享"></label>
@@ -3055,7 +3093,7 @@ function viewUpnp() {
       <div class="row">
         <label>WAN 接口<input id="up-ext" value="${esc(u.ext_iface || 'ppp0')}"></label>
         <label>监听地址（LAN 侧）<input id="up-lis" value="${esc(u.listen_ip || '192.168.7.3')}"></label>
-        <label>监听端口<input id="up-port" type="number" value="${u.port || 5000}"></label>
+        <label>监听端口<input id="up-port" type="number" value="${esc(u.port || 5000)}"></label>
       </div>
     </div>
     <div class="card">
@@ -3077,9 +3115,17 @@ function viewUpnp() {
   ['#up-ext', '#up-lis', '#up-port'].forEach(s => $(s).oninput = sync);
   $('#up-list').onclick = async () => {
     $('#up-out').innerHTML = '<pre>读取中…</pre>';
-    const r = await api('/api/service', { method: 'POST', body: { name: 'miniupnpd', op: 'start' } });
-    const r2 = await api('/api/journal', { method: 'GET' });
-    $('#up-out').innerHTML = `<pre>${esc(r.msg_cn)}\n\n注意：查询映射表需 UPnP 服务运行中。\n可在「日志」页查看 miniupnpd 输出。</pre>`;
+    // 只读接口：查询绝不顺手启动服务（「保存」与「生效」必须分开）
+    const r = await api('/api/upnpmap');
+    if (!r.ok) { $('#up-out').innerHTML = `<pre>${esc(r.msg_cn || '读取失败')}</pre>`; return; }
+    const d = r.data || {};
+    if (!d.active) { $('#up-out').innerHTML = `<p class="desc">${esc(d.note || 'miniupnpd 未在运行')}</p>`; return; }
+    const rows = d.mappings || [];
+    if (!rows.length) { $('#up-out').innerHTML = '<p class="desc">服务运行中，当前没有任何端口映射。</p>'; return; }
+    $('#up-out').innerHTML = `<table><thead><tr><th>协议</th><th>外部端口</th><th>内网地址</th><th>内网端口</th><th>说明</th></tr></thead>
+      <tbody>${rows.map(m => `<tr><td>${esc(m.proto)}</td><td class="mono">${esc(m.ext_port)}</td>
+        <td class="mono">${esc(m.int_ip)}</td><td class="mono">${esc(m.int_port)}</td>
+        <td>${esc(m.desc || '')}</td></tr>`).join('')}</tbody></table>`;
   };
 }
 
@@ -3567,7 +3613,7 @@ function cleanupRenderPolicy() {
   // 0 点是合法值（falsy），不能写 c.hour || 4 —— 配了 00:00 会显示成 04:00
   const cHour = (c.hour === 0 || c.hour) ? Number(c.hour) : 4;
   const hours = Array.from({ length: 24 }, (_, i) =>
-    `<option value="${i}"${i === cHour ? ' selected' : ''}>${String(i).padStart(2, '0')}:00</option>`).join('');
+    `<option value="${esc(i)}"${i === cHour ? ' selected' : ''}>${String(i).padStart(2, '0')}:00</option>`).join('');
   const st = (CLEAN_DATA && CLEAN_DATA.state) || {};
   $('#cl-policy').innerHTML = `
     <div class="row" style="align-items:center">
@@ -3580,7 +3626,7 @@ function cleanupRenderPolicy() {
           <option value="schedule"${c.trigger === 'schedule' ? ' selected' : ''}>仅定时触发</option>
         </select></label>
       <label class="desc" style="flex:0 0 120px;margin:0">水位阈值
-        <input id="cl-pct" type="number" min="50" max="99" value="${Number(c.disk_percent || 85)}"
+        <input id="cl-pct" type="number" min="50" max="99" value="${esc(Number(c.disk_percent || 85))}"
                style="width:100%;margin-top:4px"><span style="font-size:12px">% 使用率超过就清</span></label>
     </div>
     <div class="row" style="margin-top:10px;align-items:center">
@@ -3592,7 +3638,7 @@ function cleanupRenderPolicy() {
       <label class="desc" style="flex:0 0 130px;margin:0">执行时间
         <select id="cl-hour" style="width:100%;margin-top:4px">${hours}</select></label>
       <label class="desc" style="flex:1 1 200px;margin:0">单次上限
-        <input id="cl-max" type="number" min="0" max="1048576" value="${Number(c.max_mb_per_run || 0)}"
+        <input id="cl-max" type="number" min="0" max="1048576" value="${esc(Number(c.max_mb_per_run || 0))}"
                style="width:100%;margin-top:4px"><span style="font-size:12px">MB，0 = 不限（防止一次删太多）</span></label>
     </div>
     <p class="desc" style="margin:10px 0 0">定时器每小时被拉起一次，自己判断该不该真动手 ——
@@ -3636,7 +3682,7 @@ function cleanupRenderItems() {
           ${it.kind === 'age'
             ? `<label class="desc" style="flex:0 0 auto;margin:0">保留
                  <input class="cl-days" data-k="${esc(it.key)}" type="number" min="0" max="3650"
-                        value="${Number(it.days || 0)}" style="width:72px"> 天内的文件</label>`
+                        value="${esc(Number(it.days || 0))}" style="width:72px"> 天内的文件</label>`
             : '<span class="tag gray">由系统工具整体回收</span>'}
           <span class="desc" style="flex:1 1 auto;margin:0;text-align:right">
             轮转件 ${fmtBytes(it.total)}　命中 ${it.whole ? '全部' : (it.hit_count || 0) + ' 个文件'}${
@@ -3811,7 +3857,7 @@ function kernRender() {
           <option value="clamp"${mode === 'clamp' ? ' selected' : ''}>按 MTU 自动算（推荐）</option>
           <option value="fixed"${mode === 'fixed' ? ' selected' : ''}>写死数值</option>
         </select>
-        <input id="kn-mssval-${fam}" type="number" min="576" max="9000" value="${Number(val)}" style="width:96px">
+        <input id="kn-mssval-${fam}" type="number" min="576" max="9000" value="${esc(Number(val))}" style="width:96px">
         <span class="desc" style="margin:0">字节</span>
       </div>`;
   };
@@ -3839,7 +3885,7 @@ function kernRender() {
     </div>
     <div class="row" style="margin-top:10px">
       <label>团体名（只读口令）<input id="kn-snmp-comm" value="${esc(s.community || 'public')}"></label>
-      <label style="flex:0 0 130px">端口<input id="kn-snmp-port" type="number" min="1" max="65535" value="${Number(s.port || 161)}"></label>
+      <label style="flex:0 0 130px">端口<input id="kn-snmp-port" type="number" min="1" max="65535" value="${esc(Number(s.port || 161))}"></label>
       <label>监听地址（留空＝全部）<input id="kn-snmp-listen" value="${esc(s.listen || '')}" placeholder="0.0.0.0"></label>
     </div>
     <div class="row" style="margin-top:10px">
@@ -4097,7 +4143,7 @@ function wizStepLan() {
       </div>
       <div class="row">
         <label>子网掩码<input id="wz-pm" value="${esc(l.pool_netmask || '255.255.255.0')}"></label>
-        <label>租期（秒）<input id="wz-lt" type="number" value="${Number(l.lease_time || 7200)}"></label>
+        <label>租期（秒）<input id="wz-lt" type="number" value="${esc(Number(l.lease_time || 7200))}"></label>
       </div>
       <div class="row">
         <label>下发给设备的网关<input id="wz-og" value="${esc(l.gateway || lanIp)}"></label>
@@ -4394,7 +4440,10 @@ const DDNS_REGION_TAG = r => r === '国内' ? 'ok' : (r === '国际' ? 'info' : 
 async function viewDdns() {
   const r = await api('/api/ddns');
   const d = r.data || {};
-  const c = d.cfg || {};
+  // 有未保存草稿时，表单字段用草稿渲染；公网检测等状态区仍用实时数据。
+  // 草稿存活于 S.ddnsDirty，合并进 c 即可让下面的模板原样工作。
+  const draft = (pageIsDirty('ddns') && S.ddnsDirty) ? S.ddnsDirty : null;
+  const c = draft ? Object.assign({}, d.cfg || {}, draft) : (d.cfg || {});
   const pub = d.public || {};
   const note = d.note || {};
   S.ddns = d;
@@ -4456,8 +4505,8 @@ async function viewDdns() {
             <label class="switch" style="margin:0"><input type="checkbox" id="dd-ipv6" ${c.ipv6 ? 'checked' : ''}><i></i>AAAA（IPv6）</label>
           </div>
         </label>
-        <label>TTL（秒）<input id="dd-ttl" type="number" value="${c.ttl || 300}" min="60" max="86400"></label>
-        <label>检测间隔（秒）<input id="dd-int" type="number" value="${c.interval || 300}" min="60" max="86400"></label>
+        <label>TTL（秒）<input id="dd-ttl" type="number" value="${esc(c.ttl || 300)}" min="60" max="86400"></label>
+        <label>检测间隔（秒）<input id="dd-int" type="number" value="${esc(c.interval || 300)}" min="60" max="86400"></label>
       </div>
       <p class="hint-inline">IPv6 地址常为动态前缀，建议间隔 ≤ 300 秒、TTL ≤ 300 秒，以加快变更生效。</p>
     </div>
@@ -4468,7 +4517,7 @@ async function viewDdns() {
       <div class="row">
         <label>服务商<select id="dd-prov">
           ${Object.keys(byRegion).map(reg => `<optgroup label="${esc(reg)}">${
-            byRegion[reg].map(p => `<option value="${p.v}" ${c.provider === p.v ? 'selected' : ''}>${esc(p.n)}</option>`).join('')
+            byRegion[reg].map(p => `<option value="${esc(p.v)}" ${c.provider === p.v ? 'selected' : ''}>${esc(p.n)}</option>`).join('')
           }</optgroup>`).join('')}
         </select></label>
         <label>主域名<input id="dd-domain" value="${esc(c.domain || '')}" placeholder="例如 example.com"></label>
@@ -4477,7 +4526,7 @@ async function viewDdns() {
       <div class="kv"><b>当前服务商</b><span>${esc(prov.n || '')}
         <span class="tag ${DDNS_REGION_TAG(prov.region)}">${esc(prov.region || '')}</span></span></div>
       <p class="desc" style="margin-top:6px">${esc(prov.desc || '')}</p>
-      ${prov.doc ? `<p class="hint-inline">官方文档：<a href="${esc(prov.doc)}" target="_blank" rel="noopener noreferrer">${esc(prov.doc)}</a></p>` : ''}
+      ${prov.doc ? `<p class="hint-inline">官方文档：<a href="${esc(httpUrl(prov.doc))}" target="_blank" rel="noopener noreferrer">${esc(prov.doc)}</a></p>` : ''}
       <div id="dd-fields" style="margin-top:10px"></div>
       <div class="kv"><b>完整域名</b><span class="mono" id="dd-fqdn">—</span></div>
     </div>
@@ -4502,7 +4551,7 @@ async function viewDdns() {
     const e = $(id); if (!e) return;
     const h = () => {
       S.ddnsDirty = Object.assign(S.ddnsDirty || {}, { [k]: conv ? conv(e.value) : e.value });
-      setActionMsg('DDNS 已修改，点击下方「保存配置」生效');
+      pageDirty('ddns'); setActionMsg('DDNS 已修改，点击下方「保存配置」生效');
     };
     e.oninput = h; if (e.tagName === 'SELECT') e.onchange = h;
   };
@@ -4510,14 +4559,14 @@ async function viewDdns() {
   if (ddField) ddField.onchange = () => {
     S.ddnsDirty = Object.assign(S.ddnsDirty || {}, { provider: ddField.value, fields: {} });
     renderDdFields(ddField.value, {}, true);
-    setActionMsg('已切换服务商，请填写对应凭据后保存');
+    pageDirty('ddns'); setActionMsg('已切换服务商，请填写对应凭据后保存');
   };
   bind('#dd-domain', 'domain'); bind('#dd-sub', 'subdomain');
   bind('#dd-ttl', 'ttl', Number); bind('#dd-int', 'interval', Number);
-  $('#dd-en').onchange = e => { S.ddnsDirty = Object.assign(S.ddnsDirty || {}, { enabled: e.target.checked }); setActionMsg('已修改，点击下方保存'); };
-  $('#dd-ipv4').onchange = e => { S.ddnsDirty = Object.assign(S.ddnsDirty || {}, { ipv4: e.target.checked }); setActionMsg('已修改，点击下方保存'); };
-  $('#dd-ipv6').onchange = e => { S.ddnsDirty = Object.assign(S.ddnsDirty || {}, { ipv6: e.target.checked }); setActionMsg('已修改，点击下方保存'); };
-  S.ddnsDirty = { enabled: !!c.enabled, provider: c.provider, domain: c.domain || '',
+  $('#dd-en').onchange = e => { S.ddnsDirty = Object.assign(S.ddnsDirty || {}, { enabled: e.target.checked }); pageDirty('ddns'); setActionMsg('已修改，点击下方保存'); };
+  $('#dd-ipv4').onchange = e => { S.ddnsDirty = Object.assign(S.ddnsDirty || {}, { ipv4: e.target.checked }); pageDirty('ddns'); setActionMsg('已修改，点击下方保存'); };
+  $('#dd-ipv6').onchange = e => { S.ddnsDirty = Object.assign(S.ddnsDirty || {}, { ipv6: e.target.checked }); pageDirty('ddns'); setActionMsg('已修改，点击下方保存'); };
+  if (!draft) S.ddnsDirty = { enabled: !!c.enabled, provider: c.provider, domain: c.domain || '',
                   subdomain: c.subdomain || '', ipv4: c.ipv4 !== false, ipv6: !!c.ipv6,
                   ttl: c.ttl || 300, interval: c.interval || 300,
                   url4: c.url4 || '', url6: c.url6 || '', fields: Object.assign({}, c.fields || {}) };
@@ -4536,7 +4585,7 @@ async function viewDdns() {
     $$('#dd-fields input').forEach(i => { b.fields[i.dataset.f] = i.value; });
     const r2 = await api('/api/ddns', { method: 'POST', body: b });
     toast(r2.msg_cn, r2.ok ? 'ok' : 'err');
-    if (r2.ok) setTimeout(viewDdns, 400);
+    if (r2.ok) { pageClean('ddns'); setTimeout(viewDdns, 400); }
   };
   $('#dd-retest').onclick = async () => {
     const b = $('#dd-out'); if (b) b.innerHTML = '<pre>正在重新检测公网能力…</pre>';
@@ -4581,8 +4630,8 @@ function renderDdFields(provider, vals, clear) {
       </div>
       <p class="hint-inline">可用占位符：<span class="mono">{ip} {ipv6} {domain} {token} {user} {pass}</span></p>`;
     const u4 = $('#dd-url4'), u6 = $('#dd-url6');
-    if (u4) u4.oninput = () => { S.ddnsDirty.url4 = u4.value; setActionMsg('已修改，点击下方保存'); };
-    if (u6) u6.oninput = () => { S.ddnsDirty.url6 = u6.value; setActionMsg('已修改，点击下方保存'); };
+    if (u4) u4.oninput = () => { S.ddnsDirty.url4 = u4.value; pageDirty('ddns'); setActionMsg('已修改，点击下方保存'); };
+    if (u6) u6.oninput = () => { S.ddnsDirty.url6 = u6.value; pageDirty('ddns'); setActionMsg('已修改，点击下方保存'); };
     bindDdFieldInputs();
     return;
   }
@@ -4611,7 +4660,7 @@ function bindDdFieldInputs() {
     i.oninput = () => {
       S.ddnsDirty.fields = S.ddnsDirty.fields || {};
       S.ddnsDirty.fields[i.dataset.f] = i.value;
-      setActionMsg('已修改，点击下方保存');
+      pageDirty('ddns'); setActionMsg('已修改，点击下方保存');
     };
   });
 }
@@ -5086,7 +5135,7 @@ async function viewPppMulti() {
         <label>负载策略<select id="ppm-strategy">
           ${strat.map(s => `<option value="${esc(s.id)}"${s.id === d.strategy ? ' selected' : ''}>${esc(s.name)}</option>`).join('')}
         </select></label>
-        <label>会话数量<input id="ppm-count" type="number" min="1" max="8" value="${sessions.length || 1}" style="width:90px"></label>
+        <label>会话数量<input id="ppm-count" type="number" min="1" max="8" value="${esc(sessions.length || 1)}" style="width:90px"></label>
       </div>
       <p class="desc" id="ppm-strategy-why"></p>
       <div class="row" style="align-items:flex-end;gap:8px">
@@ -6429,7 +6478,7 @@ function wsPump() {
       // 长轮询：有输出说明可能还有后续，立刻再取一次；空手而归说明 shell 空闲。
       // 留 120ms 下限是给「守护还是旧版、不支持 wait」的情况兜底 ——
       // 否则会变成 0 延迟空转，把管理服务打满。
-      wsSchedule(d.data ? 0 : 120);
+      wsSchedule(d.data ? 0 : (document.hidden ? 1500 : 120));   // 后台标签页降频，省电省请求
     })
     .catch(() => wsSchedule(500))
     .then(() => { WS_BUSY = false; });
@@ -7297,7 +7346,7 @@ function viewSys() {
       修改后需要重启管理后台，然后用新地址重新访问（例如 <span class="mono">https://192.168.7.3:新端口/</span>）。</p>
       <div class="row">
         <label style="flex:0 0 200px">HTTPS 端口<input id="sy-port" type="number" min="1" max="65535"
-          value="${S.webPort || 8443}" placeholder="8443"></label>
+          value="${esc(S.webPort || 8443)}" placeholder="8443"></label>
         <button class="fixed" id="sy-port-save">保存并重启后台</button>
         <button class="ghost fixed" id="sy-port-reset">恢复默认 8443</button>
       </div>
@@ -7988,7 +8037,7 @@ function tmToCss(t) {
   const lines = [];
   // 主题名 / 版本是自由文本，原样拼进 /* */ 注释时，一个 "*/" 就能提前闭合注释、
   // 把后面的内容变成真正的 CSS 规则。这里必须先把注释终止符和换行剥掉。
-  const cmt = s => String(s || '').replace(/\*\//g, '').replace(/[\r\n]+/g, ' ');
+  const cmt = s => String(s || '').replace(/\/\*/g, '').replace(/\*\//g, '').replace(/[\r\n]+/g, ' ');
   lines.push(`/* Drouter 主题：${cmt(t.name)}${t.version ? ' v' + cmt(t.version) : ''} */`);
   lines.push(':root{');
   Object.keys(t.vars || {}).sort().forEach(k => { lines.push(`  ${k}:${t.vars[k]};`); });
@@ -8823,6 +8872,7 @@ function solarTermText(date) {
 
 let CLOCK_24H = localStorage.getItem('drouter_clock24') !== '0';
 let CLOCK_TIMER = null;
+let HEARTBEAT_TIMER = null;   // boot() 每次登录成功都会跑，心跳句柄要可清
 
 function tickClock() {
   const now = new Date();
@@ -8910,7 +8960,10 @@ function boot() {
     toast('初始化未完全成功，部分数据可能未加载：' + (e && e.message || e), 'warn');
   });
   // 轻量心跳：仅用于检测后端是否在线（顶栏不再展示内存，避免与概览重复）
-  setInterval(async () => {
+  // boot() 在每次登录成功后都会执行：不先清掉上一个，重登录一次就多一个心跳
+  if (HEARTBEAT_TIMER) clearInterval(HEARTBEAT_TIMER);
+  HEARTBEAT_TIMER = setInterval(async () => {
+    if (document.hidden) return;               // 标签页在后台不探测，省请求
     const r = await api('/api/health');
     if (!r.ok) toast('与后端连接中断，请检查管理服务是否在运行', 'err', 8000);
   }, 60000);
@@ -9591,7 +9644,7 @@ function dcfgRender() {
         <div style="margin:8px 0 0;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
           <label class="switch"><input type="checkbox" id="dc-log-on"${c.log_rotate === false ? '' : ' checked'}><i></i></label>
           <label style="flex:0 0 130px">单文件上限<input id="dc-log-size" value="${esc(c.log_max_size || '10m')}" placeholder="10m"></label>
-          <label style="flex:0 0 110px">保留份数<input id="dc-log-file" type="number" min="1" max="20" value="${Number(c.log_max_file || 3)}"></label>
+          <label style="flex:0 0 110px">保留份数<input id="dc-log-file" type="number" min="1" max="20" value="${esc(Number(c.log_max_file || 3))}"></label>
         </div>
       </div>
     </div>
@@ -9900,7 +9953,7 @@ function printRender() {
       <label style="flex:0 0 220px">RAW 直通设备
         <input id="pt-raw-dev" value="${esc(raw.device || '/dev/usb/lp0')}" placeholder="/dev/usb/lp0"></label>
       <label style="flex:0 0 130px">监听端口
-        <input id="pt-raw-port" type="number" min="1" max="65535" value="${Number(raw.port || 9100)}"></label>
+        <input id="pt-raw-port" type="number" min="1" max="65535" value="${esc(Number(raw.port || 9100))}"></label>
       <label style="flex:0 0 170px">绑定地址
         <input id="pt-raw-bind" value="${esc(raw.bind || '0.0.0.0')}" placeholder="0.0.0.0"></label>
     </div>
@@ -10168,7 +10221,7 @@ function ohRender() {
         <span class="tag ${d.healthy ? 'ok' : 'gray'}">${d.healthy ? '正常' : '无应答'}</span></span></div>
       <div class="kv"><b>实际监听</b><span class="mono">${(d.listen || []).length ? esc(d.listen.join('、')) : '未监听'}</span></div>
       <div class="kv"><b>控制台</b><span>${d.console_url && inst
-      ? `<a href="${esc(d.console_url)}" target="_blank" rel="noopener" class="mono">${esc(d.console_url)}</a>` : '—'}</span></div>
+      ? `<a href="${esc(httpUrl(d.console_url))}" target="_blank" rel="noopener" class="mono">${esc(d.console_url)}</a>` : '—'}</span></div>
     </div>
     <p class="desc" style="margin:10px 0 0">${esc(d.note || '')}</p>`;
 
@@ -10915,14 +10968,14 @@ function renderFlowLog() {
         <label>协议<select id="ul-proto">
           <option value="">全部</option>
           ${['TCP', 'UDP', 'ICMP', 'ICMPv6'].map(p =>
-    `<option value="${p}" ${u.proto === p ? 'selected' : ''}>${p}</option>`).join('')}
+    `<option value="${esc(p)}" ${u.proto === p ? 'selected' : ''}>${p}</option>`).join('')}
         </select></label>
         <label>动作<input id="ul-action" value="${esc(u.action)}"
           placeholder="DROP / ACCEPT / NEW…" ${isFlow ? 'disabled' : ''}></label>
         <label style="flex:2 1 260px">关键字
           <input id="ul-q" value="${esc(u.q)}" placeholder="IP、端口、中文描述…"></label>
         <label style="flex:0 0 120px">条数
-          <input id="ul-limit" type="number" min="20" max="3000" value="${u.limit}"></label>
+          <input id="ul-limit" type="number" min="20" max="3000" value="${esc(u.limit)}"></label>
         <button class="primary small fixed" id="ul-go">查询</button>
         <button class="ghost small fixed" id="ul-reset">重置</button>
       </div>
@@ -10957,9 +11010,9 @@ function renderFlowLog() {
         <label class="switch" style="margin:0"><input type="checkbox" id="ul-archive"
           ${u.conf.archive ? 'checked' : ''}><i></i>归档到磁盘</label>
         <label>保留天数<input id="ul-keep-days" type="number" min="1" max="365"
-          value="${u.conf.keep_days || 7}" style="width:100px"></label>
+          value="${esc(u.conf.keep_days != null ? u.conf.keep_days : 7)}" style="width:100px"></label>
         <label>最大条数<input id="ul-keep-rows" type="number" min="1000"
-          value="${u.conf.keep_rows || 200000}" style="width:130px"></label>
+          value="${esc(u.conf.keep_rows != null ? u.conf.keep_rows : 200000)}" style="width:130px"></label>
         <label>归档最低级别<select id="ul-minlevel">
           ${(u.levels || []).map(l => `<option value="${esc(l.v)}"
             ${u.conf.min_level === l.v ? 'selected' : ''}>${esc(l.n)}</option>`).join('')}
@@ -11191,12 +11244,14 @@ $('#ab-save').onclick = async () => {
   const mod = currentModule();
   if (S.page === 'acl') {
     const r = await saveAcl(false);
+    if (r.ok) pageClean('acl');
     toast(r.msg_cn, r.ok ? 'ok' : 'err', 7000);
     setActionMsg(r.msg_cn, r.ok ? 'ok' : 'err');
     return;
   }
   if (S.page === 'nfs') {
     const r = await saveShare(false);
+    if (r.ok) pageClean('nfs');
     toast(r.msg_cn, r.ok ? 'ok' : 'err', 7000);
     setActionMsg(r.msg_cn, r.ok ? 'ok' : 'err');
     return;
@@ -11220,6 +11275,7 @@ $('#ab-apply').onclick = async () => {
     const doAcl = async (live) => {
       setActionMsg('正在校验并应用访问控制规则…');
       const r = await saveAcl(live);
+      if (r.ok) pageClean('acl');
       toast(r.msg_cn, r.ok ? 'ok' : 'err', 9000);
       setActionMsg(r.msg_cn, r.ok ? 'ok' : 'err');
       const r2 = await api('/api/acl');
@@ -11241,6 +11297,7 @@ $('#ab-apply').onclick = async () => {
     const doSh = async (live) => {
       setActionMsg('正在校验并应用共享配置…');
       const r = await saveShare(live);
+      if (r.ok) pageClean('nfs');
       toast(r.msg_cn, r.ok ? 'ok' : 'err', 9000);
       setActionMsg(r.msg_cn, r.ok ? 'ok' : 'err');
       const r2 = await api('/api/share');

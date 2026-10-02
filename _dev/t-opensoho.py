@@ -196,7 +196,7 @@ NS = build([
     'OH_ADMIN_EMAIL', 'OH_API_LATEST', 'OH_PORT_MIN', 'OH_PORT_MAX',
     'OH_BIND_CHOICES', 'OH_UNIT', 'OH_SERVICE', 'OH_USER',
     'OH_DIR', 'OH_BIN', 'OH_DATA', 'OH_CONF', 'OH_ENV', 'OH_ADMIN',
-    '_oh_rand', '_oh_norm', '_oh_load', '_oh_save',
+    '_oh_rand', '_oh_norm', '_oh_load', '_oh_save', '_atomic_write',
     '_oh_read_env', '_oh_write_env', '_oh_ensure_env', '_oh_env',
     '_oh_admin_load', '_oh_admin_save',
     '_oh_installed', '_oh_service', '_oh_version', '_oh_arch',

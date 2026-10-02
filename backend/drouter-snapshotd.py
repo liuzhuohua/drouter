@@ -76,11 +76,36 @@ def load_conf():
     return conf
 
 
+def _disk_ok(path):
+    """拍快照前的磁盘底线检查。
+
+    顺序原来是「先创建、后清理」：只要清理那一步失败（权限、快照损坏、
+    参数问题），下一轮照样再拍一张，快照目录就这么一轮一轮涨到占满磁盘 ——
+    而磁盘满了之后，连「清理」本身都救不回来。
+    """
+    try:
+        st = os.statvfs(path if os.path.isdir(path) else '/')
+        free_gb = st.f_bavail * st.f_frsize / (1024.0 ** 3)
+        if free_gb < 1.0:
+            return False, '剩余空间 %.2f GB，不足 1 GB' % free_gb
+        return True, ''
+    except Exception as e:
+        return True, str(e)
+
+
 def main():
     conf = load_conf()
     if not conf.get('enabled', True):
         log('info', 'SNAPSHOT_SKIP', '自动快照已关闭，跳过本次执行')
         return 0
+
+    # 0) 先清理，再创建；并且盘快满时干脆不拍 —— 与其攒到磁盘耗尽，
+    #    不如这一轮少一张快照。
+    root = conf.get('path') or '/opt/drouter/snapshots'
+    ok, why = _disk_ok(root)
+    if not ok:
+        log('error', 'SNAPSHOT_DISK_LOW', '磁盘空间不足，跳过本次自动快照：%s' % why)
+        return 1
 
     # 1) 拍一张自动快照
     r = call('snapshot', {'tag': 'auto'})

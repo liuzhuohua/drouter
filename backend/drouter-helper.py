@@ -237,6 +237,33 @@ def sh(cmd, timeout=15, input_data=None, cwd=None, env=None):
         return 126, '', '权限不足：%s' % e
 
 
+# 单份结构化日志的大小阈值：超过就切成 .1（只保留一份旧档）。
+# 项目自己的日志以前完全不轮转，机器常年不重启，最后会安静地把根分区吃掉。
+LOG_MAX_BYTES = 32 * 1024 * 1024
+_log_rot_checked = {}
+
+
+def _rotate_if_big(path):
+    """超过 LOG_MAX_BYTES 就把当前日志挪成 .1。
+
+    每个日志文件最多检查一次/分钟，避免每条日志都 stat 一次。
+    """
+    try:
+        now = time.time()
+        last = _log_rot_checked.get(path, 0)
+        if now - last < 60:
+            return
+        _log_rot_checked[path] = now
+        if os.path.getsize(path) < LOG_MAX_BYTES:
+            return
+        old = path + '.1'
+        if os.path.exists(old):
+            os.unlink(old)
+        os.replace(path, old)
+    except Exception:
+        pass
+
+
 def log(level, module, code, msg_cn, detail=None):
     """结构化日志（JSONL），AI 可直接阅读"""
     try:
@@ -247,10 +274,11 @@ def log(level, module, code, msg_cn, detail=None):
             'msg_cn': msg_cn, 'detail': detail or '',
         }
         line = json.dumps(rec, ensure_ascii=False)
-        with open(os.path.join(LOGDIR, 'all.jsonl'), 'a', encoding='utf-8') as f:
-            f.write(line + '\n')
-        with open(os.path.join(LOGDIR, '%s.jsonl' % module), 'a', encoding='utf-8') as f:
-            f.write(line + '\n')
+        for fn in ('all.jsonl', '%s.jsonl' % module):
+            p = os.path.join(LOGDIR, fn)
+            _rotate_if_big(p)
+            with open(p, 'a', encoding='utf-8') as f:
+                f.write(line + '\n')
     except Exception:
         pass
 
@@ -1329,6 +1357,44 @@ def read_nft(_):
             t = item['table']
             tables.append({'family': t.get('family'), 'name': t.get('name')})
     return ok({'raw': out, 'tables': tables})
+
+
+def read_upnpmap(_):
+    """UPnP / NAT-PMP 当前映射表。只读接口：绝不顺手拉服务 ——
+    服务没起就如实回报，「查询」按钮不能产生「启动服务」这种副作用。"""
+    if not os.path.isfile('/usr/sbin/miniupnpd'):
+        return fail('miniupnpd 未安装，请先在「依赖自检」页安装', code='NOT_INSTALLED',
+                    data={'mappings': [], 'active': False})
+    _rc, out, _e = sh(['systemctl', 'is-active', 'miniupnpd'])
+    active = (out.strip() == 'active')
+    rows = []
+    # miniupnpd 租约文件逐行记录每条映射：
+    # 协议:外部端口:内网地址:内网端口:到期时间戳:描述
+    for path in ('/var/run/miniupnpd.leases', '/run/miniupnpd/miniupnpd.leases',
+                 '/run/miniupnpd.leases'):
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding='utf-8', errors='replace') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    p = line.split(':')
+                    if len(p) < 5:
+                        continue
+                    rows.append({
+                        'proto': p[0], 'ext_port': p[1], 'int_ip': p[2],
+                        'int_port': p[3],
+                        'expires': int(p[4]) if p[4].isdigit() else 0,
+                        'desc': ':'.join(p[5:]) if len(p) > 5 else '',
+                    })
+        except Exception:
+            pass
+        break
+    note = ('' if active else
+            'miniupnpd 未在运行：没有映射属正常。到 UPnP 页「保存并应用」启动服务后再看。')
+    return ok({'mappings': rows, 'active': active, 'note': note}, 'UPnP 映射表已读取')
 
 
 def read_leases(_):
@@ -2844,6 +2910,14 @@ def act_pubip(p):
         if not ip:
             return fail('拿不到出口 IPv4 地址，无法做入向实测')
         iface = info.get('egress') or ''
+        # 关键：每次开始都清掉上一次的命中记录。早先只覆盖写 .icmp、从不删 .hits，
+        # 于是「第一次命中」之后，「外网可以主动连入」这个结论会永久卡在通过状态 ——
+        # 用户据此配端口转发，实际根本不通。
+        for suffix in ('.hits', '.icmp', '.port'):
+            try:
+                os.unlink(_PROBE_STATE + suffix)
+            except OSError:
+                pass
 
         token = uuid.uuid4().hex[:12]
         method = ''
@@ -3279,10 +3353,9 @@ def _acl_load():
 
 
 def _acl_save(d):
-    os.makedirs(os.path.dirname(ACL_JSON), exist_ok=True)
-    with open(ACL_JSON, 'w', encoding='utf-8') as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.chmod(ACL_JSON, 0o644)
+    # 原子写：付钱的是用户 —— 写到一半断电能把整份家长控制策略变成空文件
+    _atomic_write(ACL_JSON, json.dumps(d, ensure_ascii=False, indent=2) + '\n',
+                  mode=0o644)
 
 
 ACL_UNIT_TMPL = """[Unit]
@@ -3319,10 +3392,7 @@ def _acl_deploy(d=None, live=True):
     if d is None:
         d = _acl_load()
     text = _acl_render_nft(d)
-    os.makedirs(os.path.dirname(ACL_CONF), exist_ok=True)
-    with open(ACL_CONF, 'w', encoding='utf-8') as f:
-        f.write(text)
-    os.chmod(ACL_CONF, 0o644)
+    _atomic_write(ACL_CONF, text, mode=0o644)
 
     # 单元文件（幂等写入，内容变化才覆盖）
     try:
@@ -3816,10 +3886,8 @@ def _share_load():
 
 
 def _share_save(d):
-    os.makedirs(os.path.dirname(SHARE_JSON), exist_ok=True)
-    with open(SHARE_JSON, 'w', encoding='utf-8') as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.chmod(SHARE_JSON, 0o644)
+    _atomic_write(SHARE_JSON, json.dumps(d, ensure_ascii=False, indent=2) + '\n',
+                  mode=0o644)
 
 
 def _share_lan_ip():
@@ -4893,9 +4961,8 @@ def _dcfg_load():
 
 
 def _dcfg_save(cfg):
-    os.makedirs(os.path.dirname(DCFG_CONF), exist_ok=True)
-    with open(DCFG_CONF, 'w', encoding='utf-8') as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    _atomic_write(DCFG_CONF,
+                  json.dumps(cfg, ensure_ascii=False, indent=2) + '\n')
 
 
 def _dcfg_read_file():
@@ -5284,8 +5351,7 @@ def _dcfg_save_op(p):
     bak = _dcfg_backup()               # 备份与写盘在任何模式下都做（都不碰网络）
     try:
         os.makedirs(DCFG_DIR, exist_ok=True)
-        with open(DCFG_FILE, 'w', encoding='utf-8') as f:
-            f.write(text)
+        _atomic_write(DCFG_FILE, text)
     except Exception as e:
         return fail('写入 %s 失败：%s' % (DCFG_FILE, e), 'WRITE_FAIL')
     _dcfg_save(cfg)
@@ -5506,9 +5572,8 @@ def _print_load():
 
 
 def _print_save(cfg):
-    os.makedirs(os.path.dirname(PRINT_CONF), exist_ok=True)
-    with open(PRINT_CONF, 'w', encoding='utf-8') as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    _atomic_write(PRINT_CONF,
+                  json.dumps(cfg, ensure_ascii=False, indent=2) + '\n')
 
 
 def _print_backup():
@@ -6444,9 +6509,8 @@ def _oh_load():
 
 
 def _oh_save(cfg):
-    os.makedirs(os.path.dirname(OH_CONF), exist_ok=True)
-    with open(OH_CONF, 'w', encoding='utf-8') as f:
-        json.dump(_oh_norm(cfg), f, ensure_ascii=False, indent=2)
+    _atomic_write(OH_CONF,
+                  json.dumps(_oh_norm(cfg), ensure_ascii=False, indent=2) + '\n')
 
 
 def _oh_read_env():
@@ -6480,8 +6544,7 @@ def _oh_write_env(secret, enc):
         '# %s：settings 集合（含 Wi-Fi 密码）的静态加密密钥。丢了，已存配置就解不开。\n'
         '%s=%s\n%s=%s\n'
         % (OH_SECRET_ENV, OH_ENC_ENV, OH_SECRET_ENV, secret, OH_ENC_ENV, enc))
-    with open(OH_ENV, 'w', encoding='utf-8') as f:
-        f.write(body)
+    _atomic_write(OH_ENV, body, mode=0o600)
     try:
         os.chmod(OH_ENV, 0o600)
     except Exception:
@@ -8711,6 +8774,35 @@ def _backup_fstab():
         pass
 
 
+def _safe_mnt_seg(s):
+    """把磁盘卷标压成安全目录名。
+
+    卷标是在**别的机器**上写的，可以塞空格、`..`、换行这类东西，
+    它会变成默认挂载点的一部分，也会原样写进 /etc/fstab。
+    """
+    return re.sub(r'[^A-Za-z0-9._-]', '_', str(s or '')).strip('._-')[:32] or 'disk'
+
+
+def _mnt_target_error(t):
+    """挂载点合法性：限定在 /mnt、/media、/srv 之下且不含空格与特殊字符。
+
+    早先 target 完全不校验 —— `target=/etc` 会把 U 盘盖到 /etc 上，系统立刻不可用；
+    写进 fstab 时还能用换行注入一整行额外的挂载项。
+    """
+    if not t.startswith('/'):
+        return '挂载点必须是绝对路径'
+    if '..' in t.split('/'):
+        return '挂载点不能包含 ..'
+    bad = [ch for ch in t if ch.isspace() or ch in '\'"\\`$|;&<>()*?!#{}[]']
+    if bad:
+        return ('挂载点不能包含空格或特殊字符（收到 %s）：这些字符会被写进 '
+                '/etc/fstab，可造成额外的挂载项注入' % t)
+    if not (t.startswith('/mnt/') or t.startswith('/media/') or
+            t.startswith('/srv/')):
+        return '为安全起见，挂载点只能放在 /mnt、/media、/srv 之下（收到：%s）' % t
+    return ''
+
+
 def act_storage(p):
     """外置存储设备：get / mount / umount / format / fstab_add / fstab_del。"""
     p = p or {}
@@ -8754,8 +8846,11 @@ def act_storage(p):
             return fail('该设备上没有可识别的文件系统，请先格式化。', 'NOFS')
         # 一律用 .get 取值：不同版本 lsblk 的字段可能缺失，缺字段不该让整个
         # 接口抛 KeyError（那样前端只会看到一句「读取失败」，看不出原因）。
-        base = '/mnt/drouter-' + (dev.get('label') or dev.get('name') or name)
+        base = '/mnt/drouter-' + _safe_mnt_seg(dev.get('label') or dev.get('name') or name)
         target = str(p.get('target') or '').strip() or base
+        terr = _mnt_target_error(target)
+        if terr:
+            return fail('挂载点不合法：%s' % terr, 'BAD_TARGET')
         try:
             os.makedirs(target, exist_ok=True)
         except Exception as e:
@@ -8855,8 +8950,14 @@ def act_storage(p):
             return fail('该设备没有 UUID（可能尚未格式化），无法写入 /etc/fstab。', 'NOUUID')
         if not target:
             target = (dev.get('mountpoint') or
-                      ('/mnt/drouter-' + (dev.get('label') or name)))
+                      ('/mnt/drouter-' + _safe_mnt_seg(dev.get('label') or name)))
+        terr = _mnt_target_error(target)
+        if terr:
+            return fail('挂载点不合法：%s' % terr, 'BAD_TARGET')
         fstype = dev.get('fstype') or 'auto'
+        # fstab 每个字段都不能含空格/换行，否则等于往 /etc/fstab 里塞新挂载项
+        if any(ch.isspace() or ch in '\\"\'`$' for ch in (fstype or '')):
+            return fail('文件系统类型不合法：%s' % fstype, 'BAD_FS')
         txt = _read_fstab()
         if ('UUID=%s' % dev['uuid']) in txt:
             return fail('/etc/fstab 里已存在该设备的条目', 'DUP')
@@ -8962,13 +9063,16 @@ def act_acl(p):
                 h = str(host).strip()
                 if not h:
                     continue
-                okv4 = re.match(r'^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}'
-                                r'(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$', h)
-                okv6 = ':' in h
-                okcidr = h.count('/') == 1
-                if not (okv4 or okv6 or okcidr):
-                    return fail('设备组「%s」包含非法地址：%s' % (g.get('name'), h),
-                                'BAD_HOST')
+                # 旧写法：含 ':' 就算 IPv6、含一个 '/' 就算 CIDR —— 换行、'}'、'#'
+                # 全都放行了。而这些值会被拼进 nft 规则，`10.0.0.0/24 } counter accept #`
+                # 就能把后面的 drop 注释掉（家长控制被绕过），带换行还能注入整条语句。
+                # 现在严格交给 ipaddress 解析（单个 IP 也合法，等价于 /32）。
+                try:
+                    ipaddress.ip_network(h, strict=False)
+                except Exception:
+                    return fail('设备组「%s」包含非法地址：%s（请填 IP 或 CIDR，'
+                                '例如 10.0.0.5 或 10.0.0.0/24）'
+                                % (g.get('name'), h), 'BAD_HOST')
         for i, r in enumerate(d.get('rules') or []):
             if (r.get('action') or 'block') not in [a['v'] for a in ACL_ACTIONS]:
                 return fail('第 %d 条规则的动作不合法' % (i + 1), 'BAD_ACTION')
@@ -9989,11 +10093,24 @@ SNAPSHOT_SCOPE = [
 ]
 
 
+SNAP_ALLOWED_PREFIXES = ('/opt', '/srv', '/var/backups', '/mnt', '/media', '/home')
+
+
 def snap_root():
-    """快照根目录：界面自定义优先，其次环境变量，最后默认值。"""
+    """快照根目录：界面自定义优先，其次环境变量，最后默认值。
+
+    三个来源**一律**限制在同一份前缀白名单里 —— 早先只有界面那条路做了校验，
+    改库或带 env 直调 helper 就能让快照被写进任意绝对路径（顺带 makedirs）。
+    """
+    def _allowed(v):
+        return bool(v) and os.path.isabs(v) and v.startswith(SNAP_ALLOWED_PREFIXES)
+
     env = os.environ.get('DROUTER_SNAP_DIR', '').strip()
-    if env and os.path.isabs(env):
+    if env and _allowed(env):
         return env
+    elif env:
+        log('warn', 'snapshot', 'SNAP_DIR_REJECT',
+            '环境变量指定的快照目录不在允许范围内，已忽略：%s' % env)
     # 从 drouter.db 里读取界面设置的路径
     try:
         import sqlite3
@@ -10004,7 +10121,10 @@ def snap_root():
             if r and r[0]:
                 v = json.loads(r[0]).get('path')
                 if v and os.path.isabs(v):
-                    return v
+                    if v.startswith(SNAP_ALLOWED_PREFIXES):
+                        return v
+                    log('warn', 'snapshot', 'SNAP_DIR_REJECT',
+                        '数据库里记录的快照目录不在允许范围内，已回落默认值：%s' % v)
     except Exception:
         pass
     return SNAP_DEFAULT
@@ -10332,9 +10452,8 @@ def _load_auto():
 
 
 def _save_auto(cfg):
-    os.makedirs(os.path.dirname(SNAP_CONF), exist_ok=True)
-    with open(SNAP_CONF, 'w', encoding='utf-8') as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    _atomic_write(SNAP_CONF,
+                  json.dumps(cfg, ensure_ascii=False, indent=2) + '\n')
     # 让 systemd timer 按新间隔重新排程
     try:
         sh(['systemctl', 'daemon-reload'], timeout=20)
@@ -10558,9 +10677,9 @@ def _load_rescue():
 
 
 def _save_rescue(conf):
-    os.makedirs(os.path.dirname(RESCUE_CONF), exist_ok=True)
-    with open(RESCUE_CONF, 'w', encoding='utf-8') as f:
-        json.dump(conf, f, ensure_ascii=False, indent=2)
+    _atomic_write(RESCUE_CONF,
+                  json.dumps(conf, ensure_ascii=False, indent=2) + '\n',
+                  mode=0o640)
     # 从 0600 放宽到 0640 且属组 drouter：这个文件里只有端口、VIP、网卡名单，
     # 没有口令。原先 0600 属主 root，导致以 drouter 身份运行的快照读不到它，
     # 一个文件就让整个 /etc/drouter 目录进不了快照（已由 _copytree_soft 兜底，
@@ -10770,6 +10889,8 @@ Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Type=oneshot
 User=root
 ExecStart=/usr/bin/python3 /opt/drouter/backend/drouter-snapshotd.py
+# oneshot 打完包就退出，但 tar 大目录时也会有内存尖峰，给个上限兜底
+MemoryMax=300M
 
 [Install]
 WantedBy=multi-user.target
@@ -11201,6 +11322,46 @@ def _valid_username(n):
     return bool(re.match(r'^[a-z_][a-z0-9_-]{0,31}$', n or ''))
 
 
+def _pw_reject(pw):
+    """chpasswd 是按**行**处理的 —— 密码里带换行就能顺带改掉别的账号的口令。
+
+    典型利用：`op=passwd name=x password="123456\\nroot:Passw0rd"`
+    交给 chpasswd 的文本变成两行，root 口令被一起改写。helper 是 root 权限，
+    所以这里必须挡住换行与所有控制字符。
+    """
+    if any(ch in pw for ch in ('\n', '\r', '\x00')):
+        return '密码不能包含换行符'
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in pw):
+        return '密码不能包含控制字符'
+    return ''
+
+
+def _atomic_write(path, text, mode=0o644):
+    """原子写：先写同目录临时文件，再 os.replace 覆盖。
+
+    直接 `open(path,'w')` 会在断电 / 被 kill 的瞬间留下空文件或半截内容，
+    本项目其他地方（_share_apply_file、_ca_write 等）早就用这套写法了，
+    这里是把它统一成一个函数，给那些还没跟上的位置用。
+    """
+    d = os.path.dirname(path) or '.'
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    fd, tmp = tempfile.mkstemp(dir=d, prefix='.dw-', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise
+
+
 def act_user(p):
     op = str((p or {}).get('op') or '')
     name = str((p or {}).get('name') or '')
@@ -11216,6 +11377,9 @@ def act_user(p):
             return fail('创建用户失败：%s' % e)
         pw = str((p or {}).get('password') or '')
         if pw:
+            bad = _pw_reject(pw)
+            if bad:
+                return fail('用户已创建但设置密码失败：%s' % bad)
             rc2, _o2, e2 = sh(['chpasswd'], input_data='%s:%s\n' % (name, pw))
             if rc2 != 0:
                 return fail('用户已创建但设置密码失败：%s' % e2)
@@ -11226,8 +11390,15 @@ def act_user(p):
         return ok({}, '系统用户 %s 创建成功' % name)
 
     if op == 'del':
-        if name in ('root', 'ajeef'):
-            return fail('受保护的用户，禁止删除：%s' % name)
+        # 不只保护两个写死的名字：任何 UID < 1000 的都是系统账号，
+        # 删掉 drouter 自己的服务账号面板会当场起不来（只能上控制台救）。
+        try:
+            entry = pwd.getpwnam(name)
+        except KeyError:
+            return fail('用户不存在：%s' % name)
+        if entry.pw_uid < 1000:
+            return fail('受保护的系统账号，禁止删除：%s（UID %d）'
+                        % (name, entry.pw_uid))
         rc, _o, e = sh(['userdel', '-r', name])
         if rc != 0:
             return fail('删除用户失败：%s' % e)
@@ -11238,6 +11409,9 @@ def act_user(p):
         pw = str((p or {}).get('password') or '')
         if len(pw) < 6:
             return fail('密码长度至少 6 位')
+        bad = _pw_reject(pw)
+        if bad:
+            return fail(bad)
         rc, _o, e = sh(['chpasswd'], input_data='%s:%s\n' % (name, pw))
         if rc != 0:
             return fail('修改密码失败：%s' % e)
@@ -11472,12 +11646,30 @@ def act_pkg(p):
     if op == 'upgrade':
         names = (p or {}).get('packages') or []
         names = [re.sub(r'[^a-zA-Z0-9.+-]', '', str(n)) for n in names][:50]
+        names = [n for n in names if n]
+        # 早先不判空：`apt-get install --only-upgrade`（不带包名）会**成功返回 0**
+        # 并打印「0 upgraded」—— 于是界面弹「升级完成 + 已建快照」，其实一个包都没升。
+        if not names:
+            return fail('没有指定要升级的软件包', 'EMPTY')
         ts, _d = _snapshot('before-upgrade')
         cmd = ['apt-get', 'install', '-y', '--only-upgrade'] + names
         rc, out, err = sh(cmd, timeout=900)
-        log('warn', 'pkg', 'UPGRADE', '已执行升级：%s' % ','.join(names), {'snapshot': ts})
-        return ok({'out': out[-4000:], 'err': err[-2000:], 'snapshot': ts},
-                  '升级完成（快照 %s，如桌面异常可回滚）' % ts if rc == 0 else '升级失败：%s' % err[-500:])
+        # apt 输出为 0 不代表真升级了（比如包已是最新 / 名字不存在会被静默忽略）
+        low = (out or '').lower()
+        upgraded = 0
+        m = re.search(r'(\d+)\s+upgraded', low)
+        if m:
+            upgraded = int(m.group(1))
+        log('warn', 'pkg', 'UPGRADE', '已执行升级：%s' % ','.join(names),
+            {'snapshot': ts, 'upgraded': upgraded})
+        if rc != 0:
+            return fail('升级失败：%s' % err[-500:])
+        return ok({'out': out[-4000:], 'err': err[-2000:], 'snapshot': ts,
+                   'upgraded': upgraded},
+                  ('升级完成：%d 个包已更新（快照 %s，如桌面异常可回滚）'
+                   % (upgraded, ts)) if upgraded else
+                  ('apt 结束了但没有包被升级（可能已是最新，或包名不对）—— 未做任何改动。'
+                   '快照 %s 已留存。' % ts))
     if op in ('hold', 'unhold'):
         names = (p or {}).get('packages') or []
         names = [re.sub(r'[^a-zA-Z0-9.+-]', '', str(n)) for n in names][:50]
@@ -11507,9 +11699,24 @@ def act_web_port_set(p):
             67: 'DHCP(dnsmasq)', 68: 'DHCP 客户端', 5900: 'RealVNC'}
     if port in busy:
         return fail('端口 %d 已被 %s 占用，请换一个' % (port, busy[port]))
+    # 真实占用检测：端口一旦写进去而服务起不来，面板就再也打不开了，
+    # 只能上控制台改回 /etc/drouter/web-port —— 所以这里要真的查一遍监听表。
+    rc0, out0, _e0 = sh(['ss', '-lntH'], timeout=8)
+    for line in (out0 or '').splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        addr = parts[3]
+        pstr = addr.rsplit(':', 1)[-1] if ':' in addr else ''
+        try:
+            cur = int(pstr)
+        except Exception:
+            continue
+        if cur == port:
+            return fail('端口 %d 已经被系统上的服务占用（%s），请换一个'
+                        % (port, ' '.join(parts[:5])), 'BUSY')
     os.makedirs('/etc/drouter', exist_ok=True)
-    with open('/etc/drouter/web-port', 'w', encoding='utf-8') as f:
-        f.write('%d\n' % port)
+    _atomic_write('/etc/drouter/web-port', '%d\n' % port)
     # 重启 Web 服务（systemd 单元名 drouter-web）
     rc, out, err = sh(['systemctl', 'restart', 'drouter-web'], timeout=30)
     log('warn', 'web', 'WEB_PORT_SET', 'Web 管理端口已改为 %d' % port, {'rc': rc, 'err': err})
@@ -11584,6 +11791,31 @@ def act_lease_make_static(p):
     return ok({'mac': mac, 'ip': ip}, '已把 %s 转为静态绑定（%s）' % (ip, host or mac))
 
 
+def _dnsmasq_listen_ifaces():
+    """dnsmasq 当前真正监听的网卡列表（给 `dhcp_release` 用）。
+
+    dhcp_release 必须指定网卡，猜错会失败，所以先看 dnsmasq 的命令行参数，
+    拿不到再退回「确实存在的常见 LAN 口」。
+    """
+    out = []
+    try:
+        rc, o, _e = sh(['pgrep', '-a', 'dnsmasq'], timeout=6)
+        toks = (o or '').split()
+        for i, t in enumerate(toks):
+            if t.startswith('--interface='):
+                out.append(t.split('=', 1)[1])
+            elif t in ('-i', '--interface') and i + 1 < len(toks):
+                out.append(toks[i + 1])
+    except Exception:
+        pass
+    for cand in ('br0', 'lan0', 'ens18'):
+        if cand not in out and os.path.exists('/sys/class/net/' + cand):
+            out.append(cand)
+    seen = set()
+    return [x for x in out if re.match(r'^[a-zA-Z0-9_.:-]{1,15}$', x)
+            and not (x in seen or seen.add(x))]
+
+
 def act_lease_release(p):
     """释放并回收 IP 回地址池（删除 dnsmasq 租约记录 + 通知客户端）"""
     p = p or {}
@@ -11591,6 +11823,8 @@ def act_lease_release(p):
     mac = str(p.get('mac') or '').strip().lower()
     if not re.match(r'^\d+\.\d+\.\d+\.\d+$', ip):
         return fail('IP 地址格式不正确')
+    if not _valid_mac(mac):
+        return fail('回收租约需要正确的 MAC 地址（aa:bb:cc:dd:ee:ff）')
     lease_file = '/var/lib/misc/dnsmasq.leases'
     removed = 0
     if os.path.isfile(lease_file):
@@ -11611,11 +11845,30 @@ def act_lease_release(p):
                 os.replace(tmp, lease_file)
         except Exception as e:
             return fail('写入租约文件失败：%s' % e)
-    # 通知 dnsmasq 重新读取租约文件
-    sh(['sh', '-c', 'kill -HUP $(pidof dnsmasq) 2>/dev/null || true'], timeout=8)
-    log('info', 'dhcp', 'LEASE_RELEASE', '释放并回收 DHCP 租约 %s' % ip, {'mac': mac, 'removed': removed})
-    return ok({'ip': ip, 'removed': removed},
-              '已回收 %s 的地址（客户端下次续租时将被重新分配）' % ip)
+    # 真正的回收要靠 dnsmasq 提供的 dhcp_release：它会同时从**内存里的租约表**
+    # 删记录并向该客户端发 DHCPRELEASE/强制下线。早先只改文件 + kill -HUP，
+    # dnsmasq 会按自己的内存表把文件重写回来 —— 界面提示「已回收」其实是假的，
+    # 客户端一续租 IP 就回来了。
+    released = False
+    iface = ''
+    for cand in _dnsmasq_listen_ifaces():
+        # dhcp_release <interface> <address> <MAC> [client_id]
+        rc, _o, _e = sh(['dhcp_release', cand, ip, mac], timeout=10)
+        if rc == 0:
+            released, iface = True, cand
+            break
+    if not released:
+        # 没有 dhcp_release 就退回到「改文件 + HUP」，并把话说明白
+        sh(['sh', '-c', 'kill -HUP $(pidof dnsmasq) 2>/dev/null || true'], timeout=8)
+    log('info', 'dhcp', 'LEASE_RELEASE', '释放并回收 DHCP 租约 %s' % ip,
+        {'mac': mac, 'removed': removed, 'released': released, 'iface': iface})
+    if released:
+        return ok({'ip': ip, 'removed': removed, 'released': True},
+                  '已回收 %s：dnsmasq 已从租约表删除该地址（客户端需重新获取）' % ip)
+    return ok({'ip': ip, 'removed': removed, 'released': False},
+              '已从租约文件删除 %s 的记录，但本机没有 dhcp_release 工具 —— '
+              'dnsmasq 内存里的租约还在，客户端续租时可能拿回同一个地址。'
+              '要彻底回收请安装 dnsmasq-utils 或重启 dnsmasq。' % ip)
 
 
 # ------------------------------------------------------------------ 迁移 / 切换
@@ -11634,9 +11887,7 @@ def act_migrate_networkd(p):
                   '已生成迁移预览（未写入磁盘，未停 NetworkManager）')
     ts, _d = _snapshot('before-migrate-networkd')
     for path, content in files:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write(content)
+        _atomic_write(path, content)
     # 清除 /etc/network/interfaces 中可能冲突的段落（该文件当前只有 lo，跳过）
     sh(['systemctl', 'disable', 'NetworkManager'])
     sh(['systemctl', 'enable', 'systemd-networkd'])
@@ -13714,6 +13965,35 @@ def _save_vlans(items):
     os.chmod(VLAN_CONF, 0o644)
 
 
+VLAN_CREATED_FILE = '/var/lib/drouter/vlan-created.json'
+
+
+def _vlan_created_load():
+    """本面板亲手创建的 VLAN 接口名集合。
+
+    维护它的唯一目的：**不要**去删不是自己创建的 VLAN。管理员可能用
+    `ip link add` 手建了跑业务的 VLAN，点一次「应用」把它删掉是不可接受的。
+    """
+    try:
+        if os.path.isfile(VLAN_CREATED_FILE):
+            with open(VLAN_CREATED_FILE, encoding='utf-8') as f:
+                v = json.load(f)
+            if isinstance(v, list):
+                return set(str(x) for x in v if re.match(r'^[a-zA-Z0-9_.-]+\.\d+$', str(x)))
+    except Exception:
+        pass
+    return set()
+
+
+def _vlan_created_save(names):
+    try:
+        os.makedirs(os.path.dirname(VLAN_CREATED_FILE), exist_ok=True)
+        lst = sorted(set(str(x) for x in names))[:200]
+        _atomic_write(VLAN_CREATED_FILE, json.dumps(lst, ensure_ascii=False), mode=0o644)
+    except Exception:
+        pass
+
+
 def _vlan_exists(name):
     rc, _o, _e = sh(['ip', 'link', 'show', name], timeout=6)
     return rc == 0
@@ -13798,7 +14078,8 @@ def act_vlan(p):
             m = re.match(r'^\d+:\s+([^:@]+)', line)
             if m:
                 existing.add(m.group(1).strip())
-        applied, removed = [], []
+        applied, removed, skipped = [], [], []
+        created = _vlan_created_load()
         want = set()
         for it in items:
             nm = '%s.%s' % (it['parent'], it['vid'])
@@ -13809,6 +14090,8 @@ def act_vlan(p):
                 if rc != 0:
                     log('error', 'system', 'VLAN_ADD_FAIL', '创建 %s 失败：%s' % (nm, e))
                     continue
+                created.add(nm)          # 记下「这是我们建的」，以后才有权回收
+                _vlan_created_save(created)
             if it.get('up', True):
                 sh(['ip', 'link', 'set', nm, 'up'], timeout=8)
             if it.get('mode') == 'static' and it.get('address'):
@@ -13817,26 +14100,39 @@ def act_vlan(p):
                 # 交给 dhcpcd 管理（不在此处直接跑 dhclient，避免与现有网络管理器冲突）
                 pass
             applied.append(nm)
-        # 删除不再需要的
+        # 删除不再需要的 —— **只**删本面板亲手创建的。
+        # 早先这里是「凡是 x.y 形式且不在当前清单里就删」：管理员手工 `ip link add`
+        # 建的（比如跑着 IPTV 业务的 ens19.100）会在点「应用」时被一声不响删掉。
+        created = _vlan_created_load()
         for line in (o or '').splitlines():
             m = re.match(r'^\d+:\s+([^:@]+)', line)
             if not m:
                 continue
             nm = m.group(1).strip()
             if re.match(r'^[a-zA-Z0-9_.-]+\.\d+(@[a-zA-Z0-9_.-]+)?$', nm) and nm.split('@')[0] not in want:
-                # 只回收本系统管理的（存在于配置文件历史中的）
+                if nm.split('@')[0] not in created:
+                    skipped.append(nm)
+                    continue
                 sh(['ip', 'link', 'del', nm], timeout=8)
                 removed.append(nm)
         log('warn', 'system', 'VLAN_APPLIED',
-            '已应用 VLAN：新增/更新 %d，回收 %d' % (len(applied), len(removed)))
-        return ok({'applied': applied, 'removed': removed},
-                  '已应用 VLAN 配置（生效 %d 个）' % len(applied))
+            '已应用 VLAN：新增/更新 %d，回收 %d，跳过非面板创建 %d'
+            % (len(applied), len(removed), len(skipped)))
+        msg = '已应用 VLAN 配置（生效 %d 个）' % len(applied)
+        if skipped:
+            msg += ('；另有 %d 个 VLAN 不是本面板创建的，已跳过（%s）'
+                    % (len(skipped), '、'.join(skipped[:5])))
+        return ok({'applied': applied, 'removed': removed, 'skipped': skipped}, msg)
 
     if op == 'delete':
         nm = str(p.get('iface') or p.get('id') or '').strip()
         if not re.match(r'^[a-zA-Z0-9_.-]+\.\d+$', nm):
             return fail('接口名不合法：%s（应形如 ens19.85）' % nm)
         sh(['ip', 'link', 'del', nm], timeout=10)
+        created = _vlan_created_load()
+        if nm in created:
+            created.discard(nm)
+            _vlan_created_save(created)
         items = [x for x in _load_vlans() if '%s.%s' % (x['parent'], x['vid']) != nm]
         _save_vlans(items)
         log('warn', 'system', 'VLAN_DEL', '已删除 VLAN 接口 %s' % nm)
@@ -13921,6 +14217,15 @@ def act_wol(p):
         mac = mac.lower()
         target = str(p.get('broadcast') or '').strip()
         iface = str(p.get('iface') or '').strip()
+        # 网卡名既会拼进 sh -c，又会被当成 etherwake 的参数，必须严格白名单。
+        # 同一个函数的 op='iface' 分支早就有这个校验，wake 分支漏了。
+        if iface and not re.match(r'^[a-zA-Z0-9_.-]{1,15}$', iface):
+            return fail('网卡名不合法：%s' % iface)
+        if target:
+            try:
+                ipaddress.IPv4Address(target)
+            except Exception:
+                return fail('广播地址不合法：%s' % target)
         sent = []
 
         def _mcast(m):
@@ -13937,12 +14242,16 @@ def act_wol(p):
         if target:
             bcasts.append(target)
         if iface:
-            rc3, o3, _e3 = sh(['sh', '-c',
-                               "ip -4 -o addr show dev %s | awk '{print $4}'" % iface], timeout=6)
+            # 早先这里是 sh -c "ip ... | awk '{print $4}'"，网卡名直接进 shell。
+            # 改成列表调用再自己取地址，顺手少 fork 一个 sh 和一个 awk。
+            rc3, o3, _e3 = sh(['ip', '-4', '-o', 'addr', 'show', 'dev', iface],
+                              timeout=6)
             for line in (o3 or '').splitlines():
+                m = re.search(r'\binet\s+(\S+)', line)
+                if not m:
+                    continue
                 try:
-                    import ipaddress
-                    net = ipaddress.IPv4Interface(line.strip())
+                    net = ipaddress.IPv4Interface(m.group(1))
                     bcasts.append(str(net.network.broadcast_address))
                 except Exception:
                     pass
@@ -14008,6 +14317,8 @@ DEPS = [
     ('python3', 'Python 3 运行时', 'cmd', 'python3', True, '后端与管理服务的运行基础', 'python3', 'core'),
     ('nftables', 'nftables 防火墙', 'cmd', 'nft', True, 'IPv4/IPv6 防火墙与软加速', 'nftables', 'fw'),
     ('dnsmasq', 'dnsmasq（DHCP/DNS）', 'cmd', 'dnsmasq', True, '局域网 DHCP 与 DNS 服务', 'dnsmasq', 'core'),
+    ('dnsmasq-utils', 'dnsmasq-utils（DHCP 工具）', 'cmd', 'dhcp_release', False,
+     '主动回收 DHCP 租约（未安装时自动退化为删租约文件 + 重载）', 'dnsmasq-utils', 'core'),
     ('radvd', 'radvd（IPv6 RA）', 'cmd', 'radvd', True, 'IPv6 路由通告', 'radvd', 'core'),
     ('dhcpcd', 'dhcpcd（DHCPv6 客户端）', 'cmd', 'dhcpcd', True, 'IPv6 前缀委派与地址获取', 'dhcpcd-base', 'core'),
     ('pppd', 'pppd（PPPoE 拨号）', 'cmd', 'pppd', True, '宽带 PPPoE 拨号', 'ppp', 'core'),
@@ -14364,10 +14675,38 @@ FS_ROOTS = ['/root', '/home', '/etc/drouter', '/var/log/drouter',
             '/opt/drouter', '/tmp', '/var/tmp', '/srv', '/mnt', '/media',
             '/usr/local/share/drouter']
 # 明确禁止的敏感路径（即使落在白名单内也拒绝）
-FS_DENY = ['/etc/shadow', '/etc/gshadow', '/etc/sudoers', '/root/.ssh/id_rsa',
-           '/etc/drouter/keys', '/proc', '/sys', '/dev']
+# ⚠️ 这里一律写**目录**（而不是单个文件）：过去只挡了 /root/.ssh/id_rsa，
+#    于是 /root/.ssh/authorized_keys 是可以写的 —— 写进去等于直接拿到 root SSH。
+FS_DENY = ['/etc/shadow', '/etc/gshadow', '/etc/sudoers', '/proc', '/sys', '/dev',
+           # SSH 密钥与授信名单整目录禁止
+           '/root/.ssh', '/etc/ssh',
+           # helper 以 root 运行，能写它自己的源码就等于任意代码执行
+           '/opt/drouter/backend', '/opt/drouter/web', '/opt/drouter/scripts',
+           '/usr/local/bin', '/usr/local/sbin', '/etc/systemd', '/etc/sudoers.d',
+           '/etc/cron.d', '/etc/cron.daily', '/etc/pam.d',
+           '/etc/drouter/keys']
+# 文件名黑名单（防跃迁最后的阀门）：命中即拒绝，不看目录
+FS_DENY_NAME = ['authorized_keys', 'authorized_keys2', 'id_rsa', 'id_dsa',
+                'id_ecdsa', 'id_ed25519', 'shadow', 'gshadow', 'sudoers',
+                '.htpasswd', 'BUILD_MODE']
 FS_TRASH = '/var/lib/drouter/trash'
 FS_PREVIEW_MAX = 1024 * 1024        # 文本预览上限 1 MB
+
+
+def _fs_name_guard(path):
+    """文件名黑名单：任何一级目录里出现这些名字都直接拒绝（不看白名单）。
+
+    只靠目录黑名单是不够的 —— 用户可以在 `/mnt/x/authorized_keys` 写好，
+    再想办法把它挪进 `/root/.ssh`。所以名字本身也要挡。
+    另外顺手挡住任何用户家目录下的 .ssh 条目。
+    """
+    parts = [x for x in str(path).split('/') if x not in ('', '.')]
+    for seg in parts:
+        if seg in FS_DENY_NAME:
+            return '该文件名受保护，禁止读写：%s' % seg
+        if seg == '.ssh':
+            return '禁止通过文件管理器操作 SSH 密钥目录'
+    return ''
 
 
 def _fs_resolve(path):
@@ -14381,6 +14720,9 @@ def _fs_resolve(path):
         raw = '/' + raw
     # 规范化（不解析软链，稍后 realpath 再判）
     norm = os.path.normpath(raw)
+    bad_name = _fs_name_guard(norm)
+    if bad_name:
+        return None, bad_name
     for d in FS_DENY:
         if norm == d or norm.startswith(d + '/'):
             return None, '该路径受保护，禁止访问'
@@ -14612,8 +14954,13 @@ def act_fs(p):
             return fail('文件不存在或无法访问')
         b64 = bool(p.get('b64'))
         if b64:
-            if size > 512 * 1024 * 1024:
-                return fail('文件超过 512MB，请通过 SFTP/SCP 传输')
+            # 下载通道是 helpd 的单条 JSON 响应（web 侧 32MB 封顶）：
+            # 20MB 原始文件 base64 后约 27MB，留足余量。早先写 512MB ——
+            # 经守护必被 32MB 截断、JSON 解析失败；回退到子进程又把
+            # ~700MB 输出整个 capture 进内存，4GB 小机直接被打爆。
+            if size > 20 * 1024 * 1024:
+                return fail('文件超过 20MB：Web 下载通道单条响应上限 32MB，'
+                            '请用 SFTP/SCP 传输，或先在文件管理里打包分卷')
             try:
                 with open(real, 'rb') as f:
                     raw = f.read()
@@ -15379,10 +15726,24 @@ def _clean_load():
 
 
 def _clean_save(cfg):
-    os.makedirs(os.path.dirname(CLEAN_CONF), exist_ok=True)
-    with open(CLEAN_CONF, 'w', encoding='utf-8') as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-    return True
+    _atomic_write(CLEAN_CONF,
+                  json.dumps(cfg, ensure_ascii=False, indent=2) + '\n')
+    _clean_status_cache_invalidate()
+
+
+# 状态页扫描缓存：_clean_status 要对每个清理项 os.walk 一遍目录树
+# （/var/log、回收站、打包目录…），机械盘上能到秒级。页面每进一次就全扫
+# 一遍没有必要 —— 30 秒内复用上次结果；配置保存 / 执行清理后立即失效。
+_clean_status_cache = {'ts': 0.0, 'items': None, 'reclaim': 0}
+_clean_status_lock = threading.Lock()
+_CLEAN_STATUS_TTL = 30.0
+
+
+def _clean_status_cache_invalidate():
+    with _clean_status_lock:
+        _clean_status_cache['ts'] = 0.0
+        _clean_status_cache['items'] = None
+        _clean_status_cache['reclaim'] = 0
 
 
 def _clean_state_load():
@@ -15593,23 +15954,34 @@ def _clean_run_item(item, days, dry, budget):
 
 def _clean_status():
     cfg = _clean_load()
-    items = []
-    reclaim = 0
-    for it in CLEAN_ITEMS:
-        ic = (cfg.get('items') or {}).get(it['key']) or {}
-        days = int(ic.get('days', it['days']))
-        on = bool(ic.get('on', it['on']))
-        st = _clean_item_stat(it, days)
-        if on:
-            reclaim += st['reclaimable']
-        items.append({
-            'key': it['key'], 'name': it['name'], 'kind': it['kind'],
-            'on': on, 'days': days, 'whole': st['whole'],
-            'why': it['why'], 'risk': it['risk'],
-            'files': st['files'], 'total': st['total'], 'active': st['active'],
-            'reclaimable': st['reclaimable'], 'hit_count': st['hit_count'],
-            'samples': st['samples'],
-        })
+    now_m = time.monotonic()
+    with _clean_status_lock:
+        hit = (_clean_status_cache['items'] is not None
+               and (now_m - _clean_status_cache['ts']) < _CLEAN_STATUS_TTL)
+        items = _clean_status_cache['items']
+        reclaim = _clean_status_cache['reclaim']
+    if not hit:
+        items = []
+        reclaim = 0
+        for it in CLEAN_ITEMS:
+            ic = (cfg.get('items') or {}).get(it['key']) or {}
+            days = int(ic.get('days', it['days']))
+            on = bool(ic.get('on', it['on']))
+            st = _clean_item_stat(it, days)
+            if on:
+                reclaim += st['reclaimable']
+            items.append({
+                'key': it['key'], 'name': it['name'], 'kind': it['kind'],
+                'on': on, 'days': days, 'whole': st['whole'],
+                'why': it['why'], 'risk': it['risk'],
+                'files': st['files'], 'total': st['total'], 'active': st['active'],
+                'reclaimable': st['reclaimable'], 'hit_count': st['hit_count'],
+                'samples': st['samples'],
+            })
+        with _clean_status_lock:
+            _clean_status_cache['ts'] = now_m
+            _clean_status_cache['items'] = items
+            _clean_status_cache['reclaim'] = reclaim
     total, used, free = _disk_usage('/')
     pct = round(used * 100.0 / total, 1) if total else 0.0
     rc, act, _e = sh(['systemctl', 'is-active', CLEAN_TIMER], timeout=8)
@@ -15733,6 +16105,8 @@ def _clean_do(p, dry=False, auto=False):
     lim = int(cfg.get('max_mb_per_run') or 0)
     budget = lim * 1048576 if lim > 0 else None
     freed = 0
+    if not dry:
+        _clean_status_cache_invalidate()   # 删完文件后状态页必须重扫
     detail = []
     for it in CLEAN_ITEMS:
         ic = (cfg.get('items') or {}).get(it['key']) or {}
@@ -16855,6 +17229,7 @@ ACTIONS = {
     'read:services': read_services,
     'read:nft': read_nft,
     'read:leases': read_leases,
+    'read:upnpmap': read_upnpmap,
     'read:ipv6': read_ipv6,
     'read:iface_method': read_iface_method,
     'read:ppp_log': read_ppp_log,

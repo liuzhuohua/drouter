@@ -15,7 +15,7 @@
 #       把标签从 buildah 的 localhost/... 改成 docker 惯用的名字。
 set -e
 
-VER="${1:-1.0.4}"
+VER="${1:-1.0.5}"
 SRC="${2:-/tmp/drouter-build}"
 cd "$SRC" || exit 1
 

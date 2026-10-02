@@ -249,6 +249,24 @@ def get_cfg(key, default=None):
         return default
 
 
+def get_cfg_many(keys, default=None):
+    """一次连接取回多个配置键 —— /api/config 一次要拉十几个模块，
+    逐个 get_cfg 就是十几次「开库 + PRAGMA + 关库」，低功耗机上能省几十毫秒。"""
+    keys = list(keys or [])
+    out = {k: (default if default is not None else {}) for k in keys}
+    if not keys:
+        return out
+    q = 'SELECT key,value FROM settings WHERE key IN (%s)' % ','.join('?' * len(keys))
+    with _lock, db() as c:
+        rows = c.execute(q, keys).fetchall()
+    for r in rows:
+        try:
+            out[r['key']] = json.loads(r['value'])
+        except Exception:
+            pass
+    return out
+
+
 def set_cfg(key, value):
     with _lock, db() as c:
         c.execute('INSERT INTO settings(key,value) VALUES(?,?) '
@@ -271,10 +289,26 @@ def hash_pw(pw, salt):
                                180000).hex()
 
 
+# 审计表保留上限。/api/login 是**不需要鉴权**的，公网暴露时随便刷就一直 INSERT，
+# 而读取端只有 LIMIT 300 —— 数据库和 WAL 会安静地长到把磁盘占满。
+AUDIT_MAX_ROWS = 20000
+_audit_since_prune = [0]
+
+
 def audit(user, action, detail, ok=True, ip=''):
     with _lock, db() as c:
         c.execute('INSERT INTO audits(ts,user,action,detail,ok,ip) VALUES(?,?,?,?,?,?)',
                   (now(), user, action, str(detail)[:2000], 1 if ok else 0, ip))
+        _audit_since_prune[0] += 1
+        # 每 500 条才整理一次：不要给每次登录都加一次 DELETE + 可能的 VACUUM
+        if _audit_since_prune[0] >= 500:
+            _audit_since_prune[0] = 0
+            try:
+                c.execute('DELETE FROM audits WHERE id NOT IN '
+                          '(SELECT id FROM audits ORDER BY id DESC LIMIT ?)',
+                          (AUDIT_MAX_ROWS,))
+            except Exception:
+                pass
 
 
 def read_audits(limit=300):
@@ -297,6 +331,17 @@ def read_audits(limit=300):
 HELPD_SOCK = '/run/drouter/helper.sock'
 # JSON 响应达到多大才值得压缩。太小的话压缩省下的字节还不如 CPU 开销。
 GZIP_MIN = 4096
+# 单次请求体上限。早年完全信任 Content-Length：`rfile.read(n)` 会按声明的
+# 长度一次性分配（还可能永久等待），一个未认证的连接就能把 4GB 小机器拖死。
+MAX_BODY = 16 * 1024 * 1024
+# 同时处理请求的工作线程上限。ThreadingHTTPServer 是「来一个连接开一个线程」，
+# 慢连接/慢客户端（slowloris）能把线程和 fd 一起吃完。
+# 并发上限：ThreadingHTTPServer 是「来一个连接开一个线程」，
+# 慢连接/慢客户端（slowloris）能把线程和 fd 一起吃完。
+MAX_WORKERS = 48
+_WORKER_SEM = threading.BoundedSemaphore(MAX_WORKERS)
+# 会话表上限：GC 线程万一挂了，也不能让 token 无限堆积。
+MAX_SESSIONS_WEB = 500
 
 # ---- 静态资源压缩缓存（#7）----
 # app.js 有 437KB，压缩后约 90KB。但每次请求都重压一遍纯属浪费 CPU，
@@ -305,6 +350,10 @@ GZIP_MIN = 4096
 _gz_lock = threading.Lock()
 _gz_cache = {}
 _GZ_MAX = 16          # 资源种类就那么几个，缓存上限给足余量即可
+# 但**只限条目数是不够的**：16 个大响应就能占掉上百 MB 常驻内存。
+# 4GB 机器上按字节再设一道闸（超过就整表清空，重建成本很低）。
+_GZ_MAX_BYTES = 24 * 1024 * 1024
+_gz_bytes = [0]
 
 
 def _want_gzip(headers):
@@ -334,9 +383,11 @@ def _gzip_cached(path, data):
     if len(z) >= len(data):
         return data, None
     with _gz_lock:
-        if len(_gz_cache) >= _GZ_MAX:
+        if len(_gz_cache) >= _GZ_MAX or _gz_bytes[0] + len(z) > _GZ_MAX_BYTES:
             _gz_cache.clear()
+            _gz_bytes[0] = 0
         _gz_cache[key] = z
+        _gz_bytes[0] += len(z)
     return z, 'gzip'
 _helpd_lock = threading.Lock()
 _helpd_down_until = [0.0]      # 在这个时间戳之前，不再尝试连 socket
@@ -367,15 +418,19 @@ def _helpd_call(action, payload, timeout):
         req = (json.dumps({'action': action, 'payload': payload or {}},
                           ensure_ascii=False) + '\n').encode('utf-8')
         s.sendall(req)
-        buf = b''
-        while not buf.endswith(b'\n'):
+        # 用 list 收集而不是 buf += chunk：后者每收一块都要整块复制一遍，
+        # 32MB 的响应会退化成 O(n^2) 并留下多份临时内存。
+        parts = []
+        total = 0
+        while True:
             chunk = s.recv(65536)
             if not chunk:
                 break
-            buf += chunk
-            if len(buf) > 32 * 1024 * 1024:
+            parts.append(chunk)
+            total += len(chunk)
+            if total > 32 * 1024 * 1024 or parts[-1].endswith(b'\n'):
                 break
-        line = buf.decode('utf-8', 'replace').strip()
+        line = b''.join(parts).decode('utf-8', 'replace').strip()
         if not line:
             return None
         return json.loads(line)
@@ -479,18 +534,46 @@ def ensure_cert():
 SESSIONS = {}
 
 
+def _session_expiry_s():
+    return SESSION_MINUTES * 60
+
+
 def new_session(user, ip):
     tok = secrets.token_urlsafe(32)
-    SESSIONS[tok] = {'user': user, 'ip': ip, 'exp': time.time() + SESSION_MINUTES * 60,
+    _prune_sessions()
+    # exp 保留墙钟时间给界面展示，判过期一律用 exp_mono：
+    # NTP 校时/机器休眠会把 time.time() 来回拨，校时回拨时所有 token 会
+    # 「意外续命」，前跳时又会一次性全部失效。
+    SESSIONS[tok] = {'user': user, 'ip': ip,
+                     'exp': time.time() + _session_expiry_s(),
+                     'exp_mono': time.monotonic() + _session_expiry_s(),
                      'csrf': secrets.token_urlsafe(24)}
     return SESSIONS[tok]
+
+
+def _prune_sessions():
+    """兜底：会话表不能无限长（GC 线程万一被异常打死也要有上限）。"""
+    if len(SESSIONS) <= MAX_SESSIONS_WEB:
+        return
+    try:
+        now = time.monotonic()
+        for k in sorted(SESSIONS, key=lambda x: SESSIONS[x].get('exp_mono', 0))[
+                :len(SESSIONS) - MAX_SESSIONS_WEB]:
+            SESSIONS.pop(k, None)
+    except Exception:
+        pass
 
 
 def get_session(tok):
     s = SESSIONS.get(tok)
     if not s:
         return None
-    if s['exp'] < time.time():
+    # 兼容老条目（没有 exp_mono 的），用墙钟时间兜底
+    exp_mono = s.get('exp_mono')
+    if exp_mono is None:
+        exp_mono = s.get('exp', 0)
+        s['exp_mono'] = exp_mono
+    if exp_mono < time.monotonic():
         SESSIONS.pop(tok, None)
         return None
     return s
@@ -499,9 +582,17 @@ def get_session(tok):
 def gc_sessions():
     while True:
         time.sleep(300)
-        dead = [k for k, v in SESSIONS.items() if v['exp'] < time.time()]
-        for k in dead:
-            SESSIONS.pop(k, None)
+        try:
+            # 用 list() 固化：CPython 3 里若在遍历中有人登录/注销会抛
+            # 「dictionary changed size during iteration」，GC 线程一旦被打死，
+            # 过期 token 就再也没人清理了。
+            now = time.monotonic()
+            dead = [k for k, v in list(SESSIONS.items())
+                    if v.get('exp_mono', 0) < now]
+            for k in dead:
+                SESSIONS.pop(k, None)
+        except Exception:
+            pass
 
 
 LOGIN_FAILS = {}
@@ -540,6 +631,9 @@ class Api:
     def body(self):
         try:
             n = int(self.h.headers.get('Content-Length') or 0)
+            # 声明的长度必须可信：负数/超大一律拒绝（见 MAX_BODY 的注释）
+            if n < 0 or n > MAX_BODY:
+                return {}
             raw = self.h.rfile.read(n) if n else b'{}'
             return json.loads(raw.decode('utf-8') or '{}')
         except Exception:
@@ -586,6 +680,7 @@ class Api:
             '/api/sysinfo': 'read:sysinfo', '/api/ifaces': 'read:ifaces',
             '/api/routes': 'read:routes', '/api/services': 'read:services',
             '/api/nft': 'read:nft', '/api/leases': 'read:leases',
+            '/api/upnpmap': 'read:upnpmap',
             '/api/ipv6': 'read:ipv6', '/api/ntp': 'read:ntp',
             '/api/users': 'read:users', '/api/logs': 'read:logs',
             '/api/journal': 'read:journal',
@@ -906,7 +1001,7 @@ class Api:
             keys = ['dnsmasq', 'nft_v4', 'nft_v6', 'radvd', 'dhcpv6', 'upnp',
                     'ntp', 'system', 'pppoe', 'ddns', 'portfwd', 'acl', 'share',
                     'docker', 'ulog', 'theme']
-            out = {k: get_cfg(k, {}) for k in keys}
+            out = get_cfg_many(keys, {})
             return self.json({'ok': True, 'data': out})
         if p == '/api/config' and method == 'POST':
             return self.save_config()
@@ -1270,7 +1365,11 @@ class Api:
             cfg['lan_iface'] = cfg.get('lan_iface') or syscfg.get('lan_iface') or 'ens18'
         elif module == 'upnp':
             cfg['ext_iface'] = cfg.get('ext_iface') or syscfg.get('wan_iface') or 'ppp0'
-        elif module == 'ppp':
+        elif module in ('ppp', 'pppoe'):
+            # ⚠️ 这里必须同时认 'pppoe'：前端 PAGE_MODULES 里声明的模块名就是
+            # pppoe（`web/app.js` 的 `wan: { save:['pppoe'], apply:['pppoe'] }`），
+            # 而渲染器里的别名才叫 ppp。早先只写 'ppp'，这条回落永远不生效 ——
+            # 界面上「拨号网卡」看着是选中的，点保存却报「PPPoE 网卡不能为空」。
             # PPPoE 拨号网卡：优先用用户填写值，其次回落到已分配的 WAN 口；
             # 若都没有，且当前只有一个物理网卡，则直接用它（单口调试场景）
             cfg['iface'] = (cfg.get('iface') or '').strip() or syscfg.get('wan_iface') or ''
@@ -1612,10 +1711,14 @@ class Api:
                 SHELL_SESSIONS.pop(sid, None)
             return self.json(self.helper('webshell', {'op': 'disconnect', **b}, timeout=20))
         if sub == 'sessions':
+            # 关键：先在锁内把快照复制出来再返回。早先这里是
+            # `with _lock: return self.json(...)` —— 而 self.json 会阻塞在
+            # wfile.write 上，慢客户端（或半开连接）就能把全局 _lock 按住，
+            # 连带把数据库、配置、审计、终端全堵死，表现为「整个面板卡住」。
             with _lock:
-                return self.json({'ok': True, 'data': [
-                    {'sid': k, 'age': int(time.time() - v['created'])}
-                    for k, v in SHELL_SESSIONS.items()]})
+                rows = [{'sid': k, 'age': int(time.time() - v['created'])}
+                        for k, v in SHELL_SESSIONS.items()]
+            return self.json({'ok': True, 'data': rows})
         return self.json({'ok': False, 'code': 'NOTFOUND',
                           'msg_cn': '终端接口不存在：%s' % sub}, 404)
 
@@ -1836,7 +1939,7 @@ def build_openapi(base):
         'openapi': '3.0.3',
         'info': {
             'title': 'Drouter 通用管理 API',
-            'version': '1.0.4',
+            'version': '1.0.5',
             'description': ('Drouter（Debian 13 拼装主路由）的统一 REST 接口。'
                             '任意语言 / 框架（curl、Python、Node、Go、PHP、Java、.NET、'
                             'Shell、Postman、工单系统、IoT 网关）均可直接调用。'
@@ -2052,6 +2155,28 @@ class _Server(ThreadingHTTPServer):
     """
 
     daemon_threads = True
+    # 等待队列也别给太大：排队排到几百个再逐个超时，体验比直接拒绝更糟
+    request_queue_size = 64
+
+    def process_request(self, request, client_address):
+        """名额用完就立刻关掉这条连接，而不是无限开线程。"""
+        if not _WORKER_SEM.acquire(blocking=False):
+            try:
+                request.close()
+            except Exception:
+                pass
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            _WORKER_SEM.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            _WORKER_SEM.release()
 
     def handle_error(self, request, client_address):
         exc = sys.exc_info()[0]
@@ -2065,6 +2190,9 @@ class _Server(ThreadingHTTPServer):
 class Handler(BaseHTTPRequestHandler):
     server_version = 'drouter/1.0'
     protocol_version = 'HTTP/1.1'
+    # 连接级读写超时：一条连接挂在这里 30 秒没动静就断开。
+    # 不设的话，慢客户端能永久占住一个工作线程（MAX_WORKERS 个名额很快被吃满）。
+    timeout = 30
 
     def log_message(self, fmt, *args):
         pass  # 静默，避免刷日志
@@ -2220,6 +2348,13 @@ def login_with_token(self):
     with _lock, db() as c:
         row = c.execute('SELECT * FROM admins WHERE username=?', (u,)).fetchone()
     if not row or hash_pw(pw, row['salt']) != row['pw_hash']:
+        # 失败记录里那些「试过一次就再也没来」的来源地址要定期清掉：
+        # 公网暴露 + IPv6 大地址空间下，这个字典会长期无界增长。
+        if len(LOGIN_FAILS) > 2000:
+            now0 = time.time()
+            for k in [k for k, v in list(LOGIN_FAILS.items())
+                      if not v.get('until') or v['until'] < now0]:
+                LOGIN_FAILS.pop(k, None)
         rec = LOGIN_FAILS.setdefault(ip, {'n': 0, 'until': 0})
         rec['n'] += 1
         rec['until'] = time.time() + LOGIN_LOCK_MINUTES * 60 if rec['n'] >= MAX_LOGIN_FAILS else 0
@@ -2228,9 +2363,8 @@ def login_with_token(self):
         return self.json({'ok': False, 'code': 'BADCRED',
                           'msg_cn': '用户名或密码错误' + ('（还可尝试 %d 次）' % left if left > 0 else '')}, 401)
     LOGIN_FAILS.pop(ip, None)
-    tok = secrets.token_urlsafe(32)
-    SESSIONS[tok] = {'user': u, 'ip': ip, 'exp': time.time() + SESSION_MINUTES * 60,
-                     'csrf': secrets.token_urlsafe(24)}
+    sess = new_session(u, ip)
+    tok = next(k for k, v in SESSIONS.items() if v is sess)
     audit(u, '登录成功', ip, True, ip)
     return self.json({'ok': True, 'msg_cn': '登录成功',
                       'data': {'token': tok, 'user': u, 'expires_in': SESSION_MINUTES * 60}})

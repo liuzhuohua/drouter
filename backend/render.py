@@ -1106,7 +1106,20 @@ def render_dhcpcd(cfg):
         f'interface {wan}',
     ]
     if not enabled:
-        lines.insert(0, '# DHCPv6 客户端已在页面中关闭，以下为保留配置（未启用）')
+        # 早先只是往开头插一行注释，后面的 interface / ia_pd 照写不误 ——
+        # 「关闭 DHCPv6 客户端」这个开关等于关不掉：配置还在、服务照样重启、
+        # 仍然在向运营商请求前缀委派。现在真的不输出任何生效配置。
+        lines = [
+            '# 由 drouter 自动生成：DHCPv6 客户端 / 前缀委派 (PD)',
+            '# DHCPv6 客户端已在页面中关闭，因此**不会**输出任何生效配置。',
+            '# 下面是你填过的参数，仅作备份（全部注释掉）：',
+        ]
+        for k in ('iface', 'wan_iface', 'lan_iface', 'iaid', 'sla_id',
+                  'prefix_len', 'request_pd', 'request_address',
+                  'rapid_commit'):
+            if d.get(k) not in (None, '', False):
+                lines.append('# %s = %s' % (k, d.get(k)))
+        return '\n'.join(lines) + '\n'
     if v_bool(d.get('request_address')):
         lines.append('    ipv6rs')
     if v_bool(d.get('request_pd', True)):

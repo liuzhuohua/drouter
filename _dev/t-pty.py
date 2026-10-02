@@ -288,7 +288,9 @@ def main():
         def close(self):
             closed.append(self)
 
-    now = ns['time'].time()
+    # 会话最后一次活动存的是**单调秒**（NTP 校时/休眠不能影响闲置回收），
+    # 所以这里必须用 monotonic() 而不是 time() 造数据。
+    now = ns['time'].monotonic()
     live['old'] = _S(now - 999)      # 闲置超时 → 该被回收
     live['new'] = _S(now)            # 刚活动过 → 该留下
     n = ns['_reap_idle']()

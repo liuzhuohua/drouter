@@ -56,7 +56,15 @@ _ensure_sbin_path()
 SOCK_PATH = '/run/drouter/shell.sock'
 LOG_DIR = '/var/log/drouter'
 IDLE_TIMEOUT = 30 * 60        # 30 分钟无操作自动回收
-MAX_SESSIONS = 8              # 4GB 小机器上别开一堆 shell
+# 单个会话的输出缓冲上限。
+# 过去完全无上限：在终端里跑 `yes`、`journalctl -f`、或者任何持续打印的程序，
+# 然后浏览器不读（或标签卡住），读线程会一直往 bytearray 里堆 ——
+# 一个会话就能把 4 GB 内存吃干净，OOM 之后连面板一起挂。
+MAX_BUF = 8 * 1024 * 1024
+# 会话名额用信号量来**占**。过去的写法是「拿到锁看一眼没满 → 释放锁 → 慢慢创建
+# PTY 和子进程 → 再拿锁登记」，中间的窗口里并发请求会各自通过检查，
+# 结果实际会话数远超 MAX_SESSIONS（PTY、进程、fd 一起失控）。
+_SESS_SEM = threading.BoundedSemaphore(MAX_SESSIONS)
 READ_CHUNK = 65536
 # 单次 read 最多回传多少字节：多了前端渲染会卡，少了要跑很多轮
 MAX_READ = 262144
@@ -175,33 +183,80 @@ class Session(object):
         self.sid = sid
         self.user = user
         self.created = time.time()
-        self.last = time.time()
+        self._last_mono = time.monotonic()
         self.alive = True
         self.buf = bytearray()
         self.buf_lock = threading.Lock()
+        self.dropped = 0      # 因缓冲上限被丢弃的字节数（宁丢oldest也不 OOM）
+
+        # 先占名额再建会话：占不到就是真的满了
+        if not _SESS_SEM.acquire(blocking=False):
+            raise RuntimeError('终端会话已达上限（%d），请先断开不用的会话'
+                               % MAX_SESSIONS)
+        self._reserved = True
 
         self.master, slave = _open_pty()
-        _set_winsize(self.master, rows, cols)
+        try:
+            _set_winsize(self.master, rows, cols)
 
-        env = dict(os.environ)
-        env['TERM'] = 'xterm-256color'
-        env['COLUMNS'] = str(cols)
-        env['LINES'] = str(rows)
-        # 关掉 bash 的“多行命令用临时文件编辑”提示，避免 readline 在
-        # 非标准终端下把界面搞乱
-        env['BASH_SILENCE_DEPRECATION_WARNING'] = '1'
+            env = dict(os.environ)
+            env['TERM'] = 'xterm-256color'
+            env['COLUMNS'] = str(cols)
+            env['LINES'] = str(rows)
+            # 关掉 bash 的“多行命令用临时文件编辑”提示，避免 readline 在
+            # 非标准终端下把界面搞乱
+            env['BASH_SILENCE_DEPRECATION_WARNING'] = '1'
 
-        # start_new_session=True 让子进程成为会话首进程；
-        # 打开 slave 端时内核会把这个 pty 设为它的控制终端，
-        # 这样 Ctrl+C 才会真的向前台进程组发 SIGINT。
-        self.proc = subprocess.Popen(
-            [shell, '-i'], stdin=slave, stdout=slave, stderr=slave,
-            start_new_session=True, cwd=cwd or '/root', env=env,
-            preexec_fn=None, close_fds=True)
+            # start_new_session=True 让子进程成为会话首进程；
+            # 打开 slave 端时内核会把这个 pty 设为它的控制终端，
+            # 这样 Ctrl+C 才会真的向前台进程组发 SIGINT。
+            self.proc = subprocess.Popen(
+                [shell, '-i'], stdin=slave, stdout=slave, stderr=slave,
+                start_new_session=True, cwd=cwd or '/root', env=env,
+                preexec_fn=None, close_fds=True)
+        except BaseException:
+            # 关键：Popen 失败（cwd 不存在、进程数超限、内存不足……）时，
+            # master/slave **两个** fd 都得关。早先这里直接抛出去，
+            # 每次失败泄漏两个 PTY，反复重试会把 /dev/pts 配额耗尽，
+            # 症状是「后来连 ssh 都开不了终端」。
+            try:
+                os.close(slave)
+            except Exception:
+                pass
+            try:
+                os.close(self.master)
+            except Exception:
+                pass
+            self._reserved = False
+            _SESS_SEM.release()
+            raise
         os.close(slave)
 
         self.th = threading.Thread(target=self._reader, daemon=True)
         self.th.start()
+
+    @property
+    def last(self):
+        """最后一次活动的**单调**时刻（秒）。
+
+        用单调时钟是因为 NTP 校时 / 机器休眠会把系统时间来回拨：
+        回拨时所有会话看起来「刚刚用过」永远不回收，前跳时又会一次性全过期。
+        """
+        return self._last_mono
+
+    @last.setter
+    def last(self, _v):
+        # 老的调用点写的是 `s.last = time.time()`，这里统一换成单调时钟
+        self._last_mono = time.monotonic()
+
+    def _append(self, data):
+        """把 PTY 输出放进缓冲，超过 MAX_BUF 就丢最旧的那一截。"""
+        with self.buf_lock:
+            over = len(self.buf) + len(data) - MAX_BUF
+            if over > 0:
+                del self.buf[:over]
+                self.dropped += over
+            self.buf.extend(data)
 
     def _reader(self):
         """把 PTY 输出搬进缓冲区。子进程退出后 EIO 会跳出循环。"""
@@ -224,8 +279,7 @@ class Session(object):
                 break
             if not data:
                 break
-            with self.buf_lock:
-                self.buf.extend(data)
+            self._append(data)
         self.alive = False
 
     def drain(self, limit=MAX_READ):
@@ -282,6 +336,19 @@ class Session(object):
         except Exception:
             pass
         self.alive = False
+        # 读线程由 PTY 关闭触发退出（EIO）；join 一下是为了把 fd 复用窗口收窄，
+        # 顺手把会话名额还回去（否则被回收的会话会永久占着名额）。
+        try:
+            if getattr(self, 'th', None) is not None:
+                self.th.join(0.5)
+        except Exception:
+            pass
+        if getattr(self, '_reserved', False):
+            self._reserved = False
+            try:
+                _SESS_SEM.release()
+            except Exception:
+                pass
 
 
 def _utf8_tail(data):
@@ -324,7 +391,8 @@ def _reap_idle():
     close() 要等子进程退出（SIGHUP 后最多轮询 3 秒），持锁做会把
     所有并发请求堵死：表现为「9 个会话时新连接超时、老终端也卡住」。
     """
-    now = time.time()
+    # 闲置/僵尸会话的回收判据必须用单调时钟（理由见 Session.last 的注释）
+    now = time.monotonic()
     victims = []
     with _lock:
         for sid, s in list(_SESSIONS.items()):
@@ -375,6 +443,10 @@ def handle(req):
         sid = 'sh%d-%d' % (int(time.time()), next(_seq))
         try:
             s = Session(sid, user, shell, cols, rows, req.get('cwd') or '/root')
+        except RuntimeError as e:
+            # Session 构造里占不到名额会抛这个 —— 真正的并发上限在这里生效
+            log('warn', 'SHELL_BUSY', '终端会话已满：%s' % e, {'user': user})
+            return {'ok': False, 'code': 'BUSY', 'msg_cn': str(e)}
         except Exception as e:
             # 把日志也写一份 —— 用户看到界面报错时的同一个信息必须留在
             # 服务端日志里，否则事后排查只能靠猜。
@@ -456,8 +528,8 @@ def handle(req):
         with _lock:
             return {'ok': True, 'data': [
                 {'sid': k, 'age': int(time.time() - v.created),
-                 'idle': int(time.time() - v.last),
-                 'alive': v.alive}
+                 'idle': int(time.monotonic() - v.last),   # last 是单调秒
+                 'alive': v.alive, 'dropped': v.dropped}
                 for k, v in _SESSIONS.items()]}
 
     return {'ok': False, 'code': 'BAD_OP', 'msg_cn': '未知操作：%s' % op}
@@ -520,6 +592,22 @@ def main():
 
     srv = Server(SOCK_PATH, Handler)
     os.chmod(SOCK_PATH, 0o600)
+    # 真正的周期回收线程。
+    # 过去 _reap_idle() 只在「新建会话且发现已满」时才被调用 —— 也就是说
+    # 只要没人连到第 9 个，那些突然断线（浏览器崩溃、手机切走）留下的
+    # root shell 就会一直挂着，连同 master fd、Session 对象和若干 bytearray。
+    def _reaper_loop():
+        while True:
+            time.sleep(60)
+            try:
+                n = _reap_idle()
+                if n:
+                    log('info', 'SHELL_REAP', '后台回收了 %d 个闲置终端会话' % n)
+            except Exception:
+                pass
+
+    threading.Thread(target=_reaper_loop, daemon=True).start()
+
     log('info', 'SHELLD_UP', 'Web 终端守护已启动：%s' % SOCK_PATH)
     try:
         srv.serve_forever(poll_interval=0.5)

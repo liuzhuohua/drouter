@@ -105,10 +105,11 @@ NS = build([
     '_print_parse_lpstat_p', '_print_c_locale_env',
     '_print_patch_location', '_print_cupsctl_args',
     '_print_queue_name', '_print_uri',
-    '_print_load', '_print_save',
+    '_print_load', '_print_save', '_atomic_write',
     '_print_backup', '_print_prune_backups', '_print_backups',
 ], {
     're': re, 'os': os, 'json': json, 'shutil': shutil, 'sh': fake_sh,
+    'tempfile': tempfile,
     'ValidateError': ValidateError,
     # 源码是 `from datetime import datetime`，注入的必须是类不是模块
     'datetime': __import__('datetime').datetime,

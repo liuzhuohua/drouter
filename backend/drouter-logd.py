@@ -20,6 +20,7 @@ import json
 import os
 import subprocess
 import sys
+import hashlib
 from datetime import datetime
 
 # ---------------------------------------------------------------- PATH 归一化
@@ -163,32 +164,79 @@ def main():
 
 
 def dedupe_archive():
-    """把归档文件里的重复记录去掉（保留首次出现的位置）。"""
+    """把归档文件里的重复记录去掉（保留首次出现的位置）。
+
+    两个要点（都是踩过的坑）：
+    1. **必须加锁**。过去没有任何互斥：手工跑一次和 timer 重叠、或者采集进程
+       在读完之后又追加了新行，最后用「按旧内容生成的 .tmp」整体替换，
+       新追加的记录就被无声吞掉了。
+    2. **流式处理**。过去是 `f.read().splitlines()` 把整个文件变成 Python 对象
+       列表，再 `join` 成一份新字符串 —— 归档越大 CPU/内存/IO 越重，
+       每分钟跑一次，20 万行在 Python 对象开销下可以占几百 MB。
+       现在逐行读、逐行写，只在内存里留一份「已见指纹」。
+    """
     try:
+        # 局部 import：这个函数会被单测单独抽出来 exec，不能依赖模块级名字
+        import hashlib
         if not os.path.isfile(ARCHIVE):
             return 0
-        with open(ARCHIVE, encoding='utf-8', errors='replace') as f:
-            lines = f.read().splitlines()
-        seen, out = set(), []
-        for ln in lines:
-            if not ln.strip():
-                continue
+        try:
+            import fcntl            # Windows 上没有：那里不做锁，但去重照跑
+        except ImportError:
+            fcntl = None
+        f = open(ARCHIVE, 'r', encoding='utf-8', errors='replace')
+        tmp = ARCHIVE + '.tmp'
+        seen = set()
+        total, kept = 0, 0
+        try:
+            if fcntl is not None:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except Exception:
+                    # 抢不到锁说明有人在写（或上一次去重还没完）：这一轮跳过，
+                    # 总比把别人刚追加的日志覆盖掉强。
+                    return 0
+            with open(tmp, 'w', encoding='utf-8') as w:
+                for ln in f:
+                    ln = ln.rstrip('\n')
+                    total += 1
+                    if not ln.strip():
+                        continue
+                    try:
+                        k = _fp(json.loads(ln))
+                    except Exception:
+                        w.write(ln + '\n')
+                        kept += 1
+                        continue
+                    # 指纹压成 8 字节摘要再进 set：20 万条也能把内存压住
+                    h = hashlib.blake2b(k.encode('utf-8', 'replace'),
+                                        digest_size=8).digest()
+                    if h in seen:
+                        continue
+                    seen.add(h)
+                    w.write(ln + '\n')
+                    kept += 1
+        except Exception:
             try:
-                r = json.loads(ln)
-                k = _fp(r)
+                os.unlink(tmp)
             except Exception:
-                out.append(ln)
-                continue
-            if k in seen:
-                continue
-            seen.add(k)
-            out.append(ln)
-        removed = len(lines) - len(out)
+                pass
+            return 0
+        finally:
+            # 必须先关掉读句柄再 os.replace：Windows 上不允许替换一个
+            # 还开着的文件（Linux 无所谓，但不能只在 Linux 上是对的）。
+            try:
+                f.close()
+            except Exception:
+                pass
+        removed = total - kept
         if removed > 0:
-            tmp = ARCHIVE + '.tmp'
-            with open(tmp, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(out) + ('\n' if out else ''))
             os.replace(tmp, ARCHIVE)
+        else:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
         return max(0, removed)
     except Exception:
         return 0

@@ -67,8 +67,9 @@ exec(m.group(0), NS)
 
 for fn in ('_acl_hhmm_min', '_acl_min_hhmm', '_acl_day_bit', '_acl_shift_days',
            '_acl_time_windows', '_acl_time_expr', '_acl_load', '_acl_save',
-           '_acl_render_nft'):
+           '_acl_render_nft', '_atomic_write'):
     exec(grab(fn), NS)
+NS['tempfile'] = tempfile
 
 # _acl_deploy 里的 BUILD_MODE 路径改成临时文件（在命名空间内可见的全局名）
 _src_deploy = grab('_acl_deploy').replace(
