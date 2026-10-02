@@ -345,8 +345,12 @@ fi
 cat > $OPT/bin/sync-isp-dns.sh <<'SYNC'
 #!/bin/bash
 # 将 pppd 获取到的运营商 DNS 同步给 dnsmasq
+# 由 pppd 的 ip-up-script / ip-down-script 调用（见 render.py 的 render_ppp）。
+# 内容没变就不 reload：拨号/断线事件很频繁，每次都重启 dnsmasq 会把
+# DNS 缓存全清掉，表现为「网页时快时慢」。
 SRC=/etc/ppp/resolv.conf
 DST=/etc/drouter/generated/isp-dns.conf
+TMP=$DST.tmp.$$
 {
   echo "# 由 drouter 自动生成：运营商下发 DNS（来源 $SRC）"
   if [ -f "$SRC" ]; then
@@ -354,8 +358,19 @@ DST=/etc/drouter/generated/isp-dns.conf
   else
     echo "# $SRC 不存在（尚未拨号成功）"
   fi
-} > "$DST"
+} > "$TMP"
+# 归一化注释行后再比较，避免「只有时间戳/注释差异」被当成变化
+if [ -f "$DST" ] && diff -q <(grep -v '^#' "$DST") <(grep -v '^#' "$TMP") >/dev/null 2>&1; then
+  rm -f "$TMP"
+  exit 0
+fi
+mv -f "$TMP" "$DST"
 chmod 644 "$DST"
+# DNS 模式为「仅运营商 / 两者合并」时 dnsmasq 依赖这个文件，必须重载
+if grep -qs 'resolv-file=/etc/drouter/generated/isp-dns.conf' /etc/dnsmasq.d/drouter.conf 2>/dev/null; then
+  systemctl reload dnsmasq 2>/dev/null || systemctl restart dnsmasq 2>/dev/null || true
+fi
+exit 0
 SYNC
 chmod +x $OPT/bin/sync-isp-dns.sh
 

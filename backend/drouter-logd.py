@@ -118,6 +118,24 @@ def _fp(r):
                      str(r.get('dport', '')), str(r.get('msg_cn', ''))[:120]])
 
 
+def _disk_ok(path):
+    """归档前的磁盘底线检查。
+
+    和 drouter-snapshotd 同一套逻辑，那边有、这边原先没有。
+    缺了它的后果不是「写失败」这么简单：根分区将满时归档写不进去，
+    而 _ulog_archive_write 把异常吞成 return 0 —— 日志看起来「一切正常」，
+    只是流量统计从此静默停更，用户完全不知道原因。
+    """
+    try:
+        st = os.statvfs(path if os.path.isdir(path) else '/')
+        free_gb = st.f_bavail * st.f_frsize / (1024.0 ** 3)
+        if free_gb < 0.5:
+            return False, '剩余空间 %.2f GB，不足 0.5 GB' % free_gb
+        return True, ''
+    except Exception as e:
+        return True, str(e)
+
+
 def main():
     conf = load_conf()
 
@@ -136,6 +154,12 @@ def main():
     if not conf.get('archive', True):
         log('info', 'ULOG_SKIP', '归档已关闭，跳过本次采集')
         return 0
+
+    # 磁盘将满时直接跳过采集：写不进去还要一直试，只会把失败信息刷满日志
+    ok, why = _disk_ok(LOG_DIR)
+    if not ok:
+        log('error', 'ULOG_DISK_LOW', '磁盘空间不足，跳过本次日志采集：%s' % why)
+        return 1
 
     # 1) 采集 + 归档（helper 内部完成归档与清理）
     r = call('ulog', {'op': 'archive', 'since': SINCE, 'limit': COLLECT_LIMIT})

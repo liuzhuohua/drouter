@@ -108,6 +108,11 @@ def main():
         return 1
 
     # 1) 拍一张自动快照
+    # 顺序说明：**先拍后清**，不是先清理再创建。
+    # 每次自动快照之前先 prune 看着更省空间，但 prune 之后如果磁盘恰好满了，
+    # snapshot 就会失败 —— 那样就变成「因为要拍新快照所以再也不敢删旧的」，
+    # 越积越多直到彻底停摆。先拍后清最多多占一份的瞬时空间，
+    # 而上面那步 _disk_ok() 已经把「空间不够」的情况挡在门外了。
     r = call('snapshot', {'tag': 'auto'})
     if not r.get('ok'):
         log('error', 'SNAPSHOT_AUTO_FAIL', '自动快照创建失败：%s' % r.get('msg_cn'))

@@ -227,7 +227,10 @@ def render_dnsmasq(cfg):
         'bogus-priv',
         'expand-hosts',
         f'domain={domain}',
-        'local=/lan/',
+        # 跟随上面用户配置的域名后缀。原来写死 /lan/，用户把后缀改成
+        # home.lan 之后，expand-hosts 生成的 xxx.home.lan 就不再被判定
+        # 为本地域，这条规则变成一条无意义的遗留项。
+        f'local=/{domain}/',
         '',
         '# ---- DHCPv4 地址池 ----',
     ]
@@ -237,6 +240,40 @@ def render_dnsmasq(cfg):
         pool_end = v_ipv4(cfg.get('pool_end'), field='地址池结束')
         netmask = v_ipv4(cfg.get('pool_netmask') or '255.255.255.0', field='子网掩码')
         lease = v_int(cfg.get('lease_time') or 7200, field='租期', lo=120, hi=604800)
+        # 地址池三条一致性校验放在渲染层（所有入口的公共收口）。
+        # 新手向导路径本来就有这三条（helper 的 _wiz_apply_step），
+        # 但 DHCP 页直接保存走的是 /api/config → merge_cfg，完全绕过向导 ——
+        # 结果是「向导里配不出来的错配，直存就能存进去」：
+        #   ① 起始 > 末端 → 倒序池，dnsmasq 行为随版本而异；
+        #   ② 池里含本机 LAN 地址 → 路由器把自己的地址发出去，全网抢 IP；
+        #   ③ 静态绑定落在池内 → 动态分配可能覆盖绑定，轻则地址漂移重则冲突。
+        if ipaddress.ip_address(pool_start) > ipaddress.ip_address(pool_end):
+            raise ValidateError(
+                f'地址池起始 {pool_start} 大于末端 {pool_end}', 'pool_start')
+        lan_addr = str(cfg.get('lan_address') or '').strip()
+        if lan_addr and '/' in lan_addr:
+            try:
+                if (ipaddress.ip_address(pool_start) in ipaddress.ip_network(
+                        lan_addr, strict=False)
+                        and ipaddress.ip_address(pool_end) in ipaddress.ip_network(
+                            lan_addr, strict=False)):
+                    raise ValidateError(
+                        f'地址池（{pool_start}-{pool_end}）包含本机 LAN 地址 '
+                        f'{lan_addr}，会把路由器自己的地址发给客户端造成地址冲突',
+                        'pool_start')
+            except ValueError:
+                pass          # lan_address 不合法时交给别处的校验去报错
+        for sl in cfg.get('static_leases') or []:
+            if not v_bool(sl.get('enabled')):
+                continue
+            try:
+                sip = ipaddress.ip_address(str(sl.get('ip') or '').strip())
+            except ValueError:
+                continue        # 非法 IP 由下面渲染静态绑定时报错
+            if ipaddress.ip_address(pool_start) <= sip <= ipaddress.ip_address(pool_end):
+                raise ValidateError(
+                    f'静态绑定 {sip} 落在地址池 {pool_start}-{pool_end} 内，'
+                    f'可能被动态分配覆盖；请把它移出池外或关掉该绑定', 'static_leases')
         lines.append(f'dhcp-range={pool_start},{pool_end},{netmask},{lease}s')
         # code 3 / 6 有专属字段，但下面的「自定义 Options」表同样可以写这两个 code。
         # 两处都填时 dnsmasq 会把值**追加**（3/6 是列表型 option），于是下发成
@@ -306,7 +343,9 @@ def render_dnsmasq(cfg):
     if cfg.get('dns_lan_server'):
         lines.append(f'server=/{domain}/{v_ipv4(cfg.get("dns_lan_server"), field="内网 DNS")}')
     lines += [
-        f"cache-size={v_int(cfg.get('dns_cache_size') or 1000, field='DNS 缓存', lo=0, hi=20000)}",
+        # lo=0 说明 0 是有意义的取值（禁用缓存），不能用 `or 1000` ——
+        # 那会把用户明确填的 0 变成 1000，缓存照旧开着。
+        f"cache-size={v_int(cfg.get('dns_cache_size'), field='DNS 缓存', lo=0, hi=20000, default=1000)}",
         'no-negcache' if not v_bool(cfg.get('dns_negcache', True)) else '',
         'log-queries' if v_bool(cfg.get('dns_query_log')) else '',
         f'log-facility={log_file}',
@@ -955,6 +994,14 @@ def render_ppp(cfg):
         f'maxfail {v_int(p.get("maxfail") or 0, field="最大失败次数", lo=0, hi=100)}',
         f'holdoff {v_int(p.get("holdoff") or 5, field="重拨间隔", lo=1, hi=600)}',
         'usepeerdns',
+        # usepeerdns 只是把运营商 DNS 写进 /etc/ppp/resolv.conf，
+        # dnsmasq 读的是 /etc/drouter/generated/isp-dns.conf（resolv-file）。
+        # 没有这条 ip-up-script，那个文件永远只有占位注释 ——
+        # DNS 选「仅运营商」或「两者合并」时上游全空，全家断网，
+        # 而界面显示配置已应用（典型的静默失效）。
+        # 脚本自己会判断内容有没有变，变了才 reload dnsmasq。
+        'ip-up-script /opt/drouter/bin/sync-isp-dns.sh',
+        'ip-down-script /opt/drouter/bin/sync-isp-dns.sh',
         'lcp-echo-interval 20',
         'lcp-echo-failure 3',
         f'mtu {mtu}',
@@ -1038,7 +1085,10 @@ def render_radvd(cfg):
         lines.append('    };')
     lines += ['};', '']
     # IPv6 地址池说明块（供人工与后续脚本参考；radvd 本身通过 prefix 段生效）
-    if r.get('pool_enabled', True) is not False:
+    # 用 v_bool 而不是 `is not False`：后者把字符串 'false' / '0' 当成 True，
+    # 任何直接调 /api/config 的客户端（脚本、curl、未来的开放 API）
+    # 传字符串就会静默失效 —— 与本文件其它开关的判定方式不一致。
+    if v_bool(r.get('pool_enabled', True)):
         # 整块都是「先取值再原样拼」的写法，池名/前缀/策略三个字段原先一个
         # 都没校验：填了换行的池名会把注释后面变成真的 radvd 指令，而页面
         # 只会报一句 radvd.conf 语法错误。这里逐个过一遍。
@@ -1095,7 +1145,7 @@ def render_dhcpcd(cfg):
         plen = int(raw_len)
     except Exception:
         plen = 64
-    enabled = d.get('enabled', True) is not False
+    enabled = v_bool(d.get('enabled', True))
     lines = [
         '# 由 drouter 自动生成：DHCPv6 客户端 / 前缀委派 (PD)',
         '# 注意：是否真正拿到 PD 前缀取决于运营商，页面会显示实际获取结果',
@@ -1152,9 +1202,12 @@ def render_miniupnpd(cfg):
         lan_if = 'ens18'
     # UPnP 权限规则：仅允许内网网段申请临时端口（>=1024），末尾全拒。
     # 网段取自 system.lan_address；取不到时退回 192.168.0.0/16 保守放行。
+    # 注意 lan_address 可能被 Web 层以顶层字段塞进来（apply/render 两条路径
+    # 都只注入了 ext_iface，没塞整个 system 段）—— 只认 _sub(cfg,'system')
+    # 的话，自定义网段（10.x / 172.x）的用户开不了 UPnP，且界面不提示。
     lan_cidr = '192.168.0.0/16'
     sysc = _sub(cfg, 'system')
-    addr = str(sysc.get('lan_address') or '')
+    addr = str(sysc.get('lan_address') or cfg.get('lan_address') or '')
     if '/' in addr:
         try:
             lan_cidr = v_cidr(addr, field='UPnP 允许网段')

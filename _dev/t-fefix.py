@@ -78,9 +78,15 @@ _m = re.search(r'const cmt = s => (.+);', APP)
 chk('cmt 同时剥 /* 与 */', bool(_m) and '/\\/\\*/g' in _m.group(1) and '/\\*\\//g' in _m.group(1))
 
 print('--- 5. value 属性转义扫尾 ---')
+# 只对「可能携带外部数据」的插值强制 esc()：含点（obj.attr）、含函数调用、
+# 含运算符拼接的一律要求 esc(...) 包裹。
+# 纯裸标识符（map 回调形参等，取值来自源码里的字面量数组）放行，
+# 否则 DHCPv6 前缀下拉 `[56,60,62,64].map(x => ...)` 这种零风险写法会一直误报。
+_value_ok = lambda e: (e.strip().startswith('esc(')
+                       or not re.search(r'[.()+\[\]]', e))
 _leftover = [m.group(1) for m in re.finditer(r'value="\$\{([^{}]+)\}"', APP)
-             if not m.group(1).strip().startswith('esc(')]
-chk('value="${...}" 已全部 esc()', not _leftover, '→ 漏网 %s' % _leftover[:5])
+             if not _value_ok(m.group(1))]
+chk('value="${...}" 含外部数据的已全部 esc()', not _leftover, '→ 漏网 %s' % _leftover[:5])
 
 print('--- 6. href 伪协议 ---')
 chk('httpUrl 辅助已定义', 'const httpUrl = u =>' in APP and '/^https?:\\/\\//i' in APP)

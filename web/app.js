@@ -16,6 +16,10 @@ const esc = s => {
 };
 /* 只放行 http/https 链接：javascript:/data: 这类伪协议绝不能进 href */
 const httpUrl = u => { const s = String(u == null ? '' : u).trim(); return /^https?:\/\//i.test(s) ? s : ''; };
+/* 数字输入框的取值：清空时 Number('') === 0，会把 MTU/MRU/租期提交成 0。
+   0 在后端要么被钳到下限、要么生成非法配置，用户却以为「我清空了=用默认」。
+   所以空串一律给 undefined，让后端的默认值生效。 */
+const numOr = v => { const s = String(v == null ? '' : v).trim(); return s === '' ? undefined : Number(s); };
 const fmtBytes = n => {
   n = Number(n) || 0;
   const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0;
@@ -200,6 +204,12 @@ const PAGE_MODULES = {
   portfwd: { save: ['portfwd'],           apply: ['nft_v4', 'nft_v6'] },
   upnp:    { save: ['upnp'],              apply: ['upnp'] },
   ntp:     { save: ['ntp'],               apply: ['ntp'] },
+  // 系统设置页也在改 system（访问范围 / 允许网段），并会提示
+  // 「请点击保存并应用」。不登记的话动作条不显示，用户点了提示里的
+  // 「保存并应用」却找不到那个按钮，改动只能靠重新进页面丢掉。
+  // 只保存不 apply：system 模块不在 render 的可应用列表里，
+  // 访问控制由 Web 层读配置后自己判断，不该走去重启服务那条路。
+  sys:     { save: ['system'],            apply: [] },
 };
 
 /* 页面 key → 渲染函数。缺失此项会导致点击菜单时报
@@ -1045,8 +1055,8 @@ function viewWan() {
       setActionMsg('拨号网卡已选为 ' + (ifEl.value || '未分配') + '，请点击保存并应用');
     };
   }
-  bind('#pp-mtu', 'mtu', Number); bind('#pp-mru', 'mru', Number);
-  bind('#pp-holdoff', 'holdoff', Number); bind('#pp-maxfail', 'maxfail', Number);
+  bind('#pp-mtu', 'mtu', numOr); bind('#pp-mru', 'mru', numOr);
+  bind('#pp-holdoff', 'holdoff', numOr); bind('#pp-maxfail', 'maxfail', numOr);
   bind('#wn-addr', 'static_address'); bind('#wn-gw', 'static_gateway'); bind('#wn-dns', 'static_dns');
   $('#pp-persist').onchange = e => { S.cfg.pppoe = Object.assign($w('pppoe'), { persist: e.target.checked }); setActionMsg('已修改'); };
   $('#wan-test').onclick = async () => {
@@ -1243,7 +1253,7 @@ function viewLan() {
     el.oninput = el.onchange = () => { S.cfg.system = Object.assign($w('system'), { [key]: conv ? conv(el.value) : el.value }); setActionMsg('已修改，请点击保存并应用'); };
   };
   bind('#ln-if', 'lan_iface'); bind('#ln-addr', 'lan_address');
-  bind('#ln-mtu', 'lan_mtu', Number);
+  bind('#ln-mtu', 'lan_mtu', numOr);
   // 网关 / 域名后缀实际由 dnsmasq 下发：render 只读 dnsmasq 模块，
   // 原先错绑到 system.gateway / system.domain —— 那两个键谁也读不到，改了等于没改
   const bindQ = (id, key) => {
@@ -1339,13 +1349,21 @@ function viewDhcp() {
     S.cfg.dnsmasq = Object.assign($w('dnsmasq'), {
       dhcp_enabled: $('#dh-en').checked,
       pool_start: $('#dh-s').value, pool_end: $('#dh-e').value,
-      pool_netmask: $('#dh-m').value, lease_time: Number($('#dh-t').value),
+      pool_netmask: $('#dh-m').value, lease_time: numOr($('#dh-t').value),
       option_gateway: $('#op-gw').value, option_dns: $('#op-dns').value,
       options: o, static_leases: s,
     });
     setActionMsg('已修改，请点击保存并应用');
   };
-  const rebuild = () => { S.cfg.dnsmasq = Object.assign($w('dnsmasq'), { options: d.options, static_leases: d.static_leases }); viewDhcp(); };
+  // 每次 rebuild 都会重跑整个 viewDhcp，新闭包里的 leaseTimer 会覆盖
+  // stopLeaseTimer 指向的旧闭包 —— 旧 interval 的句柄就此丢失，
+  // clearInterval 再也调不到它。加 10 条自定义 Option 就泄漏 10 个
+  // 10 秒轮询，持续空打 /api/leases。所以这里先停掉旧的再重建。
+  const rebuild = () => {
+    stopLeaseTimer();
+    S.cfg.dnsmasq = Object.assign($w('dnsmasq'), { options: d.options, static_leases: d.static_leases });
+    viewDhcp();
+  };
   $$('.op-en,.op-code,.op-val,.op-rm,.op-fc').forEach(e => e.oninput = e.onchange = sync);
   $$('.sl-en,.sl-mac,.sl-ip,.sl-nm').forEach(e => e.oninput = e.onchange = sync);
   $('#dh-en').onchange = sync; $('#dh-s').oninput = sync; $('#dh-e').oninput = sync;
@@ -1668,7 +1686,12 @@ function viewFw(kind) {
   };
   $('#fw-check').onclick = async () => {
     toast('正在执行语法预检…', 'ok');
-    const r = await api('/api/apply', { method: 'POST', body: { module: key, data: $w(key) } });
+    // 必须显式传 check_only:true。/api/apply 的 live 默认 False 只代表
+    // 「写盘但不生效」，不代表「不写盘」—— 少了 check_only，
+    // 这个「仅语法检查」按钮会把规则真写进 /etc/nftables.d/ 覆盖掉现有配置，
+    // 而用户以为什么都没发生（下次「保存并应用」之前的任何回滚假设都不成立）。
+    const r = await api('/api/apply', { method: 'POST',
+      body: { module: key, data: $w(key), check_only: true, live: false } });
     toast(r.msg_cn, r.ok ? 'ok' : 'err', 6000);
   };
   $('#fw-rollback').onclick = listSnapshots;
@@ -2010,7 +2033,11 @@ const PF_PROTO_CN = { tcp: 'TCP', udp: 'UDP', 'tcp/udp': 'TCP+UDP' };
 
 function viewPortfwd() {
   const c = $w('portfwd');
-  const rules = (c.rules || []).map(x => Object.assign({}, x));
+  // 编辑中的草稿只存在 S.pfRules 里，页面重进时原本从 c.rules 重建，
+  // 于是「填了一半切页回来」全丢。pageDirty 机制就是干这个的：
+  // 标脏之后重进保留草稿，真正保存后才清。
+  const rules = (pageIsDirty('portfwd') && S.pfRules && S.pfRules.length
+    ? S.pfRules : (c.rules || [])).map(x => Object.assign({}, x));
   S.pfRules = rules.length ? rules : [newPfRule()];
   const hasWan = !!($w('system').wan_iface);
 
@@ -2075,6 +2102,7 @@ function viewPortfwd() {
   $('#pf-add').onclick = () => {
     S.pfRules.push(newPfRule());
     renderPfList();
+    pageDirty('portfwd');
     setActionMsg('已新增一条空白转发规则，请填写后保存');
   };
   $('#pf-clear').onclick = () => {
@@ -2082,6 +2110,7 @@ function viewPortfwd() {
       S.pfRules = [newPfRule()];
       renderPfList();
       S.cfg.portfwd = Object.assign($w('portfwd'), { rules: [] });
+      pageDirty('portfwd');
       setActionMsg('已清空端口转发规则，请点击保存并应用');
     });
   };
@@ -2139,6 +2168,7 @@ function renderPfList() {
       if (f === 'ext_port' || f === 'int_port') v = v === '' ? '' : Number(v);
       S.pfRules[i][f] = v;
       if (f === 'family') renderPfList();
+      pageDirty('portfwd');
       setActionMsg('已修改，请点击保存并应用');
     };
   });
@@ -2147,6 +2177,7 @@ function renderPfList() {
     if (S.pfRules.length <= 1) { S.pfRules = [newPfRule()]; }
     else { S.pfRules.splice(i, 1); }
     renderPfList();
+    pageDirty('portfwd');
     setActionMsg('已删除一条规则，请点击保存并应用');
   });
 }
@@ -3107,12 +3138,14 @@ function viewUpnp() {
       enable: $('#up-en').checked, natpmp: $('#up-np').checked,
       secure_mode: $('#up-sec').checked, igd_v1: $('#up-igd').checked,
       ext_iface: $('#up-ext').value, listen_ip: $('#up-lis').value,
-      port: Number($('#up-port').value),
+      port: numOr($('#up-port').value),
     });
     setActionMsg('已修改，请点击保存并应用');
   };
-  ['#up-en', '#up-np', '#up-sec', '#up-igd'].forEach(s => $(s).onchange = sync);
-  ['#up-ext', '#up-lis', '#up-port'].forEach(s => $(s).oninput = sync);
+  // 元素可能被条件隐藏（如 igd_v1 关掉时某些行不渲染），少一个 if 防御
+  // 就是一次 TypeError 把整个页面的 sync 绑定全打断。
+  ['#up-en', '#up-np', '#up-sec', '#up-igd'].forEach(s => { const e = $(s); if (e) e.onchange = sync; });
+  ['#up-ext', '#up-lis', '#up-port'].forEach(s => { const e = $(s); if (e) e.oninput = sync; });
   $('#up-list').onclick = async () => {
     $('#up-out').innerHTML = '<pre>读取中…</pre>';
     // 只读接口：查询绝不顺手启动服务（「保存」与「生效」必须分开）
@@ -3334,7 +3367,7 @@ function viewDhcpv6() {
       <label class="switch"><input type="checkbox" id="d6-en" ${enabled ? 'checked' : ''}><i></i>启用 DHCPv6 客户端</label>
       <div class="row">
         <label>请求前缀长度<select id="d6-len">
-          ${['/56', '/60', '/62', '/64'].map(x => `<option ${(c.prefix_len || '/60') === x ? 'selected' : ''}>${x}</option>`).join('')}
+          ${[56, 60, 62, 64].map(x => `<option value="${x}" ${Number(c.prefix_len || 60) === x ? 'selected' : ''}>/${x}</option>`).join('')}
         </select></label>
         <label>PD 网卡（WAN）<select id="d6-iface">
           <option value="">跟随 WAN 口</option>
@@ -3369,7 +3402,12 @@ function viewDhcpv6() {
     const h = () => { S.cfg.dhcpv6 = Object.assign($w('dhcpv6'), { [k]: conv ? conv(e.value) : e.value }); setActionMsg('已修改，请点击保存并应用'); };
     e.onchange = h; if (e.tagName === 'INPUT') e.oninput = h;
   };
-  bind('#d6-len', 'prefix_len'); bind('#d6-iface', 'iface');
+  // prefix_len 统一存数字：IPv6 页写的是 Number()，这里原来靠 <option>
+  // 的文本当值（'/60' 字符串），两页共享同一个 dhcpv6 模块却类型不同 ——
+  // 在 IPv6 页存成 64 后进本页，四个选项全不选中（浏览器显示第一项 /56），
+  // 用户动一下别的字段点保存就把 prefix_len 覆盖成 '/56'，反向污染 IPv6 页
+  // （type=number 收到 '/60' 变成空，Number('') = 0）。
+  bind('#d6-len', 'prefix_len', Number); bind('#d6-iface', 'iface');
   bind('#d6-method', 'method');
   // 写 sla_id 而不是 subnet_id：渲染器（render_dhcpcd 的 ia_pd 第 5 段）读的是
   // sla_id，存到 subnet_id 的话用户改完点「保存并应用」什么都不会变。
@@ -4562,7 +4600,7 @@ async function viewDdns() {
     pageDirty('ddns'); setActionMsg('已切换服务商，请填写对应凭据后保存');
   };
   bind('#dd-domain', 'domain'); bind('#dd-sub', 'subdomain');
-  bind('#dd-ttl', 'ttl', Number); bind('#dd-int', 'interval', Number);
+  bind('#dd-ttl', 'ttl', numOr); bind('#dd-int', 'interval', numOr);
   $('#dd-en').onchange = e => { S.ddnsDirty = Object.assign(S.ddnsDirty || {}, { enabled: e.target.checked }); pageDirty('ddns'); setActionMsg('已修改，点击下方保存'); };
   $('#dd-ipv4').onchange = e => { S.ddnsDirty = Object.assign(S.ddnsDirty || {}, { ipv4: e.target.checked }); pageDirty('ddns'); setActionMsg('已修改，点击下方保存'); };
   $('#dd-ipv6').onchange = e => { S.ddnsDirty = Object.assign(S.ddnsDirty || {}, { ipv6: e.target.checked }); pageDirty('ddns'); setActionMsg('已修改，点击下方保存'); };
@@ -7441,6 +7479,7 @@ function viewSys() {
         <button class="ghost fixed" id="rs-test">连通性自检</button>
       </div>
       <div id="rs-out" class="msg"></div>
+      <div class="notice warn hidden" id="rs-token" style="margin-top:10px"></div>
       <div class="kv"><b>服务状态</b><span id="rs-svc">—</span></div>
       <div class="kv"><b>虚拟网卡</b><span id="rs-vif">—</span></div>
       <div id="rs-addrs" class="mono" style="margin-top:8px;font-size:12px;color:var(--muted)"></div>
@@ -7745,7 +7784,20 @@ async function loadRescue() {
     const r2 = await api('/api/rescue', { method: 'POST', body });
     out.className = 'msg ' + (r2.ok ? 'ok' : 'err');
     out.textContent = r2.msg_cn;
-    if (r2.ok) { toast(r2.msg_cn, 'ok', 6000); loadRescue(); }
+    if (r2.ok) {
+      // 开启时后端会返回一次性访问令牌：救援页开启后挂在**每一张**物理网卡上，
+      // 没有令牌就等于局域网里任何人都能回滚并重启路由器。必须让用户看见并抄走。
+      const tok = (r2.data || {}).token;
+      const box = $('#rs-token');
+      if (tok && box) {
+        box.classList.remove('hidden');
+        box.innerHTML = '访问令牌 <b class="mono">' + esc(tok) + '</b>'
+          + ' —— 救援页上所有的还原操作都要填它。只显示这一次，'
+          + '关掉再开启会换一个。请抄到另一台机器上保存。';
+      }
+      toast(r2.msg_cn, 'ok', 6000);
+      loadRescue();
+    }
   };
   $('#rs-test').onclick = async () => {
     const out = $('#rs-out'); out.className = 'msg'; out.textContent = '正在自检…';
@@ -11265,6 +11317,11 @@ $('#ab-save').onclick = async () => {
   }
   const tail = pm.apply.length ? '' : '（该页面的设置没有独立配置文件，'
     + '会作为上下文随防火墙 / DHCP 等模块一起生效）';
+  // 保存成功必须清脏标记。原来只在 acl / nfs / ddns 三条专属分支里写
+  // pageClean()，通用保存路径漏了 —— 于是 PAGE_MODULES 里那 20 多个页面
+  // 保存后 PAGE_DIRTY 永不消失，之后每次进页面都拿旧草稿覆盖刚从库里
+  // 读回来的新值（别人用 CLI 改过、或另开标签页保存过都会踩到）。
+  if (allOk) pageClean(S.page);
   toast(msgs.join('；') + tail, allOk ? 'ok' : 'err');
   setActionMsg(msgs.join('；') + tail, allOk ? 'ok' : 'err');
 };
@@ -11339,6 +11396,7 @@ $('#ab-apply').onclick = async () => {
       msgs.push('设置已保存（该页面没有独立的配置文件需要渲染，'
         + '其设置会作为上下文随防火墙 / DHCP 等模块一起生效）');
     }
+    if (ok) pageClean(S.page);
     toast(msgs.join('；'), ok ? 'ok' : 'err', 8000);
     setActionMsg(msgs.join('；'), ok ? 'ok' : 'err');
     loadAll();

@@ -698,7 +698,18 @@ class Api:
             '/api/ulog/daemon': 'read:logd',
             '/api/theme': 'read:theme',
         }
-        if p in readings and method in ('GET', 'POST'):
+        # 这几个路径「既读又写」：下面各自有专属的 POST 写分支。
+        # 绝不能让上面的 readings 把 POST 也吃掉 —— 那样写操作永远走不到，
+        # 而且返回的是读结果 + ok:true，前端照样提示「保存完成」，
+        # 用户以为存上了，实际什么都没发生（访问控制/文件共享/Docker/
+        # 动态域名/主题/流日志 六个模块全废，1.0.5 之前一直存在）。
+        # 与 1.0.5 那个 depcheck 的 keys/only 属于同一类：静默失效还报成功。
+        _has_post_branch = {
+            '/api/ulog', '/api/ulog/flow', '/api/ulog/conf', '/api/theme',
+            '/api/share', '/api/acl', '/api/docker', '/api/ddns',
+        }
+        if p in readings and (method == 'GET'
+                              or (method == 'POST' and p not in _has_post_branch)):
             if not self.auth():
                 return
             payload = {}
@@ -802,6 +813,11 @@ class Api:
             if isinstance(b.get('data'), dict):
                 cfg = dict(cfg, **b['data'])
             syscfg = get_cfg('system', {}) or {}
+            if module == 'upnp':
+                # 与 apply 路径保持一致，否则预览出来的 allow 网段
+                # 和真正生效的不一样（预览永远显示 192.168.0.0/16）
+                cfg['lan_address'] = (cfg.get('lan_address')
+                                      or syscfg.get('lan_address') or '')
             if module in ('nft_v4', 'nft_v6'):
                 cfg['wan_iface'] = cfg.get('wan_iface') or syscfg.get('wan_iface') or 'ppp0'
                 cfg['lan_ifaces'] = cfg.get('lan_ifaces') or [syscfg.get('lan_iface') or 'ens18']
@@ -1338,9 +1354,16 @@ class Api:
         data = b.get('data')
         live = bool(b.get('live'))          # 默认 False：只写盘不生效
         check_only = bool(b.get('check_only'))
-        if isinstance(data, dict):
+        # 预检绝不写配置库：只该校验「传进来的这份数据能不能渲染成合法配置」，
+        # 不该把这份数据变成「当前配置」。否则点一次「仅语法检查」
+        # 就等于悄悄保存了一次，用户完全没察觉。
+        if isinstance(data, dict) and not check_only:
             merge_cfg(module, data)
-        cfg = get_cfg(module, {})
+        if check_only and isinstance(data, dict):
+            # 预检只看「这次提交的这份」，以它为准，不受库里旧值影响
+            cfg = dict(get_cfg(module, {}) or {}, **data)
+        else:
+            cfg = get_cfg(module, {})
         # 注入必要的上下文（LAN/WAN 接口名）
         syscfg = get_cfg('system', {}) or {}
         if module == 'dnsmasq':
@@ -1369,6 +1392,11 @@ class Api:
             cfg['lan_iface'] = cfg.get('lan_iface') or syscfg.get('lan_iface') or 'ens18'
         elif module == 'upnp':
             cfg['ext_iface'] = cfg.get('ext_iface') or syscfg.get('wan_iface') or 'ppp0'
+            # lan_address 也要：miniupnpd 的 allow 规则网段取自它，
+            # 不注入的话自定义网段（10.x/172.x）的用户 UPnP 永远被 deny，
+            # 而界面上开关是开的、没有任何提示。
+            cfg['lan_address'] = (cfg.get('lan_address')
+                                  or syscfg.get('lan_address') or '')
         elif module in ('ppp', 'pppoe'):
             # ⚠️ 这里必须同时认 'pppoe'：前端 PAGE_MODULES 里声明的模块名就是
             # pppoe（`web/app.js` 的 `wan: { save:['pppoe'], apply:['pppoe'] }`），

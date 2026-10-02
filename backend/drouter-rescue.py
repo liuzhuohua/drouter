@@ -38,6 +38,7 @@ import socketserver
 import subprocess
 import sys
 import urllib.parse
+import time
 from datetime import datetime
 
 # ---------------------------------------------------------------- PATH 归一化
@@ -207,9 +208,16 @@ pre{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:11px;
     <button class="ghost" onclick="load()">刷新快照列表</button>
   </div>
   <div class="row">
+    <input id="tok" placeholder="访问令牌（开启救援时生成，6 位数字）" inputmode="numeric"
+           autocomplete="off" maxlength="6">
     <input id="cfm" placeholder="请输入：__CONFIRM__">
     <input id="ts" placeholder="或指定快照编号，如 20260928-153000" style="max-width:250px">
     <button class="ghost" onclick="restore(document.getElementById('ts').value.trim())">还原指定快照</button>
+  </div>
+  <div style="font-size:12px;color:#64748b;margin-top:8px">
+  令牌在「系统 · 紧急救援通道」开启本通道时会显示一次，请抄到这台机器上。
+  没有令牌无法读取快照列表、也无法执行还原 —— 通道开启后会被挂到**每一张**物理网卡上，
+  没有令牌就等于局域网里任何人都能还原你的路由器。
   </div>
   <div id="out" class="out"></div>
 </div>
@@ -229,8 +237,19 @@ function show(msg, kind) {
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
 
+function token() {
+  var t = (document.getElementById('tok') || {}).value;
+  return String(t == null ? '' : t).trim();
+}
+
 function load() {
-  fetch('/api/snapshots').then(function(r){return r.json();}).then(function(d){
+  if (!token()) {
+    document.getElementById('list').innerHTML =
+      '<div style="color:#fca5a5">请先在上方填入访问令牌，再点「刷新快照列表」。</div>';
+    return;
+  }
+  fetch('/api/snapshots?token=' + encodeURIComponent(token()))
+    .then(function(r){return r.json();}).then(function(d){
     var box = document.getElementById('list');
     if (!d.ok) { box.innerHTML = '<div style="color:#f87171">读取失败：' + esc(d.msg_cn) + '</div>'; return; }
     var items = d.data.items || [];
@@ -253,12 +272,13 @@ function load() {
 function restore(ts) {
   var cfm = document.getElementById('cfm').value.trim();
   if (!ts) { show('请先选择或填写要还原的快照编号。', 'warn'); return; }
+  if (!token()) { show('请先填写访问令牌。', 'warn'); return; }
   if (cfm !== '__CONFIRM__') { show('确认短语不正确，请输入「__CONFIRM__」。', 'warn'); return; }
   if (!confirm('确定要还原到快照 ' + ts + ' 吗？\\n还原过程会自动重启路由器，网络会短暂中断。')) return;
   show('正在还原 ' + ts + ' ，请勿关闭页面…', '');
   fetch('/api/restore', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ts: ts, confirm: cfm})
+    body: JSON.stringify({ts: ts, confirm: cfm, token: token()})
   }).then(function(r){return r.json();}).then(function(d){
     if (d.ok) {
       show('<b>还原成功</b><br>' + esc(d.msg_cn)
@@ -287,6 +307,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
     # ---------- 安全：只允许救援网段访问 ----------
+    # ---------- 访问令牌 ----------
+    # 为什么必须有：救援开启时 169.254.0.1/16 被挂到**每一张**物理网卡上，
+    # 「救援网段内」实际上等于「你局域网里插着网线的任意一台机器」；
+    # 而还原确认短语是页面源码里的常量。于是等于零凭据就能回滚配置 + 重启全机。
+    # 所有会改动系统的接口都必须带上「开启时生成」的那个令牌。
+    def _token_ok(self, given):
+        want = str(self.conf.get('token') or '').strip()
+        if not want:
+            # 老版本升级上来的配置里没有令牌。这里绝不能退化成
+            # 「无凭据放行」—— 那等于升级本身开了个后门。直接拒绝，
+            # 让用户在主面板里把救援关掉再打开一次以生成令牌。
+            return False
+        return str(given or '').strip() == want
+
+    def _locked(self):
+        try:
+            return time.time() < float(self.conf.get('_lock_until', 0))
+        except Exception:
+            return False
+
+    def _bump_fails(self):
+        # 令牌只有 6 位数字，穷举成本极低 —— 必须限速。
+        # 连续失败 10 次后锁定 60 秒。
+        n = int(self.conf.get('_fails', 0) or 0) + 1
+        self.conf['_fails'] = n
+        log('warn', 'RESCUE_AUTH_FAIL', '救援还原令牌校验失败（第 %d 次）' % n,
+            {'from': self.client_address[0]})
+        if n >= 10:
+            self.conf['_fails'] = 0
+            self.conf['_lock_until'] = time.time() + 60
+            log('warn', 'RESCUE_AUTH_LOCK', '令牌连续失败 10 次，锁定 60 秒')
+        return n
+
     def _allowed(self):
         try:
             ip = self.client_address[0]
@@ -352,6 +405,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     .replace('__CONFIRM__', CONFIRM_WORD))
             return self._send(200, html)
         if path == '/api/snapshots':
+            # 快照列表也要令牌：里面有你的配置备份文件名与时间，
+            # 属于可被用来推断与定位的信息，不该对同网段任何人开放。
+            if self._locked():
+                return self._json({'ok': False, 'msg_cn': '失败次数过多，请 60 秒后再试'}, 429)
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if not self._token_ok((q.get('token') or [''])[0]):
+                self._bump_fails()
+                return self._json({'ok': False, 'msg_cn': '访问令牌不正确'}, 403)
+            self.conf['_fails'] = 0
             r = run_helper('snapshot_list', timeout=60)
             return self._json(r)
         if path == '/api/health':
@@ -368,6 +430,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception:
             body = {}
         if path == '/api/restore':
+            if self._locked():
+                return self._json({'ok': False, 'msg_cn': '失败次数过多，请 60 秒后再试'}, 429)
+            if not self._token_ok(body.get('token')):
+                self._bump_fails()
+                return self._json({'ok': False, 'msg_cn': '访问令牌不正确'}, 403)
+            self.conf['_fails'] = 0
             if body.get('confirm') != CONFIRM_WORD:
                 return self._json({'ok': False, 'msg_cn': '确认短语不正确'})
             ts = str(body.get('ts') or '').strip()

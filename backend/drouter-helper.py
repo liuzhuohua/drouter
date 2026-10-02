@@ -140,8 +140,20 @@ def check_build_guard(action, payload):
     if not in_build_mode():
         return None
     # 允许：只读、快照、语法检查、纯写盘
-    if action.startswith('read:') or action in ('snapshot', 'snapshot_list', 'rollback'):
+    if action.startswith('read:') or action in ('snapshot', 'snapshot_list'):
         return None
+    # rollback 只放行「不生效」的那一半。
+    # 它原来和无条件放行放在一起，于是构建模式下回滚会把
+    # dnsmasq / radvd / dhcpcd / nftables 全部 restart ——
+    # 前三个正是 BUILD_BLOCKED_SERVICES 里明确拉黑的，等于把构建机
+    # 变成 DHCP/DNS 服务器污染局域网，正是这个模式要防的事。
+    if action == 'rollback':
+        if not (payload or {}).get('reload'):
+            return None
+        return fail(
+            '当前处于【构建保护模式】，已阻止「回滚并生效」。'
+            '如需在保护模式下还原配置，请先关闭保护模式，'
+            '或改用不重启服务的回滚（不带 reload 参数）。')
     if action == 'apply':
         if (payload or {}).get('check_only'):
             return None
@@ -406,7 +418,11 @@ def _cpu_pct_cached(min_gap=1.0):
 
 
 def _net_counters():
-    """读取所有物理网卡的收发字节/包数。跳过 lo 与虚拟接口。"""
+    """读取所有物理网卡的收发字节/包数。跳过 lo 与虚拟接口。
+
+    网桥口（br0 等）要一并跳过：它的 RX/TX 是各成员口之和，
+    和成员口一起累加会让「总接收/发送」翻倍（网桥模式下默认就在用 br0）。
+    """
     out = {}
     try:
         with open('/proc/net/dev') as f:
@@ -416,6 +432,9 @@ def _net_counters():
                 name, rest = line.split(':', 1)
                 name = name.strip()
                 if name == 'lo' or name.startswith(('veth', 'br-', 'virbr', 'docker', 'ifb')):
+                    continue
+                # br0 这类网桥口：成员口的计数就是它的计数，两者只能取其一
+                if name != 'lo' and os.path.isdir('/sys/class/net/%s/bridge' % name):
                     continue
                 p = rest.split()
                 if len(p) < 16:
@@ -568,39 +587,44 @@ def _route_latency(target=''):
     避免前端每 2 秒轮询都触发一次 ping（浪费资源）。
     注意：这里只做「探测」，不修改任何路由或网络配置。
     """
+    # ⚠️ ping 绝对不能在 _metric_lock() 里跑。
+    # 前端仪表盘每 2 秒轮询一次 /api/metrics，而这个锁同时保护 CPU 差分与
+    # 网卡速率的计算。目标不可达时 ping 会耗满 10 秒超时（-c 4 -W 1 逐个等），
+    # 期间所有指标请求全部堆着 —— 表现为「整个仪表盘卡死十几秒」。
+    # 改成：锁内只读缓存 / 决定探测目标，ping 放锁外跑，跑完再写回缓存。
+    now = time.time()
     with _metric_lock():
         st = _METRIC_CACHE['rtt']
-        now = time.time()
         tgt = target or st.get('target') or ''
-        if not tgt:
-            # 取默认路由网关；无网关则用公共 DNS 作为兜底探测目标
-            rc, o, _e = sh(['sh', '-c', "ip -4 route show default 2>/dev/null "
-                            "| awk '{print $3; exit}'"], timeout=6)
-            tgt = (o or '').strip()
-            if not tgt:
-                tgt = '223.5.5.5'
-            st['target'] = tgt
         if st['ms'] is not None and (now - st['ts']) < 20:
             return {'ms': st['ms'], 'jitter_ms': st['jitter_ms'],
                     'loss_pct': st['loss_pct'], 'target': st['target'],
                     'cached': True}
-        rc, o, _e = sh(['ping', '-n', '-c', '4', '-W', '1', '-i', '0.3', tgt], timeout=10)
-        ms = jit = loss = None
-        if rc == 0 or o:
-            m = re.search(r'(\d+)% packet loss', o or '')
-            if m:
-                loss = int(m.group(1))
-            m2 = re.search(r'rtt min/avg/max/mdev = ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)', o or '')
-            if not m2:
-                m2 = re.search(r'round-trip min/avg/max/(?:stddev|mdev) = ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)', o or '')
-            if m2:
-                ms = round(float(m2.group(2)), 1)
-                jit = round(float(m2.group(4)), 1)
-        if ms is None and loss is None:
-            loss = 100
-        st.update({'ts': now, 'ms': ms, 'jitter_ms': jit, 'loss_pct': loss})
-        return {'ms': ms, 'jitter_ms': jit, 'loss_pct': loss,
-                'target': tgt, 'cached': False}
+    if not tgt:
+        # 取默认路由网关；无网关则用公共 DNS 作为兜底探测目标
+        rc, o, _e = sh(['sh', '-c', "ip -4 route show default 2>/dev/null "
+                        "| awk '{print $3; exit}'"], timeout=6)
+        tgt = (o or '').strip() or '223.5.5.5'
+    rc, o, _e = sh(['ping', '-n', '-c', '4', '-W', '1', '-i', '0.3', tgt], timeout=10)
+    ms = jit = loss = None
+    if rc == 0 or o:
+        m = re.search(r'(\d+)% packet loss', o or '')
+        if m:
+            loss = int(m.group(1))
+        m2 = re.search(r'rtt min/avg/max/mdev = ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)', o or '')
+        if not m2:
+            m2 = re.search(r'round-trip min/avg/max/(?:stddev|mdev) = ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)', o or '')
+        if m2:
+            ms = round(float(m2.group(2)), 1)
+            jit = round(float(m2.group(4)), 1)
+    if ms is None and loss is None:
+        loss = 100
+    with _metric_lock():
+        st = _METRIC_CACHE['rtt']
+        st.update({'ts': now, 'ms': ms, 'jitter_ms': jit,
+                   'loss_pct': loss, 'target': tgt})
+    return {'ms': ms, 'jitter_ms': jit, 'loss_pct': loss,
+            'target': tgt, 'cached': False}
 
 
 def read_metrics(p):
@@ -1415,7 +1439,10 @@ def read_leases(_):
             if r:
                 cfg = json.loads(r['value'])
                 for sl in (cfg.get('static_leases') or []):
-                    if sl.get('mac'):
+                    # 必须和渲染层一致地看 enabled：取消勾选后 dnsmasq 已经
+                    # 不再生效这条绑定，租约表若还标「静态」，前端就会把
+                    # 「转为静态」按钮置灰，用户既不能转也不能再启用。
+                    if sl.get('mac') and v_bool(sl.get('enabled')):
                         static_map[sl['mac'].lower()] = sl
     except Exception:
         pass
@@ -9931,7 +9958,17 @@ def act_ulog(p):
 
 
 def _ulog_prune(conf):
-    """按保留策略清理归档文件（保留天数 + 最大条数）。"""
+    """按保留策略清理归档文件（保留天数 + 最大条数）。
+
+    必须流式。原实现 `f.read().splitlines()` 一次性把整个归档读进列表，
+    再建第二个 kept 列表 —— keep_rows 默认 20 万行、每行约 400 字节，
+    峰值内存 160MB+；而这个函数是 drouter-logd 定时器**每 60 秒**调一次。
+    4GB 的小机器上这是 OOM 杀手。同项目的 drouter-logd.py 早就因为
+    同样的问题改成了流式（见那里的 dedupe_archive 注释），helper 这边漏了。
+
+    改成：先只数行（不驻留内容），不够上限就一个字节都不用改；
+    超了上限才逐行流式写临时文件，最后 os.replace 原子替换。
+    """
     conf = conf or ULOG_DEFAULT_CONF
     path = ULOG_ARCHIVE
     if not os.path.isfile(path):
@@ -9939,37 +9976,87 @@ def _ulog_prune(conf):
     keep_days = max(1, int(conf.get('keep_days') or 7))
     keep_rows = max(1, int(conf.get('keep_rows') or 200000))
     cutoff = datetime.now().timestamp() - keep_days * 86400
-    kept, removed = [], 0
-    try:
-        with open(path, encoding='utf-8', errors='replace') as f:
-            lines = f.read().splitlines()
-    except Exception:
-        return {'removed': 0, 'kept': 0}
-    for ln in lines:
-        if not ln.strip():
-            continue
+
+    def _too_old(ln):
         try:
             r = json.loads(ln)
-            ts = r.get('ts') or ''
-            dt = datetime.strptime(ts[:19], '%Y-%m-%dT%H:%M:%S')
-            if dt.timestamp() < cutoff:
-                removed += 1
-                continue
+            dt = datetime.strptime((r.get('ts') or '')[:19], '%Y-%m-%dT%H:%M:%S')
+            return dt.timestamp() < cutoff
         except Exception:
-            pass    # 无法解析的行保留，避免误删
-        kept.append(ln)
-    if len(kept) > keep_rows:
-        removed += len(kept) - keep_rows
-        kept = kept[-keep_rows:]
-    if removed:
+            return False    # 无法解析的行保留，避免误删
+
+    # 第一遍：只统计，不留内容
+    total = 0
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            for ln in f:
+                if ln.strip():
+                    total += 1
+    except Exception:
+        return {'removed': 0, 'kept': 0}
+    if total <= keep_rows:
+        # 条数没超：只有「过期」这一种清理，逐行流式重写即可，
+        # 但要先确认确实有要删的行，否则连临时文件都不用建。
+        has_old = False
         try:
-            tmp = path + '.tmp'
-            with open(tmp, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(kept) + ('\n' if kept else ''))
+            with open(path, encoding='utf-8', errors='replace') as f:
+                for ln in f:
+                    if ln.strip() and _too_old(ln):
+                        has_old = True
+                        break
+        except Exception:
+            return {'removed': 0, 'kept': total}
+        if not has_old:
+            return {'removed': 0, 'kept': total}
+        removed = 0
+        kept_n = 0
+        tmp = path + '.tmp'
+        try:
+            with open(path, encoding='utf-8', errors='replace') as fin, \
+                    open(tmp, 'w', encoding='utf-8') as fout:
+                for ln in fin:
+                    if not ln.strip():
+                        continue
+                    if _too_old(ln):
+                        removed += 1
+                        continue
+                    fout.write(ln if ln.endswith('\n') else ln + '\n')
+                    kept_n += 1
             os.replace(tmp, path)
         except Exception:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            return {'removed': 0, 'kept': total}
+        return {'removed': removed, 'kept': kept_n}
+
+    # 第二遍：条数超上限。保留最后 keep_rows 行（最新的那些），
+    # 用滑动窗口 —— 只驻留 keep_rows 行，且它本身就是我们要写出的内容。
+    removed = 0
+    window = []
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            for ln in f:
+                if not ln.strip():
+                    continue
+                if _too_old(ln):
+                    removed += 1
+                    continue
+                window.append(ln if ln.endswith('\n') else ln + '\n')
+                if len(window) > keep_rows:
+                    window.pop(0)
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fout:
+            fout.writelines(window)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(path + '.tmp')
+        except Exception:
             pass
-    return {'removed': removed, 'kept': len(kept)}
+        return {'removed': 0, 'kept': total}
+    return {'removed': removed + (total - len(window)), 'kept': len(window)}
 
 
 def _ulog_archive_write(recs, conf=None):
@@ -10676,14 +10763,29 @@ def _load_rescue():
     return conf
 
 
+def _rescue_new_token():
+    """生成救援访问令牌。
+
+    6 位数字是为了能在手机上手打；强度靠「开启即轮换 + 失败次数限制」，
+    不靠字符集——真正防的是「同网段任意主机随手就能还原路由器」。
+    用 secrets 才是正经做法，但这个文件没导入它；uuid4 取数字位
+    在这里完全够用（不是密码学用途，只是避免可预测的序列）。
+    """
+    return ''.join(str(uuid.uuid4().int)[i] for i in range(6))
+
+
 def _save_rescue(conf):
     _atomic_write(RESCUE_CONF,
                   json.dumps(conf, ensure_ascii=False, indent=2) + '\n',
                   mode=0o640)
-    # 从 0600 放宽到 0640 且属组 drouter：这个文件里只有端口、VIP、网卡名单，
-    # 没有口令。原先 0600 属主 root，导致以 drouter 身份运行的快照读不到它，
-    # 一个文件就让整个 /etc/drouter 目录进不了快照（已由 _copytree_soft 兜底，
-    # 但能读就别漏）。0640 仍然挡住了「其他用户」。
+    # 从 0600 放宽到 0640 且属组 drouter：快照守护以 drouter 身份运行，
+    # 读不到这个文件就会让整个 /etc/drouter 目录进不了快照
+    # （已由 _copytree_soft 兜底，但能读就别漏）。
+    # ⚠️ 现在文件里多了 token —— 它就是救援通道的写操作凭据。
+    # 0640 属组 drouter 意味着 drouter 组可读，而 helper 本身就以 drouter
+    # 身份运行、必须读到 token 才能在「开启时把令牌显示给用户」。
+    # 这是有意的取舍：能进 /api/rescue 的前提是已通过 Web 面板认证，
+    # 而 drouter 组权限并不等价于「任意用户可读这个文件」。
     try:
         os.chmod(RESCUE_CONF, 0o640)
         shutil.chown(RESCUE_CONF, group='drouter')
@@ -10713,6 +10815,36 @@ def _physical_ifaces():
     return out
 
 
+def _rescue_drop_nft_chain():
+    """删除救援放行用的 nft chain（连同 input 里引用它的 jump 规则）。
+
+    单独抽出来是因为这段要「按 handle 反复删」：nft 没有「按内容批量删规则」
+    的命令，只能 `nft -a list chain` 拿到每条规则的 handle 再逐条 delete。
+    写成一段 shell 嵌在 Python 字符串里既难读又容易引号出错。
+    """
+    rc, o, _e = sh(['sh', '-c',
+                    'command -v nft >/dev/null 2>&1 && '
+                    'nft list table inet drouter >/dev/null 2>&1 && echo yes'],
+                   timeout=8)
+    if (o or '').strip() != 'yes':
+        return False
+    # 先删 jump 规则（最多 8 轮，够覆盖任何重复开启留下的残留）
+    for _ in range(8):
+        rc, o, _e = sh(['sh', '-c',
+                        'nft -a list chain inet drouter input 2>/dev/null '
+                        '| grep "jump drouter_rescue" | head -1'], timeout=8)
+        line = (o or '').strip()
+        if not line:
+            break
+        m = re.search(r'handle (\d+)', line)
+        if not m:
+            break
+        sh(['nft', 'delete', 'rule', 'inet', 'drouter', 'input',
+            'handle', m.group(1)], timeout=8)
+    sh(['nft', 'delete', 'chain', 'inet', 'drouter', 'drouter_rescue'], timeout=8)
+    return True
+
+
 def _rescue_apply_net(conf):
     """落地救援虚拟网卡与别名 IP。启用时创建，关闭时回收。"""
     vip = conf.get('vip') or RESCUE_DEFAULT['vip']
@@ -10728,6 +10860,11 @@ def _rescue_apply_net(conf):
             sh(['ip', 'addr', 'del', '%s/%s' % (alt, '24'), 'dev', n], timeout=8)
             sh(['ip', 'addr', 'del', '%s/%s' % (vip, mask), 'dev', n], timeout=8)
         sh(['ip', 'link', 'del', RESCUE_VIF], timeout=8)
+        # 把放行救援端口的那条 chain 一起删掉。
+        # 只删 chain 不够 —— input 里的 jump 规则还引用着它，会让后续
+        # 对该 chain 的操作全部报错。用 nft -a 拿到 handle 后按 handle 删，
+        # 删干净再删 chain。
+        _rescue_drop_nft_chain()
         return {'enabled': False, 'applied': []}
 
     # 1) 创建独立虚拟网卡 drescue0（dummy 类型，不依赖物理链路）
@@ -10752,9 +10889,15 @@ def _rescue_apply_net(conf):
             applied.append('%s ← %s/24（备用）' % (n, alt))
 
     # 3) 放行救援端口的入站（即便用户把 nftables 写错，也尽量留一条后门）
+    #    放进**独立的 chain**：原先是 `nft add rule inet drouter input ...`，
+    #    直接挂在主 input 链上，只加不删 —— 改端口后再关闭，旧的那条
+    #    accept 规则永远留在 nftables 里，等于留了个永久后门。
+    #    独立 chain 在关闭时可以整条 delete，不影响用户自己的规则。
     sh(['sh', '-c',
         'command -v nft >/dev/null 2>&1 && nft list table inet drouter >/dev/null 2>&1 && '
-        'nft add rule inet drouter input tcp dport %d accept 2>/dev/null || true'
+        'nft add chain inet drouter drouter_rescue 2>/dev/null; '
+        'nft add rule inet drouter drouter_rescue tcp dport %d accept 2>/dev/null; '
+        'nft insert rule inet drouter input jump drouter_rescue 2>/dev/null || true'
         % int(conf.get('port') or 8888)], timeout=10)
     return {'enabled': True, 'applied': applied, 'ifaces': ifaces}
 
@@ -10813,6 +10956,19 @@ def act_rescue(p):
         # 重建 systemd 单元并启停服务
         _write_rescue_unit()
         if conf['enabled']:
+            # 每次开启都换一个新 token。
+            # 救援通道开启时会把 169.254.0.1/16 挂到每一张物理网卡上，
+            # 于是「救援网段内的任意主机」= 局域网上任意一台机器。
+            # 而确认短语是硬编码在页面源码里的常量 —— 也就是说任何人都能
+            # POST /api/restore 回滚配置并重启全机。这条通道存在的意义是
+            # 「主面板锁死时唯一的救命入口」，一旦无凭据就等于把路由器交出去。
+            # 所以：开启即生成随机 token，rescue.conf 用 0640 属组 drouter
+            # （drouter-rescue 以 drouter 组身份读它），页面上的所有写操作
+            # 都必须带上它；用户在主面板开启时能看到这个 token 并抄到另一台
+            # 机器上用。
+            token = _rescue_new_token()
+            conf['token'] = token
+            _save_rescue(conf)
             sh(['systemctl', 'daemon-reload'], timeout=20)
             rc, _o, e = sh(['systemctl', 'enable', '--now', 'drouter-rescue'], timeout=30)
             log('warn', 'rescue', 'RESCUE_ON',
@@ -10821,11 +10977,15 @@ def act_rescue(p):
             if rc != 0:
                 return ok({'config': conf, 'net': net},
                           '配置已保存，但救援服务启动失败：%s' % (e or '请查看 journalctl -u drouter-rescue'))
-            return ok({'config': conf, 'net': net},
-                      '救援通道已开启，可通过 http://%s:%d/ 访问（插任一口皆可）'
-                      % (conf['vip'], int(conf['port'])))
+            return ok({'config': conf, 'net': net, 'token': token},
+                      '救援通道已开启，可通过 http://%s:%d/ 访问（插任一口皆可）。'
+                      '请记下访问令牌 %s —— 页面上的还原操作需要它，'
+                      '同网段其它机器无法凭猜测还原你的配置' % (conf['vip'], int(conf['port']), token))
         else:
             sh(['systemctl', 'disable', '--now', 'drouter-rescue'], timeout=30)
+            # 关闭时顺手作废 token：留着旧 token 不回收等于没关
+            conf['token'] = ''
+            _save_rescue(conf)
             log('warn', 'rescue', 'RESCUE_OFF', '紧急救援通道已关闭')
             return ok({'config': conf, 'net': net}, '救援通道已关闭（虚拟地址已回收）')
 
@@ -11784,7 +11944,11 @@ def act_lease_make_static(p):
     lst = [x for x in lst if str(x.get('mac', '')).lower() != mac]
     # 同 IP 的记录也移除，避免冲突
     lst = [x for x in lst if x.get('ip') != ip]
-    lst.append({'mac': mac, 'ip': ip, 'host': host})
+    # 字段名必须和 render_dnsmasq 读的一致：那边读 enabled + name，
+    # 这里原来写的是 host 且没有 enabled —— 结果是「转为静态」提示成功、
+    # _save_setting 也写盘了，但渲染时整条被 v_bool(enabled) 过滤掉，
+    # dnsmasq 里一条 dhcp-host 都没有，绑定静默失效。
+    lst.append({'enabled': True, 'mac': mac, 'ip': ip, 'name': host})
     cfg['static_leases'] = lst
     _save_setting('dnsmasq', cfg)
     log('info', 'dhcp', 'LEASE_STATIC', '租约转为静态绑定 %s → %s' % (mac, ip), {'host': host})
@@ -12709,9 +12873,24 @@ def act_pppoe_multi(p):
             except Exception:
                 mtu = 1492
             mtu = max(576, min(1500, mtu))
+            # MRU 独立取值：原来直接写 'mru': mtu，用户在界面上填的 MRU
+            # 被静默忽略。部分线路确实需要 mru < mtu，硬改成相等会让
+            # 「我已经调小了 MRU」变成一句空话（界面上看不出任何异常）。
+            try:
+                mru = int(s.get('mru') or mtu)
+            except Exception:
+                mru = mtu
+            mru = max(576, min(1500, mru))
+            # service_name 会被拼成 servicename "…" 写进 pppd 参数文件。
+            # 同函数里 user 有白名单、password 显式拒绝引号与换行，
+            # 只有它只做了 strip+截断 —— 含引号就能闭合引号接着写 pppd 指令。
+            # 单拨路径 render_ppp 早就用 v_text(pattern=...) 挡住了，这里漏了。
+            svc = str(s.get('service_name') or '').strip()[:64]
+            if not re.match(r'^[A-Za-z0-9._-]*$', svc):
+                return fail('第 %d 个会话的服务名只能包含字母、数字、点、下划线和连字符' % i)
             clean.append({
                 'user': user, 'password': pwd, 'weight': w, 'mtu': mtu,
-                'mru': mtu, 'service_name': str(s.get('service_name') or '').strip()[:64],
+                'mru': mru, 'service_name': svc,
                 'isp': str(s.get('isp') or 'auto'),
             })
         # 单账号多拨：把第一条的账号复制到其余会话（多点几下就能展开）
@@ -16476,7 +16655,14 @@ def _kern_save_op(p):
             cfg['snmp']['listen'] = lis
         for k in ('contact', 'location', 'sysname'):
             if s.get(k) is not None:
-                cfg['snmp'][k] = str(s[k])[:128]
+                # 这三个字段被原样拼进 snmpd.conf 的 `sysName %s` 等指令行。
+                # 原来只截长度、不过滤控制字符，于是 sysname 里塞一个换行就能
+                # 凭空插出一条 rwcommunity —— 把只读团体名升级成可写，
+                # 之后就能改路由/接口/重启设备。同段的 community 有 [\s#] 校验，
+                # 这三个漏了。
+                val = re.sub(r'[\r\n]', ' ', str(s[k]))
+                val = val.replace('#', ' ').strip()[:128]
+                cfg['snmp'][k] = val
 
     # ---- 防火墙的两组参数写回各自模块的配置库（render.py 从那里读）----
     fw = p.get('fw') or {}
