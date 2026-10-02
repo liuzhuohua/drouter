@@ -56,6 +56,7 @@ _ensure_sbin_path()
 SOCK_PATH = '/run/drouter/shell.sock'
 LOG_DIR = '/var/log/drouter'
 IDLE_TIMEOUT = 30 * 60        # 30 分钟无操作自动回收
+MAX_SESSIONS = 8              # 4GB 小机器上别开一堆 shell
 # 单个会话的输出缓冲上限。
 # 过去完全无上限：在终端里跑 `yes`、`journalctl -f`、或者任何持续打印的程序，
 # 然后浏览器不读（或标签卡住），读线程会一直往 bytearray 里堆 ——

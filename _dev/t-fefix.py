@@ -136,5 +136,86 @@ chk('snapshot 单元有内存闸（三处同步）',
 chk('dhcp_release 已登记 DEPS（可选）',
     "'dhcp_release', False," in HELPER)
 
+print('--- 12. 守护模块顶层「先用后定义」扫描 ---')
+# v1.0.5 事故：往 drouter-shelld.py 顶部插 MAX_BUF 块时把 MAX_SESSIONS = 8
+# 顶掉了，AST 抽片段的测试全绿，真机一启动就 NameError 崩溃。
+# 这里按模块顶层语句顺序模拟执行：任何 Load 的名字必须已在前面赋过值
+# （不进入函数/类/Lambda 体 —— 函数内的前向引用是合法的）。
+import ast as _ast
+import builtins as _builtins
+
+
+def _top_level_names(stmt):
+    """本语句内（不下降进函数/类/Lambda 体）所有 Load 的名字。
+    推导式变量有自己的作用域，先收集再剔除，否则 `[f(s) for s in x]`
+    会被误报成「s 先用后定义」。"""
+    loads = []
+    comp_vars = set()
+
+    class V(_ast.NodeVisitor):
+        def visit_Name(self, n):
+            if isinstance(n.ctx, _ast.Load):
+                loads.append(n.id)
+        def visit_FunctionDef(self, n):
+            pass          # 不进入函数体
+        def visit_AsyncFunctionDef(self, n):
+            pass
+        def visit_ClassDef(self, n):
+            for d in n.decorator_list:
+                self.visit(d)
+            for b in n.bases:
+                self.visit(b)
+        def visit_Lambda(self, n):
+            pass
+        def _comp(self, n):
+            for g in n.generators:
+                for t in _ast.walk(g.target):
+                    if isinstance(t, _ast.Name):
+                        comp_vars.add(t.id)
+            self.generic_visit(n)
+        visit_ListComp = _comp
+        visit_SetComp = _comp
+        visit_DictComp = _comp
+        visit_GeneratorExp = _comp
+    V().visit(stmt)
+    return [x for x in loads if x not in comp_vars]
+
+
+def _assigned_names(stmt):
+    """本语句顶层（含 if/try/for 等块内，乐观视为已定义）赋出的名字。"""
+    out = []
+    class V(_ast.NodeVisitor):
+        def visit_FunctionDef(self, n):
+            out.append(n.name)
+        def visit_AsyncFunctionDef(self, n):
+            out.append(n.name)
+        def visit_ClassDef(self, n):
+            out.append(n.name)
+        def visit_Import(self, n):
+            out.extend((a.asname or a.name).split('.')[0] for a in n.names)
+        def visit_ImportFrom(self, n):
+            out.extend(a.asname or a.name for a in n.names)
+        def visit_Name(self, n):
+            if isinstance(n.ctx, (_ast.Store, _ast.Del)):
+                out.append(n.id)
+    V().visit(stmt)
+    return out
+
+
+_BUILTINS = set(dir(_builtins)) | {'__name__', '__file__', '__doc__'}
+for rel in ('backend/drouter-shelld.py', 'backend/drouter-web.py',
+            'backend/drouter-helpd.py', 'backend/drouter-logd.py',
+            'backend/drouter-snapshotd.py', 'backend/drouter-rescue.py',
+            'backend/drouter-helper.py'):
+    tree = _ast.parse(read(rel), rel)
+    defined = set(_BUILTINS)
+    bad = []
+    for stmt in tree.body:
+        for nm in _top_level_names(stmt):
+            if nm not in defined and nm not in bad:
+                bad.append(nm)
+        defined.update(_assigned_names(stmt))
+    chk('%s 顶层无先用后定义' % rel.split('/')[-1], not bad, '→ %s' % bad)
+
 print('\n结果: %s' % ('全部通过' if fails == 0 else '%d 项失败' % fails))
 sys.exit(1 if fails else 0)
