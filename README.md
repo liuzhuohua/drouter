@@ -535,7 +535,7 @@ drouter-1.0.6-offline-amd64/
 </details>
 
 **想要更小的包？** 如果你的目标机有网（哪怕是内网自建 apt 镜像），
-可以只拿 `drouter_1.0.6_all.deb`（约 452 KB），见下方「方式二」。
+可以只拿 `drouter_1.0.6_all.deb`（约 453 KB），见下方「方式二」。
 
 **已经装过依赖、只想升级本体？** 同样只用那个 445 KB 的 `.deb`
 `dpkg -i` 覆盖安装即可，不必重新走离线包。
@@ -618,7 +618,7 @@ docker run -d --name drouter --restart unless-stopped \
 git clone https://github.com/liuzhuohua/drouter.git
 cd drouter
 
-# 本体 deb（→ dist/drouter_1.0.6_all.deb，约 452 KB）
+# 本体 deb（→ dist/drouter_1.0.6_all.deb，约 453 KB）
 bash packaging/build-deb.sh 1.0.6
 
 # 离线依赖库（→ dist/offline-deps/，236 个 .deb + Packages 索引）
