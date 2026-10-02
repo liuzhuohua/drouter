@@ -1204,8 +1204,12 @@ class Api:
             if not self.auth():
                 return
             b = self.body()
+            # 前端逐项「安装」发的是 keys；只认 only 会把 keys 丢掉，
+            # helper 收到空列表就走「只装必需项」分支——必需项全齐时
+            # 直接返回「无需操作」，用户点了安装却什么都没装（1.0.5 实测 bug）。
+            keys = b.get('keys') or b.get('only') or []
             return self.json(self.helper('depcheck', {'op': 'install',
-                                                      'only': b.get('only') or []},
+                                                      'only': keys},
                                          timeout=900))
         if p == '/api/deps/log' and method == 'GET':
             if not self.auth():

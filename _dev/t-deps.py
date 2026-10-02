@@ -561,9 +561,34 @@ def check_atomic_write():
     return n
 
 
+def check_install_keys_forward():
+    """web 层必须把逐项安装的 keys 透传给 helper。
+
+    1.0.5 实测 bug：前端 runDepInstall 发的是 {keys: [...]}，
+    而 drouter-web.py 只读 b.get('only') —— keys 被静默丢掉后
+    helper 走「只装必需项」分支，必需项全齐时直接返回「无需操作」，
+    用户点任何一个可选项的「安装」都只弹出「全部依赖已安装完成」，
+    实际上一个包都没装。
+    """
+    web = io.open(os.path.join(BACKEND, 'drouter-web.py'), encoding='utf-8').read()
+    app = io.open(os.path.join(ROOT, 'web', 'app.js'), encoding='utf-8').read()
+
+    print('\n---- 依赖安装 keys 透传 ----')
+    n = 0
+    seg_i = web.find("if p == '/api/deps/install'")
+    seg = web[seg_i:seg_i + 800] if seg_i >= 0 else ''
+    n += t('web 层读取前端发来的 keys 字段', "b.get('keys')" in seg)
+    n += t('keys 透传给 helper（only 参数）', "'only': keys" in seg)
+    n += t('前端单项安装确实发 keys', "const body = one ? { keys: keys }" in app)
+    n += t('helper 兼容 keys / only 两种写法',
+           "p.get('keys') or p.get('only')"
+           in io.open(os.path.join(BACKEND, 'drouter-helper.py'), encoding='utf-8').read())
+    return n
+
+
 if __name__ == '__main__':
     main()
-    extra_fail = check_pkg_names() + check_atomic_write()
+    extra_fail = check_pkg_names() + check_atomic_write() + check_install_keys_forward()
     total = sum(_EXTRA_FAIL) + extra_fail
     if total:
         print('\n总失败 %d 项' % total)

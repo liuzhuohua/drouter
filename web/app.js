@@ -5921,7 +5921,6 @@ async function runDepInstall(keys) {
   const body = one ? { keys: keys } : { keys: DEP_REQ_MISSING };
   const r = await api('/api/deps/install', { method: 'POST', body: body });
   if (!one && btn) { btn.disabled = false; btn.textContent = '一键安装缺失的必需项'; }
-  btn.disabled = false; btn.textContent = '一键安装缺失项';
   const box = $('#dep-result');
   const d = r.data || {};
   if (d.log) {
