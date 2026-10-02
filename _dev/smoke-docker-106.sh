@@ -29,6 +29,20 @@ ck() {  # ck <描述> <期望正则> <实际输出>
   fi
 }
 
+ckc() {  # ckc <描述> <期望命中次数> <实际命中次数>
+  # 专用于「grep -c 的数字」型断言。反向断言（期望 0 次）用这个，
+  # 不要拿数字去 ck 里匹配 —— 那是在问「数字里含不含这段代码」，
+  # 恒为假，1.0.6 首次冒烟的 5 个红全是栽在这里。
+  local desc="$1" want="$2" got="$3"
+  if [ "$got" = "$want" ]; then
+    echo "  ✔ $desc（$got）"; pass=$((pass+1))
+  else
+    echo "  ✘ $desc"
+    echo "     期望命中: $want 次，实际: $got"
+    fail=$((fail+1))
+  fi
+}
+
 cleanup() {
   $PODMAN rm -f "$NAME" >/dev/null 2>&1 && echo "  容器已删除"
   # podman 用 netavark 驱动，跑过一次容器就会在宿主留下 `table inet netavark`
@@ -159,22 +173,34 @@ ck "脚本把运营商 DNS 写向 dnsmasq 的 resolv-file" \
 # 在容器内等于什么都不做（DNS 文件更新了但 dnsmasq 仍用旧上游）。
 ck "无 systemd 时回退 SIGHUP 重载 dnsmasq" \
    'kill -HUP .*pidof dnsmasq' "$($PODMAN exec "$NAME" cat "$SYNC" 2>&1)"
-# render_ppp 写的路径必须与实际安装位置一致，否则 pppd 静默拿不到 DNS
+# render_ppp 写的路径必须与实际安装位置一致，否则 pppd 静默拿不到 DNS。
+# -A60 而不是小窗口：ip-up-script 距 def 行有 46 行（docstring + 5 行解释
+# 为什么要这个钩子），窗口窄了正好切在它前面，断言恒假。
 ck "render_ppp 的 ip-up-script 路径与安装位置一致" \
    'ip-up-script /opt/drouter/scripts/sync-isp-dns\.sh' \
-   "$($PODMAN exec "$NAME" grep -A8 'def render_ppp' /opt/drouter/backend/render.py 2>&1)"
+   "$($PODMAN exec "$NAME" grep -A60 'def render_ppp' /opt/drouter/backend/render.py 2>&1)"
+# 反向断言：不能再有指向 bin/ 的旧路径（那是不存在的位置）
+ckc "render_ppp 不再指向不存在的 bin/ 路径" 0 \
+    "$($PODMAN exec "$NAME" grep -c 'ip-up-script /opt/drouter/bin/' /opt/drouter/backend/render.py 2>&1)"
 
 echo
 echo "=== 11. backend 关键修复在镜像里（1.0.6）==="
-# 抽查三处最容易「打包漏掉」的地方：rescue token、SNMP 净化、静态租约字段名
+# 抽查几处最容易「打包漏掉」的地方：rescue token、SNMP 净化、静态租约字段名。
+# 注意用「内容匹配」而不是 grep -c 的数字 —— 数字拿去 ck 匹配代码文本
+# 是把「命中了几个」当成了「命中了什么」，恒失败（1.0.6 首次冒烟栽在这）。
 ck "rescue 服务端有令牌校验" '_token_ok' \
-   "$($PODMAN exec "$NAME" grep -c '_token_ok' /opt/drouter/backend/drouter-rescue.py 2>&1)"
-ck "SNMP 三个字段过滤换行" "re\.sub\(r'\[\\\\r\\\\n\]', ' '" \
-   "$($PODMAN exec "$NAME" grep -A6 "for k in ('contact', 'location', 'sysname')" /opt/drouter/backend/drouter-helper.py 2>&1)"
-ck "静态租约写 enabled+name" "'enabled': True" \
-   "$($PODMAN exec "$NAME" grep -c "'enabled': True, 'mac': mac" /opt/drouter/backend/drouter-helper.py 2>&1)"
+   "$($PODMAN exec "$NAME" grep '_token_ok' /opt/drouter/backend/drouter-rescue.py 2>&1 | head -2)"
+# 只断言「净化那几行在」，不硬写正则字面量：ck 内部走 grep -E，
+# `[\r\n]` 这类字符类再经一层 shell 转义后极易对不上（1.0.6 首次冒烟栽过）。
+# 真正要防的是「三个字段只有截长度、不过滤控制字符」，用净化后的特征串断言。
+ck "SNMP 三个字段过滤换行" "re\.sub\(r, ' ', str\(s\[k\]\)\)|replace\('#', ' '\)" \
+   "$($PODMAN exec "$NAME" grep -A10 "for k in ('contact', 'location', 'sysname')" /opt/drouter/backend/drouter-helper.py 2>&1)"
+ck "静态租约写 enabled+name" "'enabled': True, 'mac': mac" \
+   "$($PODMAN exec "$NAME" grep "'enabled': True, 'mac': mac" /opt/drouter/backend/drouter-helper.py 2>&1 | head -2)"
 ck "readings 不再遮蔽 POST 写分支" '_has_post_branch' \
-   "$($PODMAN exec "$NAME" grep -c '_has_post_branch' /opt/drouter/backend/drouter-web.py 2>&1)"
+   "$($PODMAN exec "$NAME" grep '_has_post_branch' /opt/drouter/backend/drouter-web.py 2>&1 | head -2)"
+ckc "sync-isp-dns.sh 写盘失败非零退出（不能静默 rc=0）" 2 \
+    "$($PODMAN exec "$NAME" grep -c 'exit 1' /opt/drouter/scripts/sync-isp-dns.sh 2>&1)"
 
 echo
 echo "================================================"
