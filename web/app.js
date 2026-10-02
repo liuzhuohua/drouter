@@ -55,14 +55,41 @@ async function api(path, opts = {}) {
     res = await fetch(path, Object.assign({ method: opts.method || 'GET' }, opts,
       { headers, body: opts.body ? JSON.stringify(opts.body) : undefined }));
   } catch (e) {
-    return { ok: false, code: 'NET', msg_cn: '无法连接到路由器管理服务：' + e.message };
+    // 浏览器抛的是原生英文异常（Failed to fetch / NetworkError 等），
+    // 直接拼进 msg_cn 会让界面中英混杂。按 message 归类成可读的中文原因，
+    // 原始串只放进 detail（排错时看得到，又不会污染主提示）。
+    const why = netErrCn(e && e.message);
+    return { ok: false, code: 'NET', msg_cn: why, detail: String((e && e.message) || e) };
   }
   if (res.status === 401) {
     logout(true);
     return { ok: false, code: 'UNAUTH', msg_cn: '登录已过期，请重新登录' };
   }
   try { return await res.json(); }
-  catch (e) { return { ok: false, code: 'PARSE', msg_cn: '服务返回数据异常' }; }
+  catch (e) {
+    return { ok: false, code: 'PARSE',
+             msg_cn: `服务返回的不是合法 JSON（HTTP ${res.status}），` +
+                     '请确认管理后台进程正常',
+             detail: String((e && e.message) || e) };
+  }
+}
+
+/* 把浏览器原生的 fetch 异常翻译成中文原因。
+   只按 message 里的关键词归类 —— 拿不到具体原因时给通用说法，
+   宁可笼统也不要让英文串漏到界面上。 */
+function netErrCn(raw) {
+  const s = String(raw || '');
+  if (/abort/i.test(s)) return '请求被中断，可能是在页面切换时自动取消';
+  if (/timeout|timed out/i.test(s)) return '连接路由器管理服务超时，请检查网络或稍后重试';
+  if (/certificate|ssl|tls/i.test(s))
+    return '与路由器管理服务的 HTTPS 证书协商失败，请确认访问的是正确地址';
+  if (/permission|denied/i.test(s)) return '浏览器拒绝了该请求，请检查权限设置';
+  if (/resolve|dns|name/i.test(s))
+    return '无法解析路由器管理服务的地址，请确认 IP 或域名是否正确';
+  if (/refused/i.test(s)) return '连接被拒绝，路由器管理服务可能未在运行';
+  if (/network|failed|fetch/i.test(s))
+    return '无法连接到路由器管理服务，请确认地址可达、服务未停止';
+  return '无法连接到路由器管理服务';
 }
 
 function setActionMsg(msg, kind = '') {
@@ -402,11 +429,14 @@ function go(k) {
     .catch(e => {
       if (navStale(gen)) return;      // 已经切走，错误面板不该盖在新页面上
       const el = $('#view');
+      // 原始异常（多半是英文）放小字footnote 供排错，主提示给中文。
+      const raw = String((e && e.message) || e);
       if (el) el.innerHTML = `<div class="card" style="border-color:var(--err)">
         <h3 style="color:var(--err)">页面渲染失败</h3>
-        <p class="desc">${esc(e && e.message || String(e))}</p>
-        <p class="desc">可点击右上角「刷新」重试，或查看「日志」页排查。</p></div>`;
-      toast('页面渲染失败：' + (e && e.message || e), 'err', 6000);
+        <p class="desc">这一页在渲染时出错了，其余页面不受影响。</p>
+        <p class="desc">可点击右上角「刷新」重试，或到「日志」页查看详细信息。</p>
+        <p class="desc" style="font-family:var(--mono);font-size:12px;opacity:.7">技术细节：${esc(raw)}</p></div>`;
+      toast('页面渲染失败，请点右上角「刷新」重试', 'err', 6000);
     });
 }
 
@@ -7037,7 +7067,7 @@ async function fmDownload(path) {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob); a.download = name; a.click();
     URL.revokeObjectURL(a.href);
-  } catch (e) { toast('下载失败：' + e.message, 'err'); }
+  } catch (e) { toast('下载失败：' + netErrCn(e && e.message), 'err'); }
 }
 
 async function fmZip(paths) {
@@ -7646,7 +7676,7 @@ async function listSnapshots() {
       document.body.appendChild(a); a.click(); document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(url), 5000);
       toast('已开始下载快照 ' + ts, 'ok');
-    } catch (e) { toast('下载失败：' + e.message, 'err', 6000); }
+    } catch (e) { toast('下载失败：' + netErrCn(e && e.message), 'err', 6000); }
   });
   $$('[data-rb]').forEach(b => b.onclick = () => modal('确认回滚',
     `<p>将把配置整体恢复到快照 <b class="mono">${esc(b.dataset.rb)}</b> 的状态。</p>
@@ -8257,7 +8287,7 @@ function tmDownloadB64(b64, filename) {
     setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1500);
     return true;
   } catch (e) {
-    toast('下载失败：' + e.message, 'err');
+    toast('下载失败：' + netErrCn(e && e.message), 'err');
     return false;
   }
 }
@@ -8283,7 +8313,7 @@ async function tmUpload(file) {
     });
     b64 = String(dataUrl).split(',')[1] || '';
   } catch (e) {
-    show('bad', '文件读取失败：' + esc(e.message)); return;
+    show('bad', '文件读取失败：' + esc(netErrCn(e && e.message))); return;
   }
   const r = await api('/api/theme/op', { method: 'POST', body: { op: 'import', b64 } });
   if (!r.ok) {
@@ -8971,7 +9001,7 @@ async function loadAll() {
       api('/api/ifaces'), api('/api/buildmode', { method: 'GET' }),
       api('/api/webport')]);
   } catch (e) {
-    cfg = si = svc = ifc = bm = wp = { ok: false, msg_cn: '加载失败：' + e.message };
+    cfg = si = svc = ifc = bm = wp = { ok: false, msg_cn: '加载失败：' + netErrCn(e && e.message) };
   }
   if (cfg.ok) S.cfg = cfg.data || {};
   if (bm && bm.ok) S.buildMode = !!((bm.data || {}).enabled);
@@ -9008,7 +9038,7 @@ function boot() {
     // 鉴权失效已在 loadAll 内处理（打回登录页）；其余错误给出可见提示，避免卡在「正在载入…」
     if (e && e.message === 'UNAUTH') return;
     go('dash');
-    toast('初始化未完全成功，部分数据可能未加载：' + (e && e.message || e), 'warn');
+    toast('初始化未完全成功，部分数据可能未加载：' + netErrCn(e && e.message), 'warn');
   });
   // 轻量心跳：仅用于检测后端是否在线（顶栏不再展示内存，避免与概览重复）
   // boot() 在每次登录成功后都会执行：不先清掉上一个，重登录一次就多一个心跳
@@ -11279,7 +11309,7 @@ function ulDownload(text, filename) {  try {
     document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 4000);
   } catch (e) {
-    toast('导出失败：' + e.message, 'err');
+    toast('导出失败：' + netErrCn(e && e.message), 'err');
   }
 }
 

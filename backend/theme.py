@@ -406,8 +406,15 @@ def ensure_contrast(fg, bg, target=4.5):
     return ('#ffffff' if to_white else '#000000')
 
 
-def make_palette(primary, dark=False, name='自定义主题', desc='由主题设计器生成'):
-    """由单一主色生成一套完整、可用的配色方案（保证对比度不会太离谱）。"""
+def make_palette(primary, dark=False, name='自定义主题', desc='由主题设计器生成',
+                 deep=None):
+    """由单一主色生成一套完整、可用的配色方案（保证对比度不会太离谱）。
+
+    deep：可选的深色底色。仅在 dark=True 时生效 —— 用来让多个深色主题
+    彼此拉开辨识度（否则每个 dark 主题都共用同一套 #111827 底色，
+    换个主色后整体观感几乎一样）。给了就用它派生出整套背景层次，
+    文字色仍按原逻辑校正对比度。
+    """
     p = primary if _RE_HEX_STRICT.match(str(primary or '')) else '#1f6feb'
     if dark:
         # 深色主题里 pri-l 用作「选中项浅底」，应当是主色的深色微透明感的版本，
@@ -417,17 +424,29 @@ def make_palette(primary, dark=False, name='自定义主题', desc='由主题设
         pri_l = tone(p, 0.86)
     pri_d = tone(p, -0.18)
     if dark:
-        bg = '#111827'
-        bg2 = '#1a2437'
-        panel = '#161f30'
-        panel2 = '#1b2537'
-        line = '#26314a'
-        line2 = '#1f2a3f'
+        # deep 给的是「页面背景」这一档，其余层次由它按同一方向递进：
+        # bg2 更亮一档做悬停，panel 介于两者之间做卡片，panel2 再亮一档做表头。
+        b0 = deep if (_RE_HEX_STRICT.match(str(deep or ''))) else '#111827'
+        bg = b0
+        bg2 = tone(b0, 0.07)
+        panel = tone(b0, 0.035)
+        panel2 = tone(b0, 0.075)
+        line = tone(b0, 0.16)
+        line2 = tone(b0, 0.115)
         txt = '#e8eef8'
         txt2 = '#a8b6cc'
         txt3 = '#7b8aa3'
         ok, warn, err, info = '#3ddc84', '#f5c451', '#ff6b5e', '#4fb8f0'
-        ok_l, warn_l, err_l, info_l = '#12301f', '#3a2f10', '#3a1a17', '#0f2a3b'
+        # 浅底跟着 b0 走：状态标签底色要在该主题的深蓝上调，
+        # 沿用通用深绿/深红那一组会与藏青底割裂。
+        # 关键：四档必须**互不相同**且能彼此区分 —— 早先只用「提亮 3~5%」派生，
+        # ok_l 与 err_l 算出来是同一个值，成功/失败标签底色撞在一起，
+        # 状态只剩字色可辨。这里改为「提亮 + 向各自状态色偏」双通道，
+        # 幅度仍压得很低（不抢面板），但色相分开。
+        def _tint(c, k=0.16):
+            return mix(mix(b0, c, k), '#ffffff', 0.035)
+        ok_l, warn_l, err_l, info_l = (_tint(ok), _tint(warn),
+                                        _tint(err), _tint(info))
     else:
         bg = mix(p, '#ffffff', 0.945)
         bg2 = mix(p, '#ffffff', 0.905)
@@ -505,6 +524,26 @@ def builtin_themes():
 
     t = make_palette('#e11d48', True, '暗夜绯红', '深色 + 绯红点缀')
     t['id'] = 'dark-rose'
+    t['builtin'] = True
+    out.append(t)
+
+    # 电光蓝：亮青蓝（#00b3ff）饱和度高、发光感强。浅色底上 #00b3ff 本身
+    # 对比度偏低，make_palette 里的 ensure_contrast 会把 --pri-text 自动压深，
+    # 保证选中项文字、链接仍然清晰 —— 主色本身仍保留亮蓝用于填充与渐变。
+    t = make_palette('#00b3ff', False, '电光蓝',
+                     '高饱和青蓝，带发光质感，适合看清状态灯与图表')
+    t['id'] = 'electric-blue'
+    t['builtin'] = True
+    out.append(t)
+
+    # 藏青色：深蓝近黑的背景，介于「暗夜墨绿」的绿与「暗夜绯红」的红之间，
+    # 是长时间盯盘最不刺眼的一档；主色用偏亮的钴蓝做点缀，保证可读。
+    # deep 给了独立的深蓝底（#0b1220 → #101a33 这一带），
+    # 否则会和其他 dark 主题共用 #111827，换主色后整体观感几乎一样。
+    t = make_palette('#3b6fd4', True, '藏青色',
+                     '深蓝近黑，护眼低眩光，适合夜间与长时间值守',
+                     deep='#0d1526')
+    t['id'] = 'navy'
     t['builtin'] = True
     out.append(t)
 

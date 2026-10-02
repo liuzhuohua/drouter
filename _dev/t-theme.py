@@ -18,6 +18,7 @@ theme.py 纯逻辑回归测试（不需要目标机、不需要数据库、不�
 import sys
 import os
 import io
+import re
 import json
 import base64
 import zipfile
@@ -300,7 +301,9 @@ has('tone 提亮', theme.tone('#808080', .5) != '#808080')
 
 # 内置主题
 bt = theme.builtin_themes()
-has('内置主题 6 个', len(bt) == 6, len(bt))
+# 不写死个数：加内置主题时这条断言不该红（1.0.6 加电光蓝/藏青时就红过一次）。
+# 真正要守的是「id 唯一、每个都合法、变量齐全」，下面逐项查。
+has('内置主题非空', len(bt) >= 1, len(bt))
 ids = [x['id'] for x in bt]
 has('内置 id 唯一', len(set(ids)) == len(ids))
 has('含 default', 'default' in ids)
@@ -309,6 +312,10 @@ for x in bt:
     has('内置主题 %s 自身合法' % x['id'], ok_, why)
     has('内置主题 %s 全部变量' % x['id'], len(x['vars']) == len(theme.THEME_VARS))
     has('内置主题 %s builtin 标记' % x['id'], x['builtin'] is True)
+    # 四档状态浅底必须互不相同：曾用「同一系数提亮」派生，ok_l 与 err_l
+    # 算出来一模一样，成功/失败标签底色撞车，状态只剩字色可辨。
+    _sl = [x['vars'].get(k) for k in ('--ok-l', '--warn-l', '--err-l', '--info-l')]
+    has('内置主题 %s 四档状态浅底互不相同' % x['id'], len(set(_sl)) == 4, _sl)
 
 # ==================================================================
 print('== 7. ZIP 打包 → 解包往返 ==')
@@ -537,7 +544,7 @@ has('contrast 同色=1', abs(theme.contrast('#808080', '#808080') - 1) < 0.01)
 print('== 11c. 内置主题也必须达标（硬编码 vars 不走 make_palette 兜底）==')
 # ==================================================================
 _builtins = theme.builtin_themes()
-has('内置主题 6 个', len(_builtins) == 6, len(_builtins))
+has('内置主题非空', len(_builtins) >= 1, len(_builtins))
 for _t in _builtins:
     _v = _t['vars']
     for _lb, _fg, _b, _need in [
@@ -613,6 +620,44 @@ for _label, _meta, _needle in _META_ATTACKS:
     has('%s → 攻击串留在注释内' % _label, _needle not in _eff, _eff[:80])
     has('%s → 有效结构仍然完好' % _label,
         '--pri:#111' in _eff and 'color-scheme:light' in _eff, _eff[:80])
+
+# ==================================================================
+print('== 13. 1.0.6 新增预设：电光蓝 / 藏青色 ==')
+# 走一遍真实使用路径：make_palette 出的配色必须过 validate_theme，
+# 并且关键文字对比度达标 —— 这两个是「给人长时间盯着看」的配色。
+# ==================================================================
+_bt = {x['id']: x for x in theme.builtin_themes()}
+has('含 electric-blue', 'electric-blue' in _bt, sorted(_bt))
+has('含 navy', 'navy' in _bt, sorted(_bt))
+for _tid, _is_dark, _pri in (('electric-blue', False, '#00b3ff'),
+                             ('navy', True, '#3b6fd4')):
+    if _tid not in _bt:
+        continue
+    _t = _bt[_tid]
+    has('%s dark 标记正确' % _tid, _t['dark'] is _is_dark, _t['dark'])
+    has('%s 主色为 %s' % (_tid, _pri), _t['vars'].get('--pri') == _pri,
+        _t['vars'].get('--pri'))
+    has('%s 有中文名' % _tid, bool(re.search(r'[\u4e00-\u9fa5]', _t['name'])),
+        _t['name'])
+    has('%s 有中文描述' % _tid,
+        bool(re.search(r'[\u4e00-\u9fa5]', _t['description'])), _t['description'])
+    _v = _t['vars']
+    for _lb, _fg, _b, _need in [
+        ('正文/背景', '--txt', '--bg', 4.5),
+        ('正文/卡片', '--txt', '--panel', 4.5),
+        ('次要/背景', '--txt2', '--bg', 4.5),
+        ('弱化/背景', '--txt3', '--bg', 4.5),
+        ('主色文字/选中底', '--pri-text', '--pri-l', 4.5),
+    ]:
+        has('%s %s ≥ %.1f' % (_tid, _lb, _need),
+            theme.contrast(_v[_fg], _v[_b]) >= _need,
+            round(theme.contrast(_v[_fg], _v[_b]), 2))
+    # make_palette 的 deep 参数：两个深色主题的底色不能雷同
+    if _is_dark:
+        _others = [x['vars']['--bg'] for x in _bt.values()
+                   if x['dark'] and x['id'] != _tid]
+        has('%s 深色底不与其他深色主题雷同' % _tid,
+            _v['--bg'] not in _others, (_v['--bg'], _others))
 
 print()
 print('=' * 56)
