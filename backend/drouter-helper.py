@@ -11633,14 +11633,25 @@ def _bk_status():
 
 
 def _bk_list_entries():
-    """列出已存在的备份包（只认 .tar.gz 且文件名合法）。"""
+    """列出已存在的备份包（只认 .tar.gz 且文件名合法）。
+
+    ⚠️ 这里**必须调 _bk_safe_name()，不能再抄一份正则**。
+    早先这里是内联的正则，于是 10-03 修「导出后列表里看不到包」时
+    只改了 _bk_safe_name，这一处漏改 —— 结果变成：
+        create / restore / delete / inspect 认这个包（已修）
+        list 仍然不认（漏改）→ 界面永远显示 0 个包
+    一个 bug 抄两份，改一处修一半，另一处继续坏，而且**测试全绿**
+    （t-107 只查了 _bk_safe_name 自己）。
+
+    教训：**同一份正则只允许存在一份**，第二处必须是调用。
+    真要各写各的，就得让 t-107 断言「helper 里这个正则字面只出现一次」。
+    """
     d = backup_dir()
     out = []
     if not os.path.isdir(d):
         return out
     for name in sorted(os.listdir(d), reverse=True):
-        if not name.endswith('.tar.gz') or not re.match(
-                r'^drouter-backup-\d{8}-\d{6}(-[a-z0-9]+)?\.tar\.gz$', name):
+        if not name.endswith('.tar.gz') or _bk_safe_name(name) is None:
             continue
         full = os.path.join(d, name)
         try:
@@ -11695,6 +11706,14 @@ def _bk_create(p):
     total_bytes = 0
     try:
         with tarfile.open(tmp, 'w:gz') as tf:
+            # ⚠️ 跨组去重：_bk_files() 只对**根路径**去重，
+            # 展开后的文件没有。SNAPSHOT_ETC_FILES 里的 /etc/drouter/rescue.conf
+            # 与 SNAPSHOT_ETC_DIRS 展开出的 /etc/drouter/rescue.conf 会**各进一次**，
+            # 于是包内同一文件出现两条、file_count 虚高、体积白算一倍。
+            # 同一个 arcname 写两遍tar 也不报错，只是后者覆盖前者 ——
+            # 属于「静默重复」，不修的话 file_count 和 total_bytes 都不可信。
+            # 这里按 arcname 记住已写入的，归第一个出现的组。
+            seen_arc = set()
             for it in _bk_files(conf['include_sensitive']):
                 src = it['path']
                 pairs = _bk_walk(src,
@@ -11708,6 +11727,9 @@ def _bk_create(p):
                         missing.append({'path': src, 'why': '文件不存在'})
                     continue
                 for full, rel, sens in pairs:
+                    if rel in seen_arc:
+                        continue
+                    seen_arc.add(rel)
                     try:
                         st = os.stat(full)
                     except Exception as e:
@@ -11773,10 +11795,31 @@ def _bk_create(p):
 
 
 def _bk_safe_name(name):
-    """校验备份包文件名，杜绝 ../ 与绝对路径。"""
+    """校验备份包文件名，杜绝 ../ 与绝对路径。
+
+    ⚠️ 这个正则必须和 _bk_pack() 的命名规则**严格一致**：
+        命名：'drouter-backup-%s-%s.tar.gz' % (ts, host)
+        host ：re.sub(r'[^A-Za-z0-9_-]', '', hostname)[:24].lower()
+    早先这里写的是 `(-[a-z0-9]+)?`，比命名规则窄两处 ——
+    不认连字符（`-`）也不认下划线（`_`）。而 Debian 的默认主机名
+    恰恰是 `debian-primaryrouter`（带连字符），于是：
+        导出的包叫 drouter-backup-20261003-012754-debian-primaryrouter.tar.gz
+        而 list / delete / inspect / restore 全部过不了自己的校验 →
+        **导出的包在界面上根本看不到，也永远还原不了**，
+        用户只会看到「备份已导出」然后找不到它。
+    这个 bug 静态检查看不出来（t-107 的用例只用了无后缀的包名），
+    是真机验收打一次真接口才暴露的。
+
+    教训：**校验正则和生成规则必须同源，最好连成一处**。
+    这里的 charset 与长度都照命名那行抄；改一边必须改另一边。
+    """
     name = str(name or '').strip()
-    if not name or not re.match(
-            r'^drouter-backup-\d{8}-\d{6}(-[a-z0-9]+)?\.tar\.gz$', name):
+    # 长度上限照命名规则：'drouter-backup-' 14 + 8 + 1 + 6 + 1 + 24 + '.tar.gz' 7
+    # 主机名段是**可选**的（老包 / 手工改名的包可能没有），但 charset 与长度
+    # 必须和命名那行一致。
+    if not name or len(name) > 64 or not re.match(
+            r'^drouter-backup-\d{8}-\d{6}(?:-[a-z0-9_-]{1,24})?\.tar\.gz$',
+            name):
         return None
     return name
 
@@ -11917,6 +11960,16 @@ def _bk_inspect(p):
             row = {'path': '/' + rel, 'size': it.get('size', 0),
                    'group': it.get('group', ''),
                    'sensitive': bool(it.get('sensitive')),
+                   # ⚠️ sha256 **必须**从manifest 条目搬进 row。
+                   # 下面比对用的是 row.get('sha256')，早先这里没搬，
+                   # 于是恒为 None ≠ 实际哈希 → **每一个文件都被标成
+                   # 「已损坏」**，界面上 22 项全是红的，还原也被
+                   # 「内容与清单不符」挡住 —— 一个刚导出的新包立刻报损坏。
+                   # 教训和本轮另外两个 bug 同一个根：**数据要从来源
+                   # 一路带到使用点，中间任何一次「重新构造字典」都会
+                   # 悄悄丢字段**。所以比对要用 it.get('sha256')，
+                   # 这里搬一份只是为了让 row 自洽（前端也读它）。
+                   'sha256': it.get('sha256', ''),
                    'present': m is not None}
             if m is None:
                 row['state'] = '缺失'

@@ -1,18 +1,19 @@
 #!/bin/bash
 # 容器成品镜像冒烟（第二段）：登录 + Web 终端建会话 + 接口抽查
-# 1.0.6 本轮修的是「静默失效」类缺陷，容器形态同样要验：
-#   ① 容器里没有 systemd，终端守护仍能被拉起（_shelld_spawn 回退路径）
+# 1.0.7 本轮新增备份 / 告警 / 配额三个守护，容器形态同样要验：
+#   ① 容器里没有 systemd，三个新守护仍能被拉起（_shelld_spawn 同款回退路径）
 #   ② /dev/ptmx 存在，PTY 能开（信号量上限后新建会话要回 BUSY 而不是挂死）
 #   ③ 自签证书的 SAN 取自本机地址，不得再出现作者写死的内网 IP
 #      （1.0.4 修复；过去直接硬编码 192.168.7.3，任何机器上签出来都带着它）
-#   ④ 1.0.6 新增 sync-isp-dns.sh（PPPoE 上游 DNS 同步脚本）必须在镜像里
-#   ⑤ 1.0.6 修的 rescue token / SNMP 净化都在 backend，要能被 import
+#   ④ sync-isp-dns.sh（1.0.6 新增，PPPoE 上游 DNS 同步）必须在镜像里
+#   ⑤ rescue token / SNMP 净化（1.0.6 修）都在 backend，要能被 import
+#   ⑥ 本轮修的 7 个缺陷：备份敏感排除、VPN 私钥不外泄、ip_network 3.13 判定
 # 用 --network none：不碰宿主网络，只在容器内自测 127.0.0.1。
 set -u
 
-TAR=/tmp/drouter-106-final.tar
-NAME=drouter-smoke106
-IMG=drouter:1.0.6
+TAR=/tmp/drouter-107-final.tar
+NAME=drouter-smoke107
+IMG=drouter:1.0.7
 BASE=https://127.0.0.1:8443
 PODMAN="podman"
 
@@ -201,6 +202,48 @@ ck "readings 不再遮蔽 POST 写分支" '_has_post_branch' \
    "$($PODMAN exec "$NAME" grep '_has_post_branch' /opt/drouter/backend/drouter-web.py 2>&1 | head -2)"
 ckc "sync-isp-dns.sh 写盘失败非零退出（不能静默 rc=0）" 2 \
     "$($PODMAN exec "$NAME" grep -c 'exit 1' /opt/drouter/scripts/sync-isp-dns.sh 2>&1)"
+
+echo
+echo "=== 12. 1.0.7 三个新守护在镜像里且语法正确 ==="
+# 容器形态没有 systemd，守护不能只靠 systemctl。这里只验「文件在 + 能编译 +
+# 有不依赖 init 的拉起路径」，真跑起来要等 sync.sh 那轮真机验证。
+for d in backupd alertd quotad; do
+  ck "drouter-$d.py 存在" "drouter-$d\.py" \
+     "$($PODMAN exec "$NAME" ls /opt/drouter/backend/drouter-$d.py 2>&1)"
+  ckc "drouter-$d.py 语法正确" 0 \
+      "$($PODMAN exec "$NAME" python3 -c "import ast,sys;ast.parse(open(sys.argv[1],encoding='utf-8').read())" /opt/drouter/backend/drouter-$d.py 2>&1; echo $?)"
+  # 自启动回退：容器里没有 init，必须有 Popen / start_new_session 这类不依赖
+  # systemd 的路径，否则守护永远起不来（真机上 systemctl 是有的，容易漏）
+  ckc "drouter-$d.py 有不依赖 init 的拉起路径" 1 \
+      "$($PODMAN exec "$NAME" grep -cE 'Popen|start_new_session' /opt/drouter/backend/drouter-$d.py 2>&1)"
+done
+ck "三个新守护在 deploy.sh 里被安装" 'drouter-backupd\.py' \
+   "$($PODMAN exec "$NAME" grep -oE 'drouter-(backupd|alertd|quotad)\.py' /opt/drouter/scripts/deploy.sh 2>&1 | head -3)"
+# 三个都要在。上面那条 ck 只要求「至少含一个」—— 用计数把「漏装一个」钉死。
+ckc "deploy.sh 里三个新守护齐全" 3 \
+    "$($PODMAN exec "$NAME" grep -oE 'drouter-(backupd|alertd|quotad)\.py' /opt/drouter/scripts/deploy.sh 2>&1 | sort -u | wc -l | tr -d ' ')"
+
+echo
+echo "=== 13. 1.0.7 修的三个隐蔽缺陷在镜像里 ==="
+# ① 默认备份不再整目录排除 /etc/drouter
+ckc "备份不再整目录标敏感（sensitive=(d == ...) 已消失）" 0 \
+    "$($PODMAN exec "$NAME" grep -c "sensitive=(d == '/etc/drouter')" /opt/drouter/backend/drouter-helper.py 2>&1)"
+ck "备份有逐文件敏感判定" '_bk_is_sensitive' \
+   "$($PODMAN exec "$NAME" grep -c '_bk_is_sensitive' /opt/douter/backend/drouter-helper.py 2>&1 | head -1)"
+# ② VPN status 不再返回含私钥的 raw
+ckc "_vpn_status 不再返回 'raw': d" 0 \
+    "$($PODMAN exec "$NAME" grep -cE "'raw': d" /opt/douter/backend/drouter-helper.py 2>&1)"
+ck "_vpn_mask 仍在（脱敏没被一起删掉）" '_vpn_mask' \
+   "$($PODMAN exec "$NAME" grep -c '_vpn_mask' /opt/douter/backend/drouter-helper.py 2>&1 | head -1)"
+# ③ ip_network 成员判断必须用对象（3.13 回归）
+ck "ip_network 归属判断用对象" 'aobj not in net' \
+   "$($PODMAN exec "$NAME" grep -cE 'aobj not in net' /opt/drouter/backend/drouter-helper.py 2>&1)"
+# ④ wireguard 登记进 DEPS
+ck "DEPS 登记 wireguard-tools" "wireguard-tools" \
+   "$($PODMAN exec "$NAME" grep -c 'wireguard-tools' /opt/drouter/backend/drouter-helper.py 2>&1 | head -1)"
+# ⑤ Python 版本必须是 3.13 —— 本轮修的 ip_network 缺陷正是 3.13 才暴露的
+ck "镜像 Python 是 3.13（3.12 上这条断言无意义）" 'Python 3\.13' \
+   "$($PODMAN exec "$NAME" python3 -V 2>&1)"
 
 echo
 echo "================================================"

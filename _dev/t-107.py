@@ -453,11 +453,24 @@ try:
         '_bk_safe_name': _safe,
         'backup_dir': lambda: '/opt/drouter/backups'})
     OK_NAMES = ['drouter-backup-20261002-120000.tar.gz',
-                'drouter-backup-20261002-120000-debian.tar.gz']
+                'drouter-backup-20261002-120000-debian.tar.gz',
+                # ⚠️ 下面这两个是**真机踩出来的**（10-03）：Debian 默认主机名是
+                # debian-primaryrouter，带连字符；命名规则里 charset 是
+                # [A-Za-z0-9_-]，而校验正则当时只写 [a-z0-9] → 导出的包
+                # 自己过不了校验，**在列表里看不到、永远还原不了**。
+                # 我原来的用例只有 'debian'（无连字符），所以绿灯放过了这个坑。
+                # 教训：**用例要照真实世界的值造**，凭自己想当然的最简单值
+                # 恰恰是最容易漏掉真实形态的那种。
+                'drouter-backup-20261003-012754-debian-primaryrouter.tar.gz',
+                'drouter-backup-20261003-012754-my_router.tar.gz']
     BAD_NAMES = ['../../etc/shadow', '/etc/shadow', 'a/b.tar.gz',
                  '..', 'a\\b', 'drouter-backup-20261002-120000.tar.gz.part',
                  'drouter-backup-x.tar.gz', '', '   ',
-                 'drouter-backup-20261002-120000.tar.gz;rm -rf /']
+                 'drouter-backup-20261002-120000.tar.gz;rm -rf /',
+                 # 主机名段超长（命名规则截 24）+ 路径穿越型变体
+                 'drouter-backup-20261002-120000-' + 'a' * 40 + '.tar.gz',
+                 '../../drouter-backup-20261002-120000-x.tar.gz',
+                 'drouter-backup-20261002-120000-a/b.tar.gz']
     bad = []
     for n in OK_NAMES:
         if not _bk_path_of(n):
@@ -485,6 +498,92 @@ try:
             pass
     chk('commonpath 兜底仍在（即使文件名校验被改坏也不逃出备份目录）',
         not escaped, '逃逸了: %s' % escaped)
+
+    # 校验正则与命名规则必须**同源**。上面的用例只能覆盖我想到的名字；
+    # 真正防住这类 bug 的是这条：拿命名那行的 charset 去生成一个名字，
+    # 要求校验必须放行。任何一边改了 charset，另一边不改就会红。
+    try:
+        # ⚠️ 必须连 docstring 一起剥。code_only() 只去 # 注释，
+        # 而 _bk_safe_name 的 docstring 里**正文明写着一份旧正则**
+        # （举例子用的），不剥就会抽到那一份 → 断言永远红，
+        # 或者更糟：抽到旧的还「通过」，等于什么都没验。
+        _src = re.sub(r'""".*?"""', '', code_only(HELPER), flags=re.S)
+        m_pack = re.search(
+            r"name\s*=\s*'drouter-backup-%s-%s\.tar\.gz'", _src)
+        m_host = re.search(
+            r"host\s*=\s*re\.sub\(r'\[\^([A-Za-z0-9_-]+)\]'", _src)
+        m_len = re.search(r"host\s*=\s*host\[:(\d+)\]", _src)
+        m_safe = re.search(
+            r"r'\^drouter-backup-\\d\{8\}-\\d\{6\}\(\?:-"
+            r"\[([a-z0-9_.-]+)\]\{(\d+),(\d+)\}\)\?\\\.tar\\\.gz\$'", _src)
+        detail = []
+        if not (m_pack and m_host and m_len and m_safe):
+            detail.append('抽不到命名/校验规则（代码结构变了？）'
+                          ' pack=%s host=%s len=%s safe=%s'
+                          % (bool(m_pack), bool(m_host), bool(m_len),
+                             bool(m_safe)))
+        else:
+            pack_charset = m_host.group(1)
+            safe_charset = m_safe.group(1)
+            pack_len = int(m_len.group(1))
+            # ⚠️ 校验里是 {下限,上限} 两个数字：**上限**才是长度上限。
+            # 我第一版取了 group(2)（=1），于是「命名截 24 字符，校验只允许 1」
+            # 一片红 —— 断言自己算错，比没有断言更误导人。
+            # 教训：正则多分组时，先在注释里写清每个 group 是哪一段。
+            safe_min = int(m_safe.group(2))
+            safe_len = int(m_safe.group(3))
+            # 正则里写成 [a-z0-9_-] 而命名允许 [A-Za-z0-9_-] 时，
+            # 大写与连字符会漏。逐字符比较（大小写不敏感，
+            # 因为命名那行末尾 .lower() 了）。
+            miss = set(pack_charset.lower()) - set(safe_charset.lower())
+            if miss:
+                detail.append('命名允许 %s 但校验不认：%s'
+                              % (pack_charset, ''.join(sorted(miss))))
+            if pack_len > safe_len:
+                detail.append('命名截 %d 字符，校验只允许 %d'
+                              % (pack_len, safe_len))
+            # 下限也照看一眼：命名里 host 最少 1 个字符（空值会被 or 'router'
+            # 兜掉），所以校验下限必须 ≤1，否则「无主机名段」的老包
+            # 反而过不了 —— 和本轮那个 bug 是同一族的毛病。
+            if safe_min > 1:
+                detail.append('校验下限 {1,%d} >1，命名能生成更短的主机名段'
+                              % safe_len)
+        chk('备份包名校验规则与命名规则同源（charset + 长度）', not detail,
+            '；'.join(detail))
+    except Exception as e:
+        chk('备份包名校验规则与命名规则同源（charset + 长度）', False,
+            '抽取失败: %s' % e)
+
+    # ★ 这条是上一条的**根因防线**，也是本轮 10-03 踩得最贵的一课。
+    # 「导出的包在列表里看不到」这个 bug 我修了 _bk_safe_name 却漏了
+    # _bk_list_entries —— 因为那份正则**被抄了两份**，而我的测试只查
+    # 了其中一份，于是「单测全绿 + 端到端仍坏」。
+    #
+    # 规则：**备份包名那份正则字面，helper 里只允许存在一份**。
+    # 第二处必须是调用 _bk_safe_name()，不是抄一份。
+    # （连 docstring 一起数，所以要先剥 —— 见上面同一段 _src。）
+    try:
+        _dup = []
+        for _pat in (r'\^drouter-backup-\\d\{8\}',        # 校验正则行首
+                     r"drouter-backup-%s-%s\.tar\.gz"):    # 命名格式串
+            _hits = [m.start() for m in re.finditer(_pat, _src)]
+            if len(_hits) != 1:
+                _dup.append('%s 出现 %d 次（应恰好 1 次）'
+                            % (_pat.replace('\\', ''), len(_hits)))
+        # 顺手钉住「_bk_list_entries 必须调 _bk_safe_name」
+        # ⚠️ 这里不能用 code_only() 再喂给 ast.parse：code_only 逐行找
+        # 行尾 '  #'，docstring 里只要有一行以两个空格 + # 开头，
+        # 整个字符串就被截断 → 报 unterminated string literal。
+        # 先用**原始**源码让 ast 切出函数，再对结果剥 docstring。
+        _lst = re.sub(r'""".*?"""', '',
+                        py_func_src('_bk_list_entries'), flags=re.S)
+        if '_bk_safe_name' not in _lst:
+            _dup.append('_bk_list_entries 没调 _bk_safe_name（又抄了一份？）')
+        chk('备份包名正则在helper 里只有一份（列表不再自抄）', not _dup,
+            '；'.join(_dup))
+    except Exception as e:
+        chk('备份包名正则在helper 里只有一份（列表不再自抄）', False,
+            '检查失败: %s' % e)
 except Exception:
     import traceback
     chk('备份包路径校验能真跑起来', False, traceback.format_exc()[-600:])
@@ -583,6 +682,56 @@ chk('还原默认跳过本机身份文件（/etc/hostname、/etc/fstab）',
     '/etc/hostname' in bk_res and '/etc/fstab' in bk_res)
 chk('还原写前留 .drouter-restore-bak', '.drouter-restore-bak' in bk_res)
 chk('还原默认先校验 sha256（verify）', 'verify' in bk_res)
+
+# C1f. inspect 的 sha256 比对 —— 本轮 10-03 真机抓到的第 9 个真缺陷。
+# _bk_inspect 把 manifest 条目重建成 row（给前端用），却**没把 sha256
+# 搬进来**，下面又拿 row.get('sha256') 去比对实际哈希：
+#     实际哈希 != None  → 每个文件都判成「已损坏」
+# 表现是刚导出的新包，22 项全部标红，还原被「内容与清单不符」挡死。
+#
+# 判据不能只写 'sha256' in _bk_inspect（源码里明明有这个字符串，
+# 就是在**别的**行用的），必须钉住「比对用的是同一个来源」：
+#   - 比对侧必须出现 row/变量.get('sha256') 之外的 it.get('sha256')，或
+#   - 重建 row 时必须搬 sha256
+# 这里直接查源码结构 + 真跑一遍（有真 tar 才跑得动，缺 tar 就 SKIP）。
+_insp = py_func_src('_bk_inspect')
+chk('inspect 把 manifest 的 sha256 带进了 row（否则全部误判已损坏）',
+    re.search(r"'sha256'\s*:\s*it\.get\('sha256'", _insp) is not None,
+    '重建 row 时没有 it.get("sha256") —— 比对会拿 None 比，'
+    '每个文件都会被标成「已损坏」')
+chk('inspect 校验的是 row 里带来的 sha256（不是临时再取一次）',
+    re.search(r"h\s*!=\s*row\.get\('sha256'\)", _insp) is not None
+    and re.search(r"'sha256'\s*:\s*it\.get\('sha256'", _insp) is not None,
+    '比对侧与构造侧必须成对出现，缺一个就是全部误判')
+#还原侧用 it.get('sha256') 是**对的**（它没重建成row），
+# 但要钉住它别被一起改成 row.get() —— 那会把还原的校验也一起废掉。
+chk('还原侧比对的是 it.get(sha256)（它没重建 row，别跟着改坏）',
+    re.search(r"h\s*!=\s*it\.get\('sha256'\)", bk_res) is not None)
+
+# C1g. 包内同一文件不能进两次 —— 本轮 10-03 真机看到的第 10 个缺陷。
+# 根因是**清单本身就重叠**：
+#     SNAPSHOT_ETC_FILES 里有 /etc/drouter/rescue.conf
+#     SNAPSHOT_ETC_DIRS   里有 /etc/drouter（整目录，展开后也含它）
+# _bk_files() 只对根路径去重，展开后的文件跨组不去重 →
+# 同一个 arcname 写两遍 tar（后者覆盖前者，不报错），
+# 表现是 file_count / total_bytes 虚高一倍、inspect 里同一文件两行。
+# 修法是 _bk_create 里按 arcname 记 seen_arc。
+_bkc = py_func_src('_bk_create')
+chk('打包时按 arcname 跨组去重（同一文件不会进包两次）',
+    'seen_arc = set()' in _bkc
+    and re.search(r'if\s+rel\s+in\s+seen_arc:\s*\n\s*continue', _bkc)
+    is not None,
+    'SNAPSHOT_ETC_FILES 与 SNAPSHOT_ETC_DIRS 重叠（/etc/drouter/rescue.conf '
+    '两边都有），只在 _bk_files() 里去重根路径不够，必须在展开后去重')
+# 清单重叠是**允许**的（去重在 create 里做），但要钉住两份清单确实重叠，
+# 免得后人以为不重叠而删掉 create 里的 seen_arc。
+_ov = [f for f in re.findall(r"'(/etc/drouter/[^']+)'", HELPER)
+       if not f.endswith('/')]
+chk('备份清单里确有「文件 ⊂ 目录」的重叠项（去重不是白加的）',
+    bool(_ov) and '/etc/drouter' in HELPER,
+    'SNAPSHOT_ETC_FILES 与 SNAPSHOT_ETC_DIRS 若不再重叠，'
+    '_bk_create 里的 seen_arc 就成了死代码 —— 但留着也无害，'
+    '新加配置时随时可能再次重叠')
 
 # --- C2. 告警：冷却 / 免打扰 ---
 print()

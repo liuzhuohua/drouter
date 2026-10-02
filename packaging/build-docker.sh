@@ -10,7 +10,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-TAG="${1:-1.0.6}"
+TAG="${1:-1.0.7}"
 
 command -v docker >/dev/null 2>&1 || { echo "需要 docker"; exit 1; }
 
