@@ -330,49 +330,28 @@ SHD
 echo "Web 终端守护单元已就位"
 
 echo "=== 9. 生成 isp-dns 占位文件（dnsmasq resolv-file 引用）==="
-# 只在缺失时补占位。这个文件是 pppd 拨号成功后经 bin/sync-isp-dns.sh 写入的
-# 真实运营商 DNS；无条件覆盖会把已经拿到的 DNS 擦掉，在那之后 dnsmasq 的
-# 上游解析一直空着，直到下一次拨号才会恢复（表现为「重新部署后网页解析变慢」）。
+# 只在缺失时补占位。这个文件是 pppd 拨号成功后经
+# /opt/drouter/scripts/sync-isp-dns.sh 写入的真实运营商 DNS；无条件覆盖会把
+# 已经拿到的 DNS 擦掉，在那之后 dnsmasq 的上游解析一直空着，直到下一次拨号
+# 才会恢复（表现为「重新部署后网页解析变慢」）。
 # 容器版 docker-init.sh 同样是「缺失才写」。
+# 脚本本体不再用 heredoc 写进 $OPT/bin/：第 84 行的 install 已经把
+# scripts/*.sh 装到 $OPT/scripts/，而 deb / 镜像走的也是同一条规则 ——
+# 早先只有 deploy.sh 部署的机器才有这个文件。
 if [ ! -f /etc/drouter/generated/isp-dns.conf ]; then
 cat > /etc/drouter/generated/isp-dns.conf <<'ISP'
 # 由 drouter 自动维护：运营商 PPPoE 下发的 DNS
 # 拨号成功后由 pppd 的 usepeerdns 写入 /etc/ppp/resolv.conf，
-# 可执行 /opt/drouter/bin/sync-isp-dns.sh 将其同步到此处。
+# 可执行 /opt/drouter/scripts/sync-isp-dns.sh 将其同步到此处。
 ISP
 fi
-
-cat > $OPT/bin/sync-isp-dns.sh <<'SYNC'
-#!/bin/bash
-# 将 pppd 获取到的运营商 DNS 同步给 dnsmasq
-# 由 pppd 的 ip-up-script / ip-down-script 调用（见 render.py 的 render_ppp）。
-# 内容没变就不 reload：拨号/断线事件很频繁，每次都重启 dnsmasq 会把
-# DNS 缓存全清掉，表现为「网页时快时慢」。
-SRC=/etc/ppp/resolv.conf
-DST=/etc/drouter/generated/isp-dns.conf
-TMP=$DST.tmp.$$
-{
-  echo "# 由 drouter 自动生成：运营商下发 DNS（来源 $SRC）"
-  if [ -f "$SRC" ]; then
-    grep -E '^nameserver' "$SRC" || echo "# 尚未获取到运营商 DNS"
-  else
-    echo "# $SRC 不存在（尚未拨号成功）"
-  fi
-} > "$TMP"
-# 归一化注释行后再比较，避免「只有时间戳/注释差异」被当成变化
-if [ -f "$DST" ] && diff -q <(grep -v '^#' "$DST") <(grep -v '^#' "$TMP") >/dev/null 2>&1; then
-  rm -f "$TMP"
-  exit 0
+# 存量占位文件里可能还留着旧路径（bin/），只换注释行、不碰 nameserver：
+# 用户已经拿到的运营商 DNS 不能被部署动作擦掉。
+if [ -f /etc/drouter/generated/isp-dns.conf ] \
+   && grep -qs 'bin/sync-isp-dns.sh' /etc/drouter/generated/isp-dns.conf; then
+  sed -i 's#bin/sync-isp-dns\.sh#scripts/sync-isp-dns.sh#' \
+    /etc/drouter/generated/isp-dns.conf
 fi
-mv -f "$TMP" "$DST"
-chmod 644 "$DST"
-# DNS 模式为「仅运营商 / 两者合并」时 dnsmasq 依赖这个文件，必须重载
-if grep -qs 'resolv-file=/etc/drouter/generated/isp-dns.conf' /etc/dnsmasq.d/drouter.conf 2>/dev/null; then
-  systemctl reload dnsmasq 2>/dev/null || systemctl restart dnsmasq 2>/dev/null || true
-fi
-exit 0
-SYNC
-chmod +x $OPT/bin/sync-isp-dns.sh
 
 # 存量机器迁移：/etc/drouter/rescue.conf 旧版本写成了 0600 属主 root，
 # 以 drouter 身份运行的快照读不到它，一个文件就让整个 /etc/drouter 目录

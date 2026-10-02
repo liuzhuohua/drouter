@@ -124,6 +124,7 @@ RESCUE = read('backend/drouter-rescue.py')
 LOGD = read('backend/drouter-logd.py')
 SNAPD = read('backend/drouter-snapshotd.py')
 DEPLOY = read('scripts/deploy.sh')
+SYN = read('scripts/sync-isp-dns.sh')
 
 # ---------------------------------------------------------------- A
 print('--- A. 路由可达性 ---')
@@ -172,17 +173,41 @@ chk('静态绑定必须落在池内', re.search(r'静态|static', _dn) is not No
 
 _ppp = block(RENDER, 'def render_ppp', 200)
 chk('render_ppp 带 ip-up-script 钩子',
-    'ip-up-script /opt/drouter/bin/sync-isp-dns.sh' in _ppp)
+    'ip-up-script /opt/drouter/scripts/sync-isp-dns.sh' in _ppp)
 chk('render_ppp 带 ip-down-script 钩子',
-    'ip-down-script /opt/drouter/bin/sync-isp-dns.sh' in _ppp)
-chk('sync-isp-dns.sh 在 deploy.sh 里安装',
-    "cat > $OPT/bin/sync-isp-dns.sh" in DEPLOY)
-_syn = DEPLOY[DEPLOY.find("cat > $OPT/bin/sync-isp-dns.sh"):][:2400]
+    'ip-down-script /opt/drouter/scripts/sync-isp-dns.sh' in _ppp)
+# 1.0.6 打包校验时发现的真漏网：脚本原本由 deploy.sh 用 heredoc 写进
+# $OPT/bin/，而 deb / 镜像走的都是 `install scripts/*.sh` → $OPT/scripts/，
+# 于是装 deb、跑容器的机器上 ip-up-script 指向不存在的文件（PPPoE 断网
+# 修复等于没修）。现在脚本是 scripts/ 下的实体文件，三条路径共用一份。
+chk('sync-isp-dns.sh 不再由 deploy.sh heredoc 生成',
+    'cat > $OPT/bin/sync-isp-dns.sh' not in DEPLOY
+    and 'SYNC' not in DEPLOY.split('isp-dns 占位文件')[1][:900])
+chk('sync-isp-dns.sh 是 scripts/ 下的实体文件', 'generated/isp-dns.conf' in SYN)
+chk('deploy.sh 仍会安装 scripts/*.sh 到 $OPT/scripts/',
+    re.search(r'install -m 0755 "\$s" "\$OPT/scripts/', DEPLOY) is not None)
+chk('render_ppp 的路径与 install 目标目录一致（scripts/ 而非 bin/）',
+    '/opt/drouter/bin/sync-isp-dns.sh' not in RENDER)
+_syn = SYN
 chk('sync-isp-dns.sh 用 $TMP 比较后再 mv（避免无谓重启 dnsmasq）',
     'TMP=$DST.tmp.$$' in _syn and re.search(r'if \[ -f "\$DST" \] && diff', _syn) is not None
     and 'mv -f "$TMP" "$DST"' in _syn)
 chk('sync-isp-dns.sh 仅在 dnsmasq.conf 引用该文件时才重载',
-    re.search(r'if grep -qs .resolv-file=/etc/drouter/generated/isp-dns\.conf', _syn) is not None)
+    re.search(r'if grep -qs "resolv-file=\$DST"', _syn) is not None)
+# 容器形态没有 systemd，只有 systemctl reload 等于什么都不做
+chk('sync-isp-dns.sh 无 systemd 时回退 SIGHUP（容器形态）',
+    re.search(r'\[ -d /run/systemd/system \]', _syn) is not None
+    and re.search(r'kill -HUP "\$\(pidof dnsmasq\)"', _syn) is not None)
+# pppd 只看 ip-up-script 的退出码。写盘失败还 exit 0 的话，
+# 「DNS 没同步」这件事没有任何日志痕迹 —— 而此时 DNS 选「仅运营商/
+# 两者合并」，表现是全家断网且界面无异常（本轮主题：静默失效）。
+chk('sync-isp-dns.sh 写盘失败必须非零退出（不能静默 rc=0）',
+    re.search(r'\} > "\$TMP" \|\| \{ rm -f "\$TMP"; exit 1; \}', _syn) is not None
+    and re.search(r'mv -f "\$TMP" "\$DST" \|\| \{ rm -f "\$TMP"; exit 1; \}', _syn) is not None)
+chk('sync-isp-dns.sh 写前确保 generated 目录存在',
+    re.search(r'mkdir -p "\$\(dirname "\$DST"\)"', _syn) is not None)
+chk('deploy.sh 迁移存量占位文件里的旧路径（不碰 nameserver）',
+    re.search(r"sed -i 's#bin/sync-isp-dns", DEPLOY) is not None)
 
 _chk_local = re.search(r"local=/\{?([\w%{}.\-]*)", _dn)
 chk('dnsmasq local 域跟随用户域名', 'domain' in _dn and "local=/lan/" not in _dn)

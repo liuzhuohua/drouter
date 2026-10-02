@@ -1,16 +1,18 @@
 #!/bin/bash
 # 容器成品镜像冒烟（第二段）：登录 + Web 终端建会话 + 接口抽查
-# 1.0.5 本轮改动集中在 PTY 会话资源收口与守护加固，容器形态同样受影响 -> 回归 + 针对性验证：
+# 1.0.6 本轮修的是「静默失效」类缺陷，容器形态同样要验：
 #   ① 容器里没有 systemd，终端守护仍能被拉起（_shelld_spawn 回退路径）
 #   ② /dev/ptmx 存在，PTY 能开（信号量上限后新建会话要回 BUSY 而不是挂死）
 #   ③ 自签证书的 SAN 取自本机地址，不得再出现作者写死的内网 IP
 #      （1.0.4 修复；过去直接硬编码 192.168.7.3，任何机器上签出来都带着它）
+#   ④ 1.0.6 新增 sync-isp-dns.sh（PPPoE 上游 DNS 同步脚本）必须在镜像里
+#   ⑤ 1.0.6 修的 rescue token / SNMP 净化都在 backend，要能被 import
 # 用 --network none：不碰宿主网络，只在容器内自测 127.0.0.1。
 set -u
 
-TAR=/tmp/drouter-105-final.tar
-NAME=drouter-smoke105
-IMG=drouter:1.0.5
+TAR=/tmp/drouter-106-final.tar
+NAME=drouter-smoke106
+IMG=drouter:1.0.6
 BASE=https://127.0.0.1:8443
 PODMAN="podman"
 
@@ -124,7 +126,7 @@ for ep in sysinfo ifaces metrics; do
 done
 
 echo
-echo "=== 9. 自签证书 SAN（1.0.5：不得再写死作者内网 IP）==="
+echo "=== 9. 自签证书 SAN（不得再写死作者内网 IP）==="
 CERT=$($PODMAN exec "$NAME" sh -c 'C=$(ls /opt/drouter/certs/server.crt 2>/dev/null); [ -n "$C" ] || exit 1; openssl x509 -in "$C" -noout -text 2>/dev/null' 2>&1)
 if [ -n "$CERT" ]; then
   echo "  SAN: $(grep -A1 -i 'Subject Alternative Name' <<<"$CERT" | tail -1 | head -c 200)"
@@ -138,6 +140,41 @@ if [ -n "$CERT" ]; then
 else
   echo "  ✘ 读不到 /opt/drouter/certs/server.crt（$CERT）"; fail=$((fail+1))
 fi
+
+echo
+echo "=== 10. sync-isp-dns.sh 在镜像里且可执行（1.0.6 新增）==="
+# 1.0.6 修 PPPoE 断网：render_ppp 写 ip-up-script 指向这个脚本，
+# 缺了它 dns_mode=isp/both 时 dnsmasq 上游全空 —— 而 PPPoE 页看不出异常。
+# 路径必须是 scripts/：deb / 镜像 / deploy.sh 三条路都装到 $OPT/scripts/。
+SYNC=/opt/drouter/scripts/sync-isp-dns.sh
+if $PODMAN exec "$NAME" test -x "$SYNC"; then
+  echo "  ✔ 脚本在且可执行"; pass=$((pass+1))
+else
+  echo "  ✘ 缺失或不可执行：$($PODMAN exec "$NAME" ls -l "$SYNC" 2>&1)"
+  fail=$((fail+1))
+fi
+ck "脚本把运营商 DNS 写向 dnsmasq 的 resolv-file" \
+   'generated/isp-dns\.conf' "$($PODMAN exec "$NAME" cat "$SYNC" 2>&1)"
+# 容器里没有 systemd，只能 SIGHUP；早先版本只 systemctl reload，
+# 在容器内等于什么都不做（DNS 文件更新了但 dnsmasq 仍用旧上游）。
+ck "无 systemd 时回退 SIGHUP 重载 dnsmasq" \
+   'kill -HUP .*pidof dnsmasq' "$($PODMAN exec "$NAME" cat "$SYNC" 2>&1)"
+# render_ppp 写的路径必须与实际安装位置一致，否则 pppd 静默拿不到 DNS
+ck "render_ppp 的 ip-up-script 路径与安装位置一致" \
+   'ip-up-script /opt/drouter/scripts/sync-isp-dns\.sh' \
+   "$($PODMAN exec "$NAME" grep -A8 'def render_ppp' /opt/drouter/backend/render.py 2>&1)"
+
+echo
+echo "=== 11. backend 关键修复在镜像里（1.0.6）==="
+# 抽查三处最容易「打包漏掉」的地方：rescue token、SNMP 净化、静态租约字段名
+ck "rescue 服务端有令牌校验" '_token_ok' \
+   "$($PODMAN exec "$NAME" grep -c '_token_ok' /opt/drouter/backend/drouter-rescue.py 2>&1)"
+ck "SNMP 三个字段过滤换行" "re\.sub\(r'\[\\\\r\\\\n\]', ' '" \
+   "$($PODMAN exec "$NAME" grep -A6 "for k in ('contact', 'location', 'sysname')" /opt/drouter/backend/drouter-helper.py 2>&1)"
+ck "静态租约写 enabled+name" "'enabled': True" \
+   "$($PODMAN exec "$NAME" grep -c "'enabled': True, 'mac': mac" /opt/drouter/backend/drouter-helper.py 2>&1)"
+ck "readings 不再遮蔽 POST 写分支" '_has_post_branch' \
+   "$($PODMAN exec "$NAME" grep -c '_has_post_branch' /opt/drouter/backend/drouter-web.py 2>&1)"
 
 echo
 echo "================================================"

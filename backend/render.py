@@ -1000,8 +1000,11 @@ def render_ppp(cfg):
         # DNS 选「仅运营商」或「两者合并」时上游全空，全家断网，
         # 而界面显示配置已应用（典型的静默失效）。
         # 脚本自己会判断内容有没有变，变了才 reload dnsmasq。
-        'ip-up-script /opt/drouter/bin/sync-isp-dns.sh',
-        'ip-down-script /opt/drouter/bin/sync-isp-dns.sh',
+        # 脚本装在 scripts/ 而不是 bin/：deb、镜像、deploy.sh 三条路径都用
+        # `install scripts/*.sh` → /opt/drouter/scripts/，bin/ 只有容器 init
+        # 才有。写 bin/ 会让装 deb / 跑容器的机器 pppd 找不到 ip-up-script。
+        'ip-up-script /opt/drouter/scripts/sync-isp-dns.sh',
+        'ip-down-script /opt/drouter/scripts/sync-isp-dns.sh',
         'lcp-echo-interval 20',
         'lcp-echo-failure 3',
         f'mtu {mtu}',

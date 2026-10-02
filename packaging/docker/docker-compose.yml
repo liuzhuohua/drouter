@@ -2,7 +2,7 @@
 # Drouter —— Docker Compose 编排
 #
 #   用法：
-#     docker load -i drouter-1.0.5-docker.tar
+#     docker load -i drouter-1.0.6-docker.tar
 #     docker compose up -d
 #     浏览器打开 https://<宿主IP>:8443/
 #
@@ -24,7 +24,7 @@
 services:
   drouter:
     # 镜像从 tar 加载后即为这个名字。若你改过标签，这里同步改。
-    image: drouter:1.0.5
+    image: drouter:1.0.6
 
     # 固定容器名，方便 docker exec / logs 直接引用
     container_name: drouter
