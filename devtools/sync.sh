@@ -31,6 +31,10 @@ PY
 "$NODEBIN" devtools/check-render.js web/app.js || { echo "❌ 渲染回归预检失败"; exit 1; }
 # 手机适配要素（#14）：viewport / 抽屉 / 表格横向滚动，防止改版时被悄悄改掉
 "$NODEBIN" devtools/check-mobile.js || { echo "❌ 手机适配预检失败"; exit 1; }
+# VPN 页四态文案渲染：need_module / need_tool / unsupported / ready 各喂一遍，
+# 真跑 vpnRenderTop 看输出的 HTML。check-render 只看「视图崩没崩」，
+# 抓不到「某一档文案拼出来的 HTML 是坏的」或「按钮没绑上」。
+"$NODEBIN" devtools/check-vpn-render.js || { echo "❌ VPN 文案渲染预检失败"; exit 1; }
 # 入口页破缓存：部署后用户不手动强刷也能拿到新前端
 "$PYBIN" _dev/t-cachebust.py || { echo "❌ 缓存版本号预检失败"; exit 1; }
 # 历史累计流量（概览页），含「计数器回绕 / 重启清零」容错

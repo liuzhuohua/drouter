@@ -25,6 +25,13 @@ EXCL = {
     't-live', 't-smoke', 't-ulog-perf', 't-ulog-detail', 't-perf',
     't-print', 't-cachebust', 't-cleanup', 't-webshell', 't-pty',
     't-daemon-restart',
+    # ⚠️ 反向验证脚本**会真的改源文件**（注入 bug → 跑测试 → 还原）。
+    # 名字前缀也是 t-，会被 glob 自动收进来；一旦被自动执行，
+    # 它就会在回归过程中反复改写 backend/ 与 web/ —— 后果是
+    # 别的检查器读到被注入污染的代码，报出一堆假红，
+    # 更糟的是中途被打断会留下污染（已经发生过一次）。
+    # 只能手动跑：python _dev/t-107-inject-wg.py --batch 0
+    't-107-inject-wg',
 }
 
 

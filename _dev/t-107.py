@@ -157,6 +157,86 @@ def code_only(src):
     return '\n'.join(out)
 
 
+def strip_docstrings(src):
+    """去掉 Python 的 docstring（模块级、类级、函数级都去）。
+
+    ⚠️ 为什么必须有这一步：修 bug 时我们会在 docstring 里**引用
+    原来的错误文案**来说明「为什么当初错了」，比如
+    `_vpn_env()` 的注释里就写着「通常说明跑在精简容器里」这句
+    被我们删掉的旧文案。断言若直接对源码做子串匹配，会把这段
+    说明当成「代码里还有错文案」而报假红灯 —— 最坏的结果是
+    为了让测试变绿，把解释 bug 来历的注释也删掉。
+
+    同理 `code_only()` 也不能替代它：code_only 逐行找行尾'  #'
+    来砍行尾注释，遇到 docstring 里以两个空格 + # 开头的行会把
+    字符串截断，喂给 ast.parse 直接报 unterminated string。
+    所以两个是正交的：先剥 docstring，再谈其他。
+
+    ⚠️⚠️ 实现踩过两个坑，都写在这儿免得下次再踩：
+    ① **别用「前一个 token 是 INDENT/NL/NEWLINE」判断是不是 docstring**。
+       我第一版就是这么写的，结果把 return {...} 里的'virt': virt
+       这类**普通键值**也剥了（紧跟 INDENT 的字符串在词法上完全合法）
+       —— 一夜之间 6 条断言变红，全是假红。ast 懂语义，tokenize 不懂。
+    ② **别用 tokenize.untokenize() 重排**。被剥掉的 docstring 位置
+       会被填成 '\n' 续行，把行结构搞乱：原来那几条
+       `if ...:\n    state = 'ready'` 的跨行正则全部失配，
+       而它们恰恰是钉死「四态判定顺序」的核心判据。
+    所以：**先剥，再按行删**，不重排、不填充。
+    """
+    import ast as _ast
+    try:
+        tree = _ast.parse(src)
+    except SyntaxError:
+        return src
+    doc_pos = set()
+
+    def _add(node):
+        if (node is not None and isinstance(node, _ast.Expr)
+                and isinstance(node.value, _ast.Constant)
+                and isinstance(node.value.value, str)):
+            doc_pos.add(node.value.lineno)
+    _add(tree)
+    for n in _ast.walk(tree):
+        if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef,
+                          _ast.ClassDef, _ast.Module)):
+            if n.body:
+                _add(n.body[0])
+    if not doc_pos:
+        return src
+    # ast 给出的是 docstring **第一行**；多行 docstring 要删到结束行。
+    # 直接用 ast 节点的 end_lineno 定位，跨行也对得上。
+    spans = set()
+    for n in _ast.walk(tree):
+        if isinstance(n, _ast.Expr) and isinstance(n.value, _ast.Constant) \
+                and isinstance(n.value.value, str) and n.lineno in doc_pos:
+            spans.add((n.lineno, getattr(n, 'end_lineno', n.lineno)))
+    if not spans:
+        return src
+    out = []
+    for i, ln in enumerate(src.split('\n'), start=1):
+        if any(a <= i <= b for a, b in spans):
+            continue
+        out.append(ln)
+    return '\n'.join(out)
+
+
+def py_code_only(src):
+    """源码去docstring + 去注释，只留真正会被执行的代码。"""
+    return code_only(strip_docstrings(src))
+
+
+def js_code_only(src):
+    """JS 侧去注释（// 与 /* */），只留真正会被执行的代码。
+
+    前端改文案时同样会在注释里引用旧文案（「那句是猜的」）。
+    不剥注释就会把说明当成残留代码。
+    """
+    out = re.sub(r'/\*.*?\*/', '', src, flags=re.S)
+    # 行注释：// 后面不能紧跟引号（那是 URL 里的 //）
+    out = re.sub(r'(?<!:)//[^\n\'"`]*$', '', out, flags=re.M)
+    return out
+
+
 def py_func_src(name, src=HELPER):
     """用 ast 精确取一个模块级函数的源码段。"""
     tree = ast.parse(src)
@@ -761,7 +841,7 @@ chk('_vpn_norm 保留 private_key（否则每次保存都清空所有客户端�
 mask = py_func_src('_vpn_mask')
 chk('_vpn_mask 对外输出时抹掉 private_key',
     re.search(r"pop\(\s*'private_key'", mask) is not None)
-st = py_func_src('_vpn_status')
+st = py_code_only(py_func_src('_vpn_status'))
 chk('status 走 _vpn_mask（不直接返回未脱敏的 peers）',
     "'conf': _vpn_mask(d)" in st)
 # 这一条是本轮修掉的第二个真缺陷：status 里原本还有 'raw': d，
@@ -796,6 +876,178 @@ chk('端口占用判断只在服务未运行时做（否则报自己占的）',
     '服务自己在跑时端口必然 bind 失败，不能报给用户说冲突')
 chk('自动换端口后必须明说换成了几',
     re.search(r'已自动改用|swapped', py_func_src('_vpn_save_op')) is not None)
+
+# --- C3c. WireGuard 环境诊断：四态，别再把「模块没加载」说成内核不支持 ---
+# 2026-10-03 修的第 11 个缺陷。原来的 _vpn_installed() 只做两个二值检查
+# （/sys/module/wireguard 在不在、/usr/bin/wg 在不在），从不查
+# /lib/modules/ 下的模块文件 —— 于是「模块文件在、只是没加载」被压进
+# 同一个 'no'，前端再配一句写死的「通常说明跑在精简容器里」。
+# 实际受害机是 PVE 里的 KVM 虚拟机（systemd-detect-virt = kvm，
+# 是虚拟机不是容器），内核 6.12.107+deb13-amd64 里 wireguard.ko.xz
+# 好好地放着，modprobe 一下就RC=0。
+print()
+print('--- C3c. WireGuard 环境诊断：四态 + 一键修复 + 开机自启 ---')
+# ⚠️ 这里全部用 py_code_only（剥 docstring + 注释），不是 py_func_src。
+# 这是**反向验证逼出来的**：两条断言恒绿，注入 bug 后仍然全绿 ——
+#   E1 把探测路径改成 /nonexistent，「查的是 /lib/modules」仍 OK
+#      → 因为函数 docstring 里就写着「/lib/modules 下的模块文件」
+#   E8 把 'env': _vpn_env(), 注释掉，「status 返回 env」仍 OK
+#      → 因为我加的是 `# 'env': _vpn_env(),`，正则照样匹配
+# 两次都是同一个病：**判据喂了带注释的原文**。
+# 注释/docstring 是给人看的、会被引用旧代码来解释 bug 来历，
+# 一旦把它算进判据，断言就既会假绿、又可能假红。
+_env = py_code_only(py_func_src('_vpn_env'))
+_envc = _env
+chk('_vpn_env 查的是 /lib/modules 下的模块文件（这是原误报的根因）',
+    '/lib/modules' in _env and 'wireguard.ko' in _env,
+    '少了这一级，「模块在但没加载」永远落进 unsupported')
+chk('模块文件名覆盖 .ko/.ko.xz/.ko.zst（Debian 默认是 .ko.xz）',
+    all(x in _env for x in ('wireguard.ko', 'wireguard.ko.xz', 'wireguard.ko.zst')))
+chk('_vpn_env 四态齐全（ready/need_module/need_tool/unsupported）',
+    all(("'%s'" % s) in _env for s in
+        ('ready', 'need_module', 'need_tool', 'unsupported')))
+# ⚠️ 判据不能比实现更宽：光断言字符串出现过没用，必须钉住**判定顺序**。
+# 四态的核心是「已加载 + 有工具 → ready；已加载 + 没工具 → need_tool；
+# 没加载 + 有模块文件 → need_module；两头都没有 → unsupported」。
+# 只查字面的话，把四个 state 全写进一个 tuple 再随机返回也能过。
+chk('_vpn_env 的四态判定顺序正确（不是把四态当集合乱返回）',
+    re.search(r"if\s+mod_loaded\s+and\s+tool:\s*\n\s*state\s*=\s*'ready'",
+              _env) is not None
+    and re.search(r"elif\s+mod_loaded:\s*\n\s*state\s*=\s*'need_tool'",
+                  _env) is not None
+    and re.search(r"elif\s+mod_file:\s*\n\s*state\s*=\s*'need_module'",
+                  _env) is not None
+    and re.search(r"else:\s*\n\s*state\s*=\s*'unsupported'", _env) is not None,
+    '四态必须按「已加载?有工具?有模块文件?」逐级降级，'
+    '否则 need_module 永远出不来（那正是本轮要修的那个状态）')
+chk('_vpn_env 把 virt 一起返回（文案要靠它区分 kvm 与容器）',
+    "'virt'" in _envc and 'systemd-detect-virt' in _envc)
+chk('_vpn_env 返回 autoload（前端要据此提示「重启后起不来」）',
+    "'autoload'" in _envc and 'WG_AUTOLOAD' in _envc)
+# 兼容壳不能偷偷把判定改回二值
+chk('_vpn_installed 只是兼容壳（真判定在 _vpn_env 里）',
+    re.search(r"def _vpn_installed\(\):.*?_vpn_env\(\)\['state'\]",
+              py_code_only(HELPER), re.S) is not None)
+chk('helper 里不再有「内核不支持」这个误导文案',
+    '内核或工具不支持 WireGuard' not in py_code_only(HELPER),
+    '旧文案断言的是猜测（精简容器），已由四态文案取代')
+chk('helper 里不再有写死「精简容器」的猜测',
+    '通常说明跑在精简容器里' not in py_code_only(HELPER))
+
+# 开机自动加载：Debian 走 udev 按需加载，/etc/modules 默认不写 wireguard，
+# 所以每次重启后 /sys/module/wireguard 都不存在 → 本页又报「不可用」。
+chk('有 _vpn_write_autoload 写 /etc/modules-load.d（开机自启）',
+    re.search(r"def _vpn_write_autoload\(\)", HELPER) is not None
+    and '/etc/modules-load.d/' in py_code_only(HELPER))
+chk('WG_AUTOLOAD 常量指向 modules-load.d 下的 drouter 专属文件',
+    re.search(r"WG_AUTOLOAD\s*=\s*'/etc/modules-load\.d/[\w.-]+'",
+              py_code_only(HELPER))
+    is not None)
+_al = py_code_only(py_func_src('_vpn_write_autoload'))
+chk('_vpn_write_autoload 真的往 WG_AUTOLOAD 写 wireguard 这一行',
+    re.search(r"open\(WG_AUTOLOAD,\s*'w'", _al) is not None
+    and re.search(r"'wireguard\\n'", _al) is not None,
+    '少写模块名 = 开机不加载，等于没写')
+# modprobe 之后必须以 /sys/module 复核，不能只看 rc：
+# modprobe 偶尔会 RC=0 但模块仍不在（裁剪 / 拦截）。
+_em = py_code_only(py_func_src('_vpn_ensure_module'))
+chk('_vpn_ensure_module 加载后以 /sys/module 复核（不只看 rc）',
+    re.search(r"modprobe'?,?\s*'wireguard'", _em) is not None
+    and _em.count("os.path.isdir('/sys/module/wireguard')") >= 2,
+    '只看 rc 的话，RC=0 但模块没进 /sys/module 会被当成成功')
+chk('_vpn_ensure_module 成功后顺手写开机自启（否则重启又失效）',
+    '_vpn_write_autoload()' in _em)
+# 装包必须挑 apt 源里真实存在的包名，不能硬塞
+_it = py_code_only(py_func_src('_vpn_install_tool'))
+chk('_vpn_install_tool 先用 _pkgs_available 挑包名再 apt-get install',
+    '_pkgs_available' in _it
+    and re.search(r"'apt-get',\s*'install'", _it) is not None)
+chk('_vpn_install_tool 装完复核 wg 是否真的可用（不只看 rc）',
+    _it.count("shutil.which('wg')") >= 2)
+# 一键修复 op
+chk('act_vpn 派发 fix op',
+    re.search(r"op == 'fix'", py_code_only(HELPER)) is not None)
+_fix = py_code_only(py_func_src('_vpn_fix_op'))
+chk('_vpn_fix_op 是幂等的（已 ready 时不重复装）',
+    re.search(r"if\s+before\['state'\]\s*==\s*'ready'", _fix) is not None)
+chk('_vpn_fix_op 分步做并逐步汇报（notes 回传）',
+    "'notes': notes" in _fix and 'done.append' in _fix)
+chk('_vpn_fix_op 对 unsupported 明确说「装不了」而不是硬试',
+    re.search(r"state'\]\s*==\s*'unsupported'", _fix) is not None)
+chk('_vpn_fix_op 修完复核 state 必须为 ready，否则报未完全成功',
+    re.search(r"after\['state'\]\s*!=\s*'ready'", _fix) is not None)
+# apply 必须先自愈再报错 —— 能修的别撵去 SSH
+_ap = py_code_only(py_func_src('_vpn_apply_op'))
+chk('_vpn_apply_op 遇 need_module 先 modprobe 自愈（不是直接报错）',
+    re.search(r"state'\]\s*==\s*'need_module'.{0,400}?_vpn_ensure_module\(\)",
+              _ap, re.S) is not None,
+    '原来这里只有一句 return fail(... 内核不支持 ...)')
+chk('_vpn_apply_op 对 need_tool 说清是「缺工具」并指向一键修复',
+    'need_tool' in _ap and '一键修复' in _ap)
+chk('_vpn_apply_op 只在真 unsupported 时才报 NO_WG',
+    re.search(r"state'\]\s*==\s*'unsupported'", _ap) is not None
+    and "'内核或工具不支持 WireGuard'" not in _ap)
+chk('_vpn_apply_op 自愈后重新读一次 env（别用旧状态判断）',
+    re.search(r"_vpn_ensure_module\(\).*?env\s*=\s*_vpn_env\(\).*?"
+              r"if\s+env\['state'\]\s*!=\s*'ready'",
+              _ap, re.S) is not None,
+    '重读之后必须再判一次 ready，否则拿自愈前的旧 state 往下走')
+# status 要把 env 透出去
+chk('_vpn_status 返回 env（四态诊断透给前端）',
+    re.search(r"'env':\s*_vpn_env\(\)", st) is not None)
+
+# 前端：三档文案 + 一键修复按钮
+# ⚠️ 判据一律走 js_code_only：注释里引用旧文案（「那句是猜的」）
+# 是有意留的，不剥掉就会把说明当成残留代码。
+_rt = js_code_only(BODIES.get('vpnRenderTop') or func_body('vpnRenderTop'))
+chk('VPN 页文案按四态分支（不再只有 no/非no 两档）',
+    all(x in _rt for x in ('unsupported', 'need_module', 'need_tool')))
+chk('VPN 页读的是 d.env 而不是只读 d.installed',
+    'd.env' in _rt and "d.installed === 'no'" not in _rt)
+chk('VPN 页不再断言「精简容器」（那在 KVM 上是错的）',
+    '精简容器里' not in _rt,
+    'systemd-detect-virt 返回 kvm（虚拟机），不能猜成精简容器')
+chk('VPN 页三档里没有「不支持 WireGuard」这种一刀切说法',
+    '本机内核或工具不支持 WireGuard' not in _rt)
+chk('VPN 页每一档都给出可执行动作（一键修复按钮）',
+    _rt.count('id="vp-fix"') >= 3,
+    'need_module / need_tool / ready-但没自启 三档各要一个按钮')
+chk('VPN 页提示「模块文件在、未加载」这一真实原因',
+    'kernel/drivers/net/wireguard' in _rt)
+chk('VPN 页展示运行环境（内核版本 / 虚拟化形态 / 开机自启）',
+    '运行环境' in _rt and 'env0.kernel' in _rt and 'env0.autoload' in _rt)
+# ⚠️ 同样要 js_code_only：vpnFix 的 confirm 文案里就写着
+# 「3. 如果还没装，apt-get install wireguard-tools」，
+# 不剥注释的话「有二次确认」这条判据永远成立（E14 恒绿）。
+_ff = js_code_only(BODIES.get('vpnFix') or func_body('vpnFix'))
+chk('vpnFix 调的是 fix op', re.search(r"op:\s*'fix'", _ff) is not None)
+chk('vpnFix 装包前有二次确认（会联网 apt-get install）',
+    re.search(r'if\s*\(!confirm\(', _ff) is not None
+    and 'apt-get install' in _ff)
+chk('vpnFix 的确认文案说清了要联网装包（用户有权知道代价）',
+    'wireguard-tools' in _ff and '联网' in _ff)
+chk('vpnFix 失败时把后端 notes 显示出来（别只弹一句 toast）',
+    'notes' in _ff and 'notice err' in _ff)
+chk('vpnRenderTop 给修复按钮绑了 vpnFix',
+    re.search(r"onclick\s*=\s*vpnFix", _rt) is not None)
+chk('VPN 页不再声称「不需要装任何第三方软件」（缺 tools 时就要装）',
+    '不需要装任何第三方软件' not in js_code_only(APP))
+# ⚠️ 死分支防线：本轮真的踩过 —— 我用小锚点替换文案时，只换掉了
+# `if (d.installed === 'no') {` 这一行，旧分支的 body 和它的
+# `} else if (!d.has_systemd) {` 全留在原地，拼出一个
+# 「没有 systemd → 报内核不支持」的假分支。语法完全合法，
+# 静态检查也过得去，只有对着文件读才能发现。
+# 所以：vpnRenderTop 里 `else if` 的数量必须恰好等于分支数。
+chk('vpnRenderTop 没有残留的重复 else if 死分支',
+    len(re.findall(r'\}\s*else\s+if\s*\(', _rt)) == 5,
+    '期望 5 个 else if（unsupported/need_module/need_tool/'
+    'ready-无自启/unknown-老后端/无-systemd），实际 %d 个 —— '
+    '很可能改文案时留下了旧分支'
+    % len(re.findall(r'\}\s*else\s+if\s*\(', _rt)))
+chk('老后端兜底是 unknown 而非把旧 no 当 unsupported',
+    "state: 'unknown'" in _rt,
+    '旧判据分不清「模块没加载」和「内核没模块」，'
+    '直接映射成 unsupported 就是把本轮修掉的误报又请回来')
 
 # --- C3b. VPN 私钥生命周期：真跑一遍 ---
 # 这是整个 4 个模块里最需要真跑的一段。静态断言只能确认

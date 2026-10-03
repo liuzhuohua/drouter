@@ -462,7 +462,7 @@ Drouter 是普通 Debian 软件包，跑在哪都行：
 
 路由器往往出现在**不方便接外网**的地方：机房、弱电箱、隔离网段、
 或者一台你根本不想让它联网的机器。所以 Release 里的
-`drouter-1.0.7-offline-amd64.tar.gz` 不是「只发一个 `.deb`」，
+`drouter-1.0.8-offline-amd64.tar.gz` 不是「只发一个 `.deb`」，
 而是把 **Drouter 本体 + 它跑起来需要的全部 Debian 依赖**一起打成了一个包。
 
 解包出来是这样：
@@ -470,8 +470,8 @@ Drouter 是普通 Debian 软件包，跑在哪都行：
 ```bash
 # 1) 把 tar.gz 拷到目标机（U 盘 / scp / 内网共享都行）
 # 2) 解包
-tar xzf drouter-1.0.7-offline-amd64.tar.gz
-cd drouter-1.0.7-offline-amd64
+tar xzf drouter-1.0.8-offline-amd64.tar.gz
+cd drouter-1.0.8-offline-amd64
 
 # 3) 一条命令装完（会自动 sudo）
 sudo bash install.sh
@@ -494,11 +494,11 @@ sudo bash install.sh
 <summary><b>包里到底装了什么（点开看）</b></summary>
 
 ```
-drouter-1.0.7-offline-amd64/
+drouter-1.0.8-offline-amd64/
 ├── install.sh                 安装脚本（自动提权 + 本地 file: 源，零外网）
 ├── README-离线安装.md          给不熟悉 Linux 的人看的逐步说明
 ├── SHA256SUMS                 237 条校验和（236 依赖 + 本体）
-├── drouter_1.0.7_all.deb      Drouter 本体（含 6 个 systemd 单元）
+├── drouter_1.0.8_all.deb      Drouter 本体（含 6 个 systemd 单元）
 └── debs/                      236 个依赖 .deb
     ├── nftables_*.deb         ├─ 直接依赖
     ├── dnsmasq_*.deb
@@ -535,9 +535,9 @@ drouter-1.0.7-offline-amd64/
 </details>
 
 **想要更小的包？** 如果你的目标机有网（哪怕是内网自建 apt 镜像），
-可以只拿 `drouter_1.0.7_all.deb`（约 500 KB），见下方「方式二」。
+可以只拿 `drouter_1.0.8_all.deb`（约 506 KB），见下方「方式二」。
 
-**已经装过依赖、只想升级本体？** 同样只用那个 500 KB 的 `.deb`
+**已经装过依赖、只想升级本体？** 同样只用那个 506 KB 的 `.deb`
 `dpkg -i` 覆盖安装即可，不必重新走离线包。
 
 ### 方式二：在线安装（目标机有网）
@@ -545,7 +545,7 @@ drouter-1.0.7-offline-amd64/
 如果目标机能连上 Debian 官方源（或内网 apt 镜像），只需要本体那一个文件：
 
 ```bash
-sudo apt install ./drouter_1.0.7_all.deb
+sudo apt install ./drouter_1.0.8_all.deb
 sudo drouter-ctl status
 ```
 
@@ -555,14 +555,14 @@ sudo drouter-ctl status
 
 ### 方式三：Docker（体验用）
 
-项目提供 `drouter-1.0.7-docker.tar`（约 169 MB，已含完整根文件系统）。
+项目提供 `drouter-1.0.8-docker.tar`（约 169 MB，已含完整根文件系统）。
 
 **方式 A：docker compose（推荐）**
 
 Release 里附了现成的 `docker-compose.yml`，直接下下来用：
 
 ```bash
-docker load -i drouter-1.0.7-docker.tar
+docker load -i drouter-1.0.8-docker.tar
 
 # 把 docker-compose.yml 放到当前目录
 docker compose up -d
@@ -572,7 +572,7 @@ docker compose ps          # 等 health 变 healthy
 **方式 B：docker run**
 
 ```bash
-docker load -i drouter-1.0.7-docker.tar
+docker load -i drouter-1.0.8-docker.tar
 
 docker run -d --name drouter --restart unless-stopped \
   --network host \
@@ -582,11 +582,11 @@ docker run -d --name drouter --restart unless-stopped \
   -v drouter-data:/opt/drouter/data \
   -v drouter-snapshots:/opt/drouter/snapshots \
   -v drouter-log:/var/log/drouter \
-  drouter:1.0.7
+  drouter:1.0.8
 ```
 
-两种方式加载后镜像标签都是 **`drouter:1.0.7`**（另有一个
-`liuzhuohua/drouter:1.0.7` 别名，同一个镜像）。
+两种方式加载后镜像标签都是 **`drouter:1.0.8`**（另有一个
+`liuzhuohua/drouter:1.0.8` 别名，同一个镜像）。
 
 访问 `https://<宿主IP>:8443/`，账号 `admin` / `admin123`。
 
@@ -618,17 +618,17 @@ docker run -d --name drouter --restart unless-stopped \
 git clone https://github.com/liuzhuohua/drouter.git
 cd drouter
 
-# 本体 deb（→ dist/drouter_1.0.7_all.deb，约 500 KB）
-bash packaging/build-deb.sh 1.0.7
+# 本体 deb（→ dist/drouter_1.0.8_all.deb，约 506 KB）
+bash packaging/build-deb.sh 1.0.8
 
 # 离线依赖库（→ dist/offline-deps/，236 个 .deb + Packages 索引）
 bash scripts/make-offline-deps.sh
 
-# 自包含离线包（→ dist/drouter-1.0.7-offline-amd64.tar.gz，约 83 MB）
-bash packaging/build-offline-bundle.sh 1.0.7
+# 自包含离线包（→ dist/drouter-1.0.8-offline-amd64.tar.gz，约 83 MB）
+bash packaging/build-offline-bundle.sh 1.0.8
 
-# Docker 镜像（→ dist/drouter-1.0.7-docker.tar，约 169 MB）
-bash packaging/build-docker.sh 1.0.7
+# Docker 镜像（→ dist/drouter-1.0.8-docker.tar，约 169 MB）
+bash packaging/build-docker.sh 1.0.8
 ```
 
 构建顺序上，`build-offline-bundle.sh` 会**自己**先调 `build-deb.sh`
@@ -960,7 +960,7 @@ sudo ss -tlnp | grep 8443        # 看端口有没有在听
 
 ```bash
 # 下载新版 deb
-sudo apt install ./drouter_1.0.7_all.deb    # 直接覆盖安装，配置保留
+sudo apt install ./drouter_1.0.8_all.deb    # 直接覆盖安装，配置保留
 ```
 
 配置在 `/etc/drouter/` 和 SQLite 里，`apt remove` 也会保留（`purge` 才删）。
@@ -984,6 +984,80 @@ sudo apt purge  drouter       # 连配置一起删
 ---
 
 ## 📝 更新日志
+
+### v1.0.8 — VPN 页把「模块没加载」误报成「内核不支持」
+
+纯修复版本，无新增功能，**不改动配置存储格式**（老配置直接可用）。
+
+**先说结论：Debian 13 虚拟机上跑 drouter，KVM 不是容器，
+内核里一直有 WireGuard —— 是面板自己判错了。**
+
+原判据只看两件事：`/sys/module/wireguard` 在不在（模块**当前已加载**）、
+`/usr/bin/wg` 在不在（工具**已安装**）。
+**从没查过 `/lib/modules/` 下有没有模块文件** ——
+于是「模块文件在、但没加载」被压进了「内核真没这个模块」。
+
+而 Debian 走 **udev 按需加载**，`/etc/modules` 与 `/etc/modules-load.d/`
+默认都不写 wireguard，模块**在磁盘上但没进内存**。
+本机实测：内核 `6.12.107+deb13-amd64`，`wireguard.ko.xz` 在，未加载。
+
+前端还配了一句写死的文案把这事坐实：
+
+> 通常说明跑在精简容器里
+
+**而这台是 PVE 上的 KVM 虚拟机。** 排查方向被这句话整个带偏 ——
+用户会去查容器配置，真正该做的却是 `modprobe wireguard`。
+
+- **判据从两态扩到四态**（`ready` / `need_module` / `need_tool` / `unsupported`），
+  每一态都给出**可执行的下一步**。`unsupported` 明确说「装不了」且
+  **不给一键修复** —— 不设套路的死路。
+- **模块文件名覆盖 `.ko` / `.ko.xz` / `.ko.zst`**：Debian 默认压成 `.ko.xz`，
+  只认 `.ko` 会把正常机器也判成 `unsupported`。
+- **新增「一键修复」按钮**：`modprobe` → 写
+  `/etc/modules-load.d/drouter-wireguard.conf`（开机自动加载）→
+  缺工具则 `apt-get install wireguard-tools`。确认弹窗写清三步，
+  并明确告知不动网络接口、防火墙与现有 VPN 配置。
+- **`apply` 改为先自愈再报错**：以前直接弹「内核不支持」把用户挡在门外，
+  现在先尝试 `modprobe`，成功就继续。
+- 页面新增「运行环境」行（内核 / 虚拟化类型 / 是否已配开机自启）；
+  老后端（无 `env` 字段）兜底为 `unknown` 而**不猜成 `unsupported`** ——
+  猜错就等于把这个 bug 复活一次。
+
+真机验证：`_vpn_env()` 从 `need_module` 修到 `ready`，
+`wg` 装上（v1.0.20210914），`modules-load.d` 配置已写入
+→ **重启后不用再手动 modprobe**。
+
+- **测试基建：抓出 3 条恒绿断言 + 1 处死分支** ——
+  判据喂了带注释的源码，注释里引用被删掉的旧代码会让「这段代码还在吗」永远成立
+  （实测把探测路径改成 `/nonexistent` 仍全绿，因为 docstring 里就写着那句）。
+  新增的 41 条断言现已统一走 `py_code_only()` / `js_code_only()`，
+  **16 个注入用例全部被抓住**；`} else if (` 数量钉死，死分支无处藏身。
+  详见 [Release Notes](https://github.com/liuzhuohua/drouter/releases/tag/v1.0.8)。
+
+### v1.0.7 — 备份 / 告警 / 配额三模块收尾，再抓 3 个真缺陷
+
+新增三个模块，全部带定时器守护（`drouter-backupd` / `drouter-alertd` / `drouter-quotad`）。
+
+| 页面 | 做什么 |
+|---|---|
+| **配置备份与还原** | 把全部设置导成能下载、能换机还原的包：带清单与逐文件 sha256 校验，还原前先预检，敏感项默认排除 |
+| **告警与通知** | 掉线 / 磁盘满 / 温度高主动推送：Bark · 邮件 · 群机器人，带冷却期与免打扰时段 |
+| **用量与账单** | 按设备与服务统计每月流量，可按比例分摊话费；后台增量聚合，不拖慢机器 |
+
+自查 + 真机验收共修 **10 个缺陷**，其中三个值得单说：
+
+- **默认备份静默丢失大半配置**（最严重）：`_bk_files()` 把整个 `/etc/drouter`
+  标成敏感 → 默认导出时整目录被排除，而 `BACKUP_SCOPE` 恰恰宣称备份含
+  `dcfg.json` / `kern.conf` / Docker 栈文件。**界面全程显示「已导出」**，
+  用户换机还原才发现大半配置没了。改为逐文件判定。
+- **备份包名校验比命名规则窄**：命名 charset 是 `[A-Za-z0-9_-]`，
+  校验只写 `[a-z0-9]+`，而 Debian 默认主机名 `debian-primaryrouter` **带连字符**
+  → 导出的包自己在列表里都看不到。修完才发现**第二处同样的正则**漏改。
+- **包内容校验拿不到 sha256** → 所有文件都被标成「已损坏」，还原被挡死。
+  刚导出来的新包立刻报损坏。
+
+⚠️ 三个守护的 systemd timer **不在 deb 里**，是首次保存配置后由 helper
+动态写出来的 —— 这是有意设计，没开的功能不该有定时器。
 
 ### v1.0.6 — 静默失效专项：六个模块的保存按钮从来没生效过
 

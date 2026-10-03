@@ -3308,6 +3308,7 @@ def _ddns_record_name(cfg):
 #   「装了 deb 一切正常、跑镜像 VPN 起不来」。
 
 WG_CONF_DIR = '/etc/wireguard'
+WG_AUTOLOAD = '/etc/modules-load.d/drouter-wireguard.conf'
 VPN_CONF = '/etc/drouter/generated/vpn.json'
 VPN_UID = 51820          # WireGuard 默认用户
 VPN_IFACE = 'wg0'
@@ -3448,12 +3449,140 @@ def _wg_genkey():
 
 
 def _vpn_installed():
-    """内核是否支持 WireGuard。Debian 13 自带，但容器基础镜像可能裁掉了模块。"""
-    rc, o, _e = sh(['sh', '-c',
-                    'test -d /sys/module/wireguard && echo yes || '
-                    '(ls /usr/bin/wg >/dev/null 2>&1 && echo tool || echo no)'],
-                   timeout=6)
-    return (o or '').strip() or 'no'
+    """兼容壳：只取四态里的 state。判定逻辑全在 _vpn_env()。"""
+    return _vpn_env()['state']
+
+
+def _vpn_env():
+    """WireGuard 可用性诊断（分四态）。
+
+    ⚠️ 这段判据改过一轮才对。早先只有两个二值检查：
+        /sys/module/wireguard 在不在  → 模块**已加载**吗
+        /usr/bin/wg 在不在             → 工具装了吗
+    两个都没有就报「内核不支持 WireGuard」，前端照着写死一句
+    「通常说明跑在精简容器里」。2026-10-03 被用户当场问住：
+    PVE 里的 KVM 虚拟机（systemd-detect-virt 明确返回 kvm，
+    是虚拟机、不是容器）被说成精简容器。而那台机的内核
+    6.12.107+deb13-amd64 里 wireguard.ko.xz 好好地躺在
+    /lib/modules/ 下，只是**没被加载**（/etc/modules 与
+    /etc/modules-load.d/ 里都没写 wireguard，也没有别的触发点），
+    `modprobe wireguard` 直接 RC=0 成功。
+
+    根因：**从没查过 /lib/modules/ 下的模块文件**，于是
+    「模块在但没加载」和「内核裁掉了模块」被压进同一个 no，
+    再配一句写死的「精简容器」，把排查方向整个带偏 ——
+    用户会去查容器镜像，而真正该做的是 modprobe 一下。
+
+    四态（前端文案与一键修复按钮都按这四态分支）：
+        ready        模块已加载 + 工具已装 → 可以直接用
+        need_module  模块文件在，只是没加载 → modprobe 即可（本地秒级）
+        need_tool    模块已就绪，只缺 wireguard-tools → 需要下载安装
+        unsupported  内核里确实没有 wireguard 模块（真精简镜像 / 自编内核）
+    """
+    kver = os.uname().release
+    mod_loaded = os.path.isdir('/sys/module/wireguard')
+    tool = bool(shutil.which('wg'))
+    # 查模块**文件**在不在 —— 这一级以前完全没有，是本轮误报的根因。
+    # 不能只认 .ko：Debian 默认压成 .ko.xz，个别发行版用 .ko.zst。
+    mod_file = ''
+    for _n in ('wireguard.ko', 'wireguard.ko.xz', 'wireguard.ko.zst'):
+        _p = os.path.join('/lib/modules', kver,
+                          'kernel/drivers/net/wireguard', _n)
+        if os.path.isfile(_p):
+            mod_file = _p
+            break
+    if mod_loaded and tool:
+        state = 'ready'
+    elif mod_loaded:
+        state = 'need_tool'
+    elif mod_file:
+        state = 'need_module'
+    else:
+        state = 'unsupported'
+    # 虚拟化形态只用于文案说明（kvm 是虚拟机，不是容器 —— 别再写反了）
+    virt = ''
+    if shutil.which('systemd-detect-virt'):
+        rc, o, _e = sh(['systemd-detect-virt'], timeout=6)
+        if rc == 0:
+            virt = (o or '').strip()
+    return {
+        'state': state,
+        'mod_loaded': mod_loaded,
+        'mod_file': mod_file,
+        'tool': tool,
+        'kernel': kver,
+        'virt': virt,
+        'autoload': os.path.isfile(WG_AUTOLOAD),
+        'fixable': state in ('need_module', 'need_tool'),
+    }
+
+
+def _vpn_write_autoload():
+    """把 wireguard 写进 /etc/modules-load.d/，重启后自动加载。
+
+    为什么要自己写：Debian 的 wireguard 走的是 **udev 按需加载**
+    （有人 `ip link add type wireguard` 时才自动 modprobe），
+    /etc/modules 默认不写它。于是每次重启后 /sys/module/wireguard
+    都不存在 → 本页报「不支持」→ 用户以为坏了。
+    显式写一份 modules-load.d 才是「开机自动加载」的正解。
+    """
+    txt = ('# 由 drouter 写入：VPN 服务端需要 wireguard 内核模块。\n'
+           '# 不写的话模块不会被加载（Debian 走 udev 按需加载），\n'
+           '# 表现为 drouter VPN 页提示「内核不支持 WireGuard」。\n'
+           'wireguard\n')
+    try:
+        os.makedirs(os.path.dirname(WG_AUTOLOAD), exist_ok=True)
+        with open(WG_AUTOLOAD, 'w', encoding='utf-8') as f:
+            f.write(txt)
+        return True, ''
+    except Exception as ex:
+        return False, str(ex)
+
+
+def _vpn_ensure_module(persist=True):
+    """尝试加载 wireguard 内核模块；成功后顺手写开机自动加载。
+
+    返回 (ok, why)。纯本地动作（modprobe + 写一个 conf），
+    不碰网络、不碰防火墙，所以放在 apply 之前自动做是安全的 ——
+    能自愈的事不该把用户撵去 SSH。
+    """
+    if os.path.isdir('/sys/module/wireguard'):
+        return True, ''
+    if not shutil.which('modprobe'):
+        return False, '系统里没有 modprobe（kmod 包），无法加载内核模块'
+    rc, o, e = sh(['modprobe', 'wireguard'], timeout=20)
+    # 光看 rc 不够：modprobe 可能 RC=0 但模块仍不在（极少见的
+    # built-in 裁剪 / seccomp 拦截），所以一律以 /sys/module 复核。
+    if rc != 0 or not os.path.isdir('/sys/module/wireguard'):
+        return False, 'modprobe wireguard 失败：%s' % (
+            e or o or ('返回码 %d' % rc))
+    if persist:
+        ok2, why2 = _vpn_write_autoload()
+        if not ok2:
+            # 加载成功但持久化失败：模块这次能用，只是重启后又要重来。
+            # 不能当失败返回（服务能起来），但必须让用户知道。
+            return True, ('模块已加载，但写 %s 失败（%s），'
+                          '重启后需要重新加载' % (WG_AUTOLOAD, why2))
+    return True, ''
+
+
+def _vpn_install_tool():
+    """装 wireguard-tools（提供 wg / wg-quick）。返回 (ok, detail)。"""
+    if shutil.which('wg'):
+        return True, 'wireguard-tools 已就绪'
+    have, lack = _pkgs_available(['wireguard-tools', 'wireguard'])
+    if not have:
+        return False, ('在当前 apt 源里找不到 wireguard-tools（查到：%s）。'
+                       '请先执行 apt-get update，或改用国内镜像源后重试。'
+                       % ('、'.join(lack) or '无'))
+    env = dict(os.environ)
+    env['DEBIAN_FRONTEND'] = 'noninteractive'
+    rc, o, e = sh(['apt-get', 'install', '-y', '--no-install-recommends'] + have,
+                  timeout=900, env=env)
+    if rc != 0 or not shutil.which('wg'):
+        return False, ('apt-get install %s 失败：%s'
+                       % (' '.join(have), (e or o)[-300:] or ('返回码 %d' % rc)))
+    return True, '已安装 %s' % ' '.join(have)
 
 
 def _vpn_free_port(prefer=0):
@@ -3752,9 +3881,77 @@ def act_vpn(p):
         return _vpn_peer_conf(p)
     if op == 'endpoint':
         return _vpn_endpoint()
+    if op == 'fix':
+        return _vpn_fix_op()
     if op == 'delete_all':
         return _vpn_delete_all()
     return fail('未知的 VPN 操作：%s' % op)
+
+
+def _vpn_fix_op():
+    """一键修复：加载内核模块 + 装 wireguard-tools + 写开机自动加载。
+
+    分步做、逐步汇报，不是一锅端。理由：
+      * modprobe 是纯本地动作，不碰网络/防火墙，可以直接做；
+      * 装包要联网、要动系统，**必须**是用户点了按钮才做，
+        不能在 status 或 apply 的路径里偷偷执行。
+    已经是 ready 时是幂等的 —— 直接告诉用户不用修。
+    """
+    before = _vpn_env()
+    if before['state'] == 'ready':
+        # ready 但没写开机自加载：顺手补上（否则重启后又变回不可用）
+        if before['autoload']:
+            return ok({'env': before, 'changed': []},
+                      'WireGuard 环境正常（模块已加载、工具已安装、开机自动加载已配置）')
+        okw, whyw = _vpn_write_autoload()
+        if not okw:
+            return fail('WireGuard 环境正常，但写 %s 失败：%s' % (WG_AUTOLOAD, whyw),
+                        'AUTOLOAD_FAIL', {'env': _vpn_env(), 'changed': []})
+        return ok({'env': _vpn_env(), 'changed': ['autoload']},
+                  'WireGuard 环境正常，已补上开机自动加载配置')
+    if before['state'] == 'unsupported':
+        return fail('本机内核 %s 里没有 wireguard 模块，无法通过安装修复。'
+                    '精简容器镜像和自编内核会裁掉它；'
+                    'Debian 官方内核与 PVE/KVM 虚拟机都自带。' % before['kernel'],
+                    'NO_WG', {'env': before, 'changed': []})
+    done, notes = [], []
+    # ① 模块
+    if not before['mod_loaded']:
+        okm, whym = _vpn_ensure_module()
+        if not okm:
+            return fail('加载 wireguard 内核模块失败：%s' % whym,
+                        'WG_MODFAIL',
+                        {'env': _vpn_env(), 'changed': done, 'notes': notes})
+        done.append('module')
+        notes.append('已加载 wireguard 内核模块')
+        if whym:
+            notes.append(whym)      # 模块成功但 autoload 写失败，也在notes 里
+    elif not before['autoload']:
+        okw, whyw = _vpn_write_autoload()
+        if okw:
+            done.append('autoload')
+            notes.append('已配置开机自动加载')
+        else:
+            notes.append('写 %s 失败：%s' % (WG_AUTOLOAD, whyw))
+    # ② 工具
+    if not before['tool']:
+        okt, what = _vpn_install_tool()
+        if not okt:
+            return fail('内核模块已就绪，但安装 wireguard-tools 失败：%s' % what,
+                        'NO_WG_TOOL',
+                        {'env': _vpn_env(), 'changed': done, 'notes': notes})
+        done.append('tool')
+        notes.append(what)
+    after = _vpn_env()
+    if after['state'] != 'ready':
+        return fail('修复未完全成功（当前：%s）。%s'
+                    % (after['state'], '；'.join(notes) or '请查看环境诊断'),
+                    'FIX_INCOMPLETE',
+                    {'env': after, 'changed': done, 'notes': notes})
+    log('info', 'vpn', 'VPN_ENV_FIXED',
+        'WireGuard 环境修复完成：%s' % ('、'.join(done) or '无需改动'))
+    return ok({'env': after, 'changed': done, 'notes': notes},
+              '修复完成：%s' % ('；'.join(notes) or '环境本来就正常'))
 
 
 def _vpn_status():
@@ -3783,6 +3980,12 @@ def _vpn_status():
         # 留着它的诱惑是「以后调试方便」—— 不值得。
         'live': live,
         'installed': _vpn_installed(),
+        # env 是四态诊断的完整结果（state/mod_loaded/mod_file/tool/
+        # kernel/virt/autoload/fixable）。前端文案与「一键修复」
+        # 按钮全靠它 —— 早先只有一个 installed 字符串，把
+        # 「模块没加载」「工具没装」「内核真没模块」压成同一个 no，
+        # 文案只能瞎猜「精简容器」。
+        'env': _vpn_env(),
         'has_systemd': os.path.isdir('/run/systemd/system'),
         'lan_nets': _vpn_lan_net(),
         'pool_conflict': conflicts,
@@ -3829,9 +4032,30 @@ def _vpn_apply_op(p):
     d = _vpn_norm({**_vpn_load(), **(p.get('conf') or {})})
     if d.get('exit_node') and p.get('confirm_exit') is not True:
         return fail('允许全部流量经过本机需要显式确认', 'NEEDCONFIRM')
-    if _vpn_installed() == 'no':
-        return fail('本机内核或工具不支持 WireGuard，无法启动',
-                    'NO_WG')
+    # 环境自检。**先尽力自愈再报错** ——
+    # 「模块在但没加载」是 modprobe 一下的事（本地、秒级、不碰网络），
+    # 早先在这里直接 return fail('内核不支持')，把一个能自愈的
+    # 状态报成了死路一条，用户只能自己去 SSH。
+    env = _vpn_env()
+    if env['state'] == 'unsupported':
+        return fail('本机内核里没有 WireGuard 模块（内核 %s），无法启动。'
+                    % env['kernel'], 'NO_WG', {'env': env})
+    if env['state'] in ('need_module', 'need_tool'):
+        # need_module 顺手就修；need_tool 要下载安装包，不在这里做
+        # （点页面上的「一键修复」按钮，或去服务页装依赖）。
+        if env['state'] == 'need_module':
+            okm, why = _vpn_ensure_module()
+            if not okm:
+                return fail('WireGuard 内核模块未加载，且自动加载失败：%s。'
+                            '可点上方「一键修复」重试。' % why,
+                            'WG_MODFAIL', {'env': _vpn_env()})
+            env = _vpn_env()
+        if env['state'] != 'ready':
+            return fail(env['state'] == 'need_tool'
+                        and ('缺少 wireguard-tools（提供 wg / wg-quick 命令），'
+                             '无法启动服务。点上方「一键修复」可自动安装。'
+                             or 'WireGuard 环境仍不可用。'),
+                        'NO_WG', {'env': env})
     if not d.get('port'):
         d['port'] = _vpn_free_port(0)
     res, err = _vpn_write_conf(d)
@@ -17944,8 +18168,10 @@ DEPS = [
     # ---- VPN（WireGuard）----
     # ⚠️ 这条以前是漏的：VPN 模块到处调`wg` / `wg-quick`（genkey / pubkey /
     # setconf / show），但依赖清单里没有它。后果是「服务」页看不到缺失提示，
-    # 用户点进 VPN 页才发现配不了，而 `_vpn_installed()` 只会说「内核不支持」，
-    # 把他引向错误方向（其实只是没装 wireguard-tools）。
+    # 用户点进 VPN 页才发现配不了。1.0.8 起`_vpn_env()` 已经能分出
+    # 「只是没装 wireguard-tools」这一态（state=need_tool）并给一键修复，
+    # 但依赖清单这条仍然要留着 —— 自检页是全局视角，用户不该非得
+    # 先进 VPN 页才知道缺东西。
     # 两个探测目标分开登记：wg 在 wireguard-tools 里，wg-quick 同包。
     # 不标required —— 它只在用 VPN 时才需要，装机就强制拉进来不合理。
     ('wireguard-tools', 'WireGuard 工具（wg / wg-quick）', 'cmd', 'wg', False,

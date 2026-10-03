@@ -11815,7 +11815,7 @@ async function viewVpn() {
       <h3>远程连回家里
         <button class="ghost small" id="vp-reload" style="float:right">重新读取</button></h3>
       <p class="desc">人在外面想回内网拿文件、访问家里的 NAS，用它。
-        Debian 13 的内核<b>自带 WireGuard</b>，不需要装任何第三方软件，
+        Debian 13 的内核<b>自带 WireGuard</b>，不需要装任何第三方内核模块，
         性能也远好于 OpenVPN。</p>
       <p class="desc">工作方式是：给每台设备（手机 / 笔记本）生成一份独立配置，
         导入对方的 WireGuard 客户端 App，连上之后就能像在家一样访问内网地址。</p>
@@ -11873,11 +11873,52 @@ async function viewVpn() {
 function vpnRenderTop(d) {
   const c = d.conf || {};
   const live = d.live || {};
+  // 后端给的是四态诊断（state/mod_loaded/mod_file/tool/kernel/
+  // virt/autoload/fixable）。老版本后端只给 installed 字符串，
+  // **那时候两态信息已经丢了**，所以这里一律映射成 unknown ——
+  // 绝不能把旧的 'no' 直接当成 unsupported：旧判据分不清
+  // 「模块没加载」和「内核真没模块」，猜错就是本轮修的那个坑。
+  const env0 = d.env || { state: 'unknown', kernel: '', virt: '',
+    autoload: false };
   let env = '';
-  if (d.installed === 'no') {
-    env = '<div class="notice err">本机内核或工具不支持 WireGuard，'
-      + '无法启动服务。<span class="mono">Debian 13 官方内核自带 WireGuard，'
-      + '出现这个提示通常说明跑在精简容器里。</span></div>';
+  // ⚠️ 这段文案早先只有两档，其中一档还写死了「通常说明跑在
+  // 精简容器里」—— 那是**猜**的，而且在 PVE 的 KVM 虚拟机上
+  // 明确说错了（systemd-detect-virt 返回 kvm，是虚拟机不是容器）。
+  // 真正的原因是「模块文件在，只是没加载」。所以现在按后端给的
+  // 四态各说各话，每一档都给出**能做什么**，不猜运行环境。
+  if (env0.state === 'unsupported') {
+    env = '<div class="notice err">本机内核 <span class="mono">'
+      + esc(env0.kernel || '') + '</span> 里没有 wireguard 模块，无法启动服务。'
+      + '<span class="mono">精简容器镜像和自编内核会裁掉它；'
+      + 'Debian 官方内核与 PVE / KVM 虚拟机都自带。</span></div>';
+  } else if (env0.state === 'need_module') {
+    env = '<div class="notice warn">内核里有 wireguard 模块，但当前'
+      + '<b>还没加载</b>，所以服务起不来。'
+      + '<span class="mono">' + esc(env0.kernel || '')
+      + '/kernel/drivers/net/wireguard</span> 下的模块文件是在的，'
+      + '点下面的按钮加载一下即可（本地操作，几秒钟）。</div>'
+      + '<div class="row" style="margin-top:8px">'
+      + '<button class="primary" id="vp-fix">一键修复（加载模块并配置开机自启）</button>'
+      + '</div>';
+  } else if (env0.state === 'need_tool') {
+    env = '<div class="notice warn">内核模块已加载，但缺少 '
+      + '<span class="mono">wireguard-tools</span>（提供 wg / wg-quick 命令），'
+      + '无法启动服务。点下面的按钮自动安装。</div>'
+      + '<div class="row" style="margin-top:8px">'
+      + '<button class="primary" id="vp-fix">一键修复（安装 wireguard-tools）</button>'
+      + '</div>';
+  } else if (env0.state === 'ready' && !env0.autoload) {
+    env = '<div class="notice warn">WireGuard 可用，但<b>没有配置开机自动加载</b>。'
+      + '重启后模块不会被加载，VPN 会自己起不来。'
+      + '<span class="mono">Debian 走 udev 按需加载，/etc/modules 默认不写它。</span></div>'
+      + '<div class="row" style="margin-top:8px">'
+      + '<button class="primary" id="vp-fix">配置开机自动加载</button>'
+      + '</div>';
+  } else if (env0.state === 'unknown') {
+    env = '<div class="notice warn">后端版本较旧，'
+      + '无法诊断 WireGuard 环境（缺少内核模块 / 工具的分项检测）。'
+      + '升级到 1.0.8 后本页会明确告诉你是模块没加载、工具没装，'
+      + '还是内核真不支持，并提供一键修复。</div>';
   } else if (!d.has_systemd) {
     env = '<div class="notice warn">当前环境没有 systemd（容器形态）。'
       + '服务会由 drouter 直接管理接口，功能可用，但不能用 '
@@ -11886,6 +11927,16 @@ function vpnRenderTop(d) {
   $('#vp-top').innerHTML = env + `<table class="kv">
     <tr><td>服务状态</td><td>${live.up
       ? '<span class="tag ok">运行中</span>' : '<span class="tag gray">未启动</span>'}</td></tr>
+    <tr><td>运行环境</td><td>${env0.state === 'ready'
+      ? '<span class="tag ok">WireGuard 就绪</span>'
+      : env0.state === 'unknown' ? '<span class="tag gray">未检测</span>'
+      : '<span class="tag err">'
+        + esc({ need_module: '模块未加载', need_tool: '缺少工具',
+                unsupported: '内核无模块' }[env0.state] || env0.state)
+        + '</span>'}<span class="desc" style="margin-left:8px">内核 ${esc(
+          env0.kernel || '')}${env0.virt ? ' · ' + esc(env0.virt) : ''} · ${
+          env0.autoload ? '已配置开机自启'
+            : (env0.state === 'ready' ? '未配置开机自启' : '')}</span></td></tr>
     <tr><td>配置开关</td><td>${c.enabled
       ? '<span class="tag ok">已开启</span>' : '<span class="tag gray">已关闭</span>'}</td></tr>
     <tr><td>监听端口</td><td class="mono">UDP ${c.port || '未设置'}${
@@ -11897,6 +11948,8 @@ function vpnRenderTop(d) {
     <tr><td>本机内网网段</td><td class="mono">${esc((d.lan_nets || []).join('、') || '未识别')}</td></tr>
     <tr><td>配置文件</td><td class="mono" style="font-size:11px">${esc(d.path || '')}</td></tr>
   </table>`;
+  const fx = $('#vp-fix');
+  if (fx) fx.onclick = vpnFix;
 }
 
 function vpnRenderConf(d) {
@@ -12100,6 +12153,33 @@ async function vpnStop() {
   const r = await api('/api/vpn', { method: 'POST', body: { op: 'stop' } });
   toast(r.msg_cn, r.ok ? 'ok' : 'err');
   if (r.ok) vpnLoad(false);
+}
+
+async function vpnFix() {
+  // 会装软件包，必须先说清代价：要走 apt、可能要下载几百 KB。
+  if (!confirm('一键修复会做这几件事：\n\n'
+    + '1. modprobe wireguard（加载内核模块，本地操作）\n'
+    + '2. 写 /etc/modules-load.d/drouter-wireguard.conf（开机自动加载）\n'
+    + '3. 如果还没装，apt-get install wireguard-tools（需要联网下载）\n\n'
+    + '不会改动你的网络接口、防火墙和现有 VPN 配置。\n要继续吗？')) return;
+  const box = $('#vp-out');
+  box.classList.remove('hidden');
+  box.innerHTML = '<p class="desc">正在修复 WireGuard 环境…'
+    + '<br><span class="desc">装包时可能要等十几秒。</span></p>';
+  const r = await api('/api/vpn', { method: 'POST', body: { op: 'fix' } });
+  const d = r.data || {};
+  const notes = d.notes || [];
+  if (!r.ok) {
+    box.innerHTML = `<div class="notice err">${esc(r.msg_cn || '修复失败')}</div>`
+      + (notes.length ? '<ul class="desc" style="margin-top:6px">'
+        + notes.map(x => `<li>${esc(x)}</li>`).join('') + '</ul>' : '');
+    toast(r.msg_cn || '修复失败', 'err', 9000);
+    vpnLoad(false);
+    return;
+  }
+  box.innerHTML = `<div class="notice ok">${esc(r.msg_cn || '修复完成')}</div>`;
+  toast(r.msg_cn || '修复完成', 'ok', 8000);
+  vpnLoad(false);
 }
 
 async function vpnAddPeer() {

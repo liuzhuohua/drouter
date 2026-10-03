@@ -1,19 +1,22 @@
 #!/bin/bash
 # 容器成品镜像冒烟（第二段）：登录 + Web 终端建会话 + 接口抽查
-# 1.0.7 本轮新增备份 / 告警 / 配额三个守护，容器形态同样要验：
+# 1.0.7 新增备份 / 告警 / 配额三个守护，容器形态同样要验：
 #   ① 容器里没有 systemd，三个新守护仍能被拉起（_shelld_spawn 同款回退路径）
 #   ② /dev/ptmx 存在，PTY 能开（信号量上限后新建会话要回 BUSY 而不是挂死）
 #   ③ 自签证书的 SAN 取自本机地址，不得再出现作者写死的内网 IP
 #      （1.0.4 修复；过去直接硬编码 192.168.7.3，任何机器上签出来都带着它）
 #   ④ sync-isp-dns.sh（1.0.6 新增，PPPoE 上游 DNS 同步）必须在镜像里
 #   ⑤ rescue token / SNMP 净化（1.0.6 修）都在 backend，要能被 import
-#   ⑥ 本轮修的 7 个缺陷：备份敏感排除、VPN 私钥不外泄、ip_network 3.13 判定
+#   ⑥ 1.0.7 修的 7 个缺陷：备份敏感排除、VPN 私钥不外泄、ip_network 3.13 判定
+#   ⑦ 1.0.8 新增：VPN 四态诊断（_vpn_env）+ /etc/modules-load.d/ 开机自启，
+#      容器里 wireguard 模块多半加载不了 → 这正好是「unsupported」那一档，
+#      验的是**别误报成别的态**、以及 fix 按钮该消失时消失
 # 用 --network none：不碰宿主网络，只在容器内自测 127.0.0.1。
 set -u
 
-TAR=/tmp/drouter-107-final.tar
-NAME=drouter-smoke107
-IMG=drouter:1.0.7
+TAR=/tmp/drouter-108-final.tar
+NAME=drouter-smoke108
+IMG=drouter:1.0.8
 BASE=https://127.0.0.1:8443
 PODMAN="podman"
 
@@ -204,7 +207,7 @@ ckc "sync-isp-dns.sh 写盘失败非零退出（不能静默 rc=0）" 2 \
     "$($PODMAN exec "$NAME" grep -c 'exit 1' /opt/drouter/scripts/sync-isp-dns.sh 2>&1)"
 
 echo
-echo "=== 12. 1.0.7 三个新守护在镜像里且语法正确 ==="
+echo "=== 12. 1.0.7 新增的三个守护在镜像里且语法正确 ==="
 # 容器形态没有 systemd，守护不能只靠 systemctl。这里只验「文件在 + 能编译 +
 # 有不依赖 init 的拉起路径」，真跑起来要等 sync.sh 那轮真机验证。
 for d in backupd alertd quotad; do
@@ -244,6 +247,75 @@ ck "DEPS 登记 wireguard-tools" "wireguard-tools" \
 # ⑤ Python 版本必须是 3.13 —— 本轮修的 ip_network 缺陷正是 3.13 才暴露的
 ck "镜像 Python 是 3.13（3.12 上这条断言无意义）" 'Python 3\.13' \
    "$($PODMAN exec "$NAME" python3 -V 2>&1)"
+
+echo
+echo "=== 14. 1.0.8 VPN 四态诊断在容器形态下的表现 ==="
+# 容器里wireguard 模块多半加载不了（内核没暴露模块或 /lib/modules 缺失）。
+# 关键不是「能不能装上」，而是**别判错态** ——
+# 1.0.7 之前只分「有/无」，本轮才拆成四态并给出可执行的下一步。
+H="/opt/drouter/backend/drouter-helper.py"
+ck "_vpn_env 四态函数在镜像里" 'def _vpn_env' \
+   "$($PODMAN exec "$NAME" grep -c 'def _vpn_env' $H 2>&1 | head -1)"
+# ⛔ 判据不能只 grep 字面量：注释/docstring 里也会写这些词。
+# 所以下面真把函数跑起来，看它在**本机**返回哪一态。
+# 探针文件位置：可用环境变量覆盖。写死本机路径的话，换台机器跑就会
+# 直接判「探针不存在」—— 而真实原因只是路径不对，误报成产品问题。
+PROBE="${PROBE:-/tmp/vpn-env-probe.py}"
+if [ ! -f "$PROBE" ]; then
+  echo "  ✘ 探针脚本不存在：$PROBE"
+  fail=$((fail+1))
+else
+  $PODMAN cp "$PROBE" "$NAME:/tmp/vpn-env-probe.py" >/dev/null 2>&1
+  VENV_OUT="$($PODMAN exec "$NAME" python3 /tmp/vpn-env-probe.py 2>&1)"
+  if grep -q 'IMPORTERR' <<<"$VENV_OUT"; then
+    echo "  ✘ _vpn_env 能在镜像里 import 并运行"
+    echo "$VENV_OUT" | head -5
+    fail=$((fail+1))
+  else
+    echo "  ✔ _vpn_env 能在镜像里 import 并运行"
+    pass=$((pass+1))
+    for k in STATE VIRT FIXABLE AUTOLOAD KERNEL; do
+      v="$(grep "^$k=" <<<"$VENV_OUT" | head -1 | cut -d= -f2-)"
+      echo "     $k = ${v:-（空）}"
+    done
+    st="$(grep '^STATE=' <<<"$VENV_OUT" | cut -d= -f2-)"
+    # 判据不能写死某一态：不同内核/容器能力下合法结果不同。
+    # 真正要钉死的是「返回值落在四态之内」—— 判错态才是 1.0.7 那个 bug。
+    if grep -qE '^(ready|need_module|need_tool|unsupported)$' <<<"$st"; then
+      echo "  ✔ state 落在四态之内（$st）"
+      pass=$((pass+1))
+    else
+      echo "  ✘ state 必须是四态之一，实际「${st}」"
+      fail=$((fail+1))
+    fi
+    # unsupported 时不得声称「可一键修复」—— 那会把用户引向一条必然失败的操作
+    if [ "$st" = "unsupported" ]; then
+      if grep -q '^FIXABLE=False' <<<"$VENV_OUT"; then
+        echo "  ✔ unsupported 时 fixable=False"
+        pass=$((pass+1))
+      else
+        echo "  ✘ unsupported 时 fixable 必须为 False"
+        fail=$((fail+1))
+      fi
+    fi
+    # 模块文件那一级是本轮新增的探测；查不到也要正常返回而不是抛异常
+    if grep -qE '^KERNEL=\S' <<<"$VENV_OUT"; then
+      echo "  ✔ kernel 版本取到了（四态诊断没因为 /lib/modules 缺失而崩）"
+      pass=$((pass+1))
+    else
+      echo "  ✘ kernel 版本应能取到"
+      fail=$((fail+1))
+    fi
+  fi
+fi
+# 开机自启文件由 fix 写，镜像里不该预先存在
+ckc "镜像里不预置 modules-load.d 配置" 0 \
+    "$($PODMAN exec "$NAME" ls /etc/modules-load.d/drouter-wireguard.conf 2>&1 >/dev/null; echo $?)"
+# 前端：老后端（没有 env 字段）必须显示 unknown 而不是 unsupported
+ck "前端老后端兜底是 unknown" "state: 'unknown'" \
+   "$($PODMAN exec "$NAME" grep -c "state: 'unknown'" /opt/drouter/web/app.js 2>&1 | head -1)"
+ck "前端有 VPN 一键修复按钮" 'id="vp-fix"' \
+   "$($PODMAN exec "$NAME" grep -c 'id="vp-fix"' /opt/drouter/web/app.js 2>&1 | head -1)"
 
 echo
 echo "================================================"
