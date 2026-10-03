@@ -51,6 +51,9 @@ install -m 0644 $SRC/backend/drouter-helpd.py  $OPT/backend/drouter-helpd.py
 install -m 0644 $SRC/backend/drouter-backupd.py $OPT/backend/drouter-backupd.py
 install -m 0644 $SRC/backend/drouter-alertd.py  $OPT/backend/drouter-alertd.py
 install -m 0644 $SRC/backend/drouter-quotad.py  $OPT/backend/drouter-quotad.py
+# DDNS 定时更新守护（1.0.8）。drouter-ddns.service/.timer 不在这里预置：
+# 周期取自用户填的「检测间隔」，由 helper 的 _write_ddns_timer() 运行时生成。
+install -m 0644 $SRC/backend/drouter-ddnsd.py  $OPT/backend/drouter-ddnsd.py
 
 # 主题之家（#12）：自定义主题目录 + 生效主题标记
 mkdir -p /etc/drouter/themes
@@ -371,7 +374,7 @@ echo "=== 10. 校验 ==="
 for f in render.py drouter-helper.py drouter-web.py drouter-logd.py \
          drouter-snapshotd.py drouter-rescue.py drouter-shelld.py \
          drouter-helpd.py drouter-backupd.py drouter-alertd.py \
-         drouter-quotad.py theme.py; do
+         drouter-quotad.py drouter-ddnsd.py theme.py; do
     p="$OPT/backend/$f"
     if [ ! -f "$p" ]; then echo "✘ 缺少文件: $p"; exit 1; fi
     python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' "$p" \

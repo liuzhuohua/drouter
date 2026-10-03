@@ -5,6 +5,7 @@
 真机构建由 packaging/build-deb.sh 负责（需要 dpkg-deb），本脚本负责在任何机器上
 都能跑的「结构正确性」检查，把「打出来的包不能用」挡在构建之前。
 """
+import io
 import os
 import re
 import subprocess
@@ -206,6 +207,36 @@ have = {f for f in os.listdir(os.path.join(ROOT, 'backend'))
 notlisted = sorted(have - set(BACKEND_MODULES))
 ck('backend/ 下没有游离于清单之外的模块', not notlisted,
    '→ 未进清单：%s' % notlisted if not notlisted else '')
+
+# ⚠️ 光查 build-deb.sh **不够** —— 打包对、真机不对，一样是功能开不起来。
+# 1.0.8 加 drouter-ddnsd.py 时就踩到过：build-deb 用 `install backend/*.py`
+# 通配复制，ddnsd  自动进了包，t-packaging 全绿；可 scripts/deploy.sh
+# 是**逐个 install 硬名单**，ddnsd 漏在里面 —— 于是「本地全绿、真机没有文件」，
+# 表现为 timer 起来报 203/EXEC，极难定位。
+# 部署才是真正生效的那一步，所以**两份清单都要查**。
+DP = os.path.join(ROOT, 'scripts', 'deploy.sh')
+dp_src = io.open(DP, encoding='utf-8').read()
+# deploy.sh 里那两段：编译校验的 for 清单 + 逐个 install 段落
+dp_for = ''
+m = re.search(r'for f in render\.py.*?; do', dp_src, re.S)
+if m:
+    dp_for = m.group(0)
+dp_inst = '\n'.join(l for l in dp_src.splitlines()
+                    if re.search(r'install -m 0644 \$SRC/backend/', l))
+dp_all = dp_for + '\n' + dp_inst
+dp_miss = sorted(x for x in have
+                 if not re.search(r'(?<![A-Za-z0-9_.-])%s(?![A-Za-z0-9_.-])'
+                                  % re.escape(x), dp_all))
+ck('deploy.sh 里每个后端模块都出现（for 校验或逐个 install）',
+   not dp_miss, '→ deploy.sh 漏了：%s' % dp_miss if dp_miss else '')
+
+# 反向：deploy.sh 的 for 清单也必须与 backend/ 对得上（抄一份就会漂移）
+dp_named = set(re.findall(r'(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+\.py)(?![A-Za-z0-9_.-])',
+                          dp_for))
+ck('deploy.sh 的 for 清单不是脱离 backend/ 的另一份',
+   set(BACKEND_MODULES) - dp_named == set(),
+   '→ build-deb 有而 deploy.sh 无：%s'
+   % sorted(set(BACKEND_MODULES) - dp_named))
 
 print('\n结果：失败 %d 项' % len(fails))
 for f in fails:

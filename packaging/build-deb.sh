@@ -78,11 +78,15 @@ install -m 0755 "$HERE/packaging/deb/postrm"   "$STAGE/DEBIAN/postrm"
     | sed 's|^\./||' | xargs -r md5sum > DEBIAN/md5sums )
 
 echo "== 4/6 校验 =="
-# 后端 12 个模块必须齐全，缺一个上线后就是某个功能打不开
+# 后端 13 个模块必须齐全，缺一个上线后就是某个功能打不开。
+# ⚠️ drouter-ddnsd.py 是 DDNS 定时更新守护（1.0.8 新增）：
+#    deb 里**只有这个脚本**，drouter-ddns.service/.timer 是运行时由
+#    helper 的 _write_ddns_timer() 生成的（周期取自用户填的检测间隔），
+#    所以下面的 systemd 清单里不能出现它们，否则构建会误判「缺少单元」。
 for f in render.py drouter-helper.py drouter-web.py drouter-logd.py \
          drouter-snapshotd.py drouter-rescue.py drouter-shelld.py \
          drouter-helpd.py drouter-backupd.py drouter-alertd.py \
-         drouter-quotad.py theme.py; do
+         drouter-quotad.py drouter-ddnsd.py theme.py; do
   [ -f "$STAGE/opt/drouter/backend/$f" ] || { echo "✘ 缺少 $f"; exit 1; }
   python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' \
     "$STAGE/opt/drouter/backend/$f"
@@ -90,7 +94,7 @@ done
 [ -f "$STAGE/opt/drouter/web/app.js" ] || { echo "✘ 缺少 app.js"; exit 1; }
 # 这里的数字必须等于上面for 里的条目数。写错了不会让构建失败，
 # 但会让人以为清单是全的（历史上「7 个」和实际 12 个长期不符）。
-echo "  后端模块 12 个、语法全部通过"
+echo "  后端模块 13 个、语法全部通过"
 
 # systemd 单元齐全性：少一个就是「某项功能装完不工作」
 for u in drouter-web.service drouter-helpd.service drouter-shelld.service \

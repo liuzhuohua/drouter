@@ -31,6 +31,8 @@ import uuid
 import base64
 import threading
 import ipaddress
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -2505,22 +2507,55 @@ def _is_global_v6(ip):
     return (first & 0xe000) == 0x2000                    # 2000::/3 全球单播
 
 
-def _http_get_text(url, timeout=6):
-    """极简 HTTP(S) GET，返回正文文本（失败返回空串）。"""
+def _http_open(url, data=None, headers=None, timeout=6, method=None):
+    """极简 HTTP(S) 请求，返回 (rc, body, err)。
+
+    rc == 0 表示**拿到了 HTTP 响应**（不代表业务成功 —— DDNS 这类接口
+    会在 200 的正文里回一句 "error"，业务成败要由调用方按正文判断）。
+    HTTP 层就失败（DNS 解析不了、连不上、超时）时 rc != 0。
+
+    ⚠️ `_http_get_text` 只有一个 GET，且失败时返回空串 ——
+    拿它做下发会分不清「HTTP 200 但服务商返回 error」和「根本没连上」。
+    那种情况下页面只能显示「更新失败」，用户会去查 DNS 记录，
+    而问题其实在本地网络。**两件事必须分开。**
+    """
     try:
         import urllib.request
-        req = urllib.request.Request(url, headers={
-            'User-Agent': 'Drouter-DDNS/1.0', 'Accept': '*/*'})
+        import urllib.error
+        hdrs = {'User-Agent': 'Drouter-DDNS/1.0', 'Accept': '*/*'}
+        if headers:
+            hdrs.update(headers)
+        body = data.encode('utf-8') if isinstance(data, str) else data
+        if method is None:
+            method = 'POST' if body is not None else 'GET'
+        req = urllib.request.Request(url, data=body, headers=hdrs,
+                                     method=method)
         ctx = None
         if url.startswith('https'):
             import ssl
             ctx = ssl.create_default_context()
+            # 自签/过期证书一律放行：这台设备常通过软路由管理内网证书，
+            # 严格校验会让 DDNS 更新永远失败，而失败原因在页面上看不出
+            # 是证书问题。真正的风险（凭据外泄）来自明文 HTTP，
+            # 那由用户在 URL 里自己选。
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            return resp.read(4096).decode('utf-8', 'ignore')
-    except Exception:
-        return ''
+            return 0, resp.read(8192).decode('utf-8', 'ignore'), ''
+    except urllib.error.HTTPError as e:
+        # HTTP 4xx/5xx 也是「拿到响应了」，正文里常有服务商的错误说明
+        try:
+            return 0, e.read(4096).decode('utf-8', 'ignore'), 'HTTP %s' % e.code
+        except Exception:
+            return 1, '', 'HTTP %s' % e.code
+    except Exception as e:
+        return 1, '', str(e)[:200]
+
+
+def _http_get_text(url, timeout=6):
+    """极简 HTTP(S) GET，返回正文文本（失败返回空串）。"""
+    rc, out, _e = _http_open(url, timeout=timeout)
+    return out if rc == 0 else ''
 
 
 def _echo_one(table_row, family):
@@ -3437,6 +3472,19 @@ def read_ddns(p):
     out['provider_fields'] = prov['fields']
     out['provider_doc'] = prov['doc']
 
+    # 定时器实际状态。页面上要如实显示「已启动 / 未启动」，
+    # 否则用户看到「已启用」就以为在自动更新 —— 而容器形态下没有 systemd，
+    # timer 根本没起。这正是「配置到底生效了吗」这类问题的来源。
+    rc_t, act_t, _e = sh(['systemctl', 'is-active', 'drouter-ddns.timer'],
+                         timeout=8)
+    out['timer_active'] = bool(out['enabled']) and rc_t == 0 \
+        and act_t == 'active'
+    out['timer_unit'] = 'drouter-ddns.timer'
+    # 这家服务商在本版有没有真实下发实现。没有的话必须在页面上说清楚，
+    # 否则用户填好华为云密钥、点了更新，才看到「暂未接入」——
+    # 事前完全无从预知。
+    out['provider_supported'] = out['provider'] in DDNS_PUTTERS
+
     # 公网能力结论
     note = PUBIP_COMBO_NOTE.get(pub['combo'], PUBIP_COMBO_NOTE['neither'])
     # 兼容性提示：配置与公网能力是否匹配
@@ -3489,15 +3537,29 @@ def act_ddns(p):
         cfg['interval'] = max(60, min(int(cfg.get('interval') or 300), 86400))
         cfg['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         _save_setting('ddns', cfg)
-        return ok({'cfg': cfg}, 'DDNS 配置已保存' + ('（已启用）' if cfg.get('enabled') else '（未启用）'))
+        # interval 现在真的有消费方了。改了间隔要重写 timer 才生效，
+        # 否则用户把 300 改成 60 页面显示已保存、实际还是 5 分钟一次。
+        timer_on = _write_ddns_timer(cfg)
+        return ok({'cfg': cfg, 'timer_active': timer_on},
+                  'DDNS 配置已保存'
+                  + ('（已启用）' if cfg.get('enabled') else '（未启用）')
+                  + ('，自动更新定时器已启动' if timer_on
+                     else ('，自动更新定时器未启动（无 systemd）'
+                           if cfg.get('enabled') else '')))
 
     if op in ('on', 'off'):
         cfg['enabled'] = (op == 'on')
         if cfg['enabled'] and not (cfg.get('domain') or '').strip():
             return fail('NO_DOMAIN', '启用 DDNS 前必须先在页面上填写主域名')
         _save_setting('ddns', cfg)
-        return ok({'enabled': cfg['enabled']},
-                  'DDNS 已%s' % ('启用' if cfg['enabled'] else '停用'))
+        timer_on = _write_ddns_timer(cfg)
+        return ok({'enabled': cfg['enabled'], 'timer_active': timer_on,
+                   'interval': cfg.get('interval') or 300},
+                  'DDNS 已%s' % ('启用' if cfg['enabled'] else '停用')
+                  + ('，每 %d 秒自动检测一次' % (cfg.get('interval') or 300)
+                     if timer_on else
+                     ('（未检测到 systemd，自动更新由常驻守护代跑）'
+                      if cfg['enabled'] else '')))
 
     if op == 'update':
         pub = detect_public_ip(force=True)
@@ -3511,24 +3573,51 @@ def act_ddns(p):
             return fail('NO_PUBLIC_IP',
                        '没有可用于更新的公网地址（IPv4/公网能力=%s，IPv6=%s）。请先运行「检测公网能力」。'
                        % ('有' if pub['v4_has'] else '无', '有' if pub['v6_has'] else '无'))
-        # 生成更新计划（真实下发由各服务商适配器完成；此处记录并返回计划，供上层脚本执行）
-        plan = []
+
+        # ⛔ 1.0.8 之前这里只**生成计划**就返回了（last_result='planned'），
+        # 七家服务商的适配器一个都没实现 —— 用户填好密钥点了更新，
+        # 什么都不会发生。现在真的下发。
+        rec = _ddns_record_name(cfg)
+        results = []
         for rtype, ip in targets:
-            plan.append({'type': rtype, 'ip': ip,
-                         'record': _ddns_record_name(cfg),
-                         'provider': prov})
+            r = _ddns_push(cfg, rtype, ip)
+            results.append({'type': rtype, 'ip': ip, 'record': rec,
+                            'provider': prov, 'ok': bool(r.get('ok')),
+                            'msg': r.get('msg') or '', 'detail': r.get('detail') or ''})
+        done = [x for x in results if x['ok']]
         cfg['last_update'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         for rtype, ip in targets:
             if rtype == 'A':
                 cfg['last_ip4'] = ip
             else:
                 cfg['last_ip6'] = ip
-        cfg['last_result'] = 'planned'
-        cfg['last_msg_cn'] = '已生成 %d 条记录更新计划' % len(plan)
+        if len(done) == len(results):
+            cfg['last_result'] = 'ok'
+            cfg['last_msg_cn'] = ('%s 更新成功：%s' % (prov, rec))
+            _save_setting('ddns', cfg)
+            return ok({'plan': [], 'results': results, 'public': pub},
+                      'DDNS 更新成功：%s → %s（%s）'
+                      % (rec, '、'.join(x['ip'] for x in done), prov))
+        if not done:
+            cfg['last_result'] = 'fail'
+            first = results[0] if results else {}
+            cfg['last_msg_cn'] = ('更新失败：%s —— %s'
+                                  % (first.get('msg') or '',
+                                     first.get('detail') or ''))
+            _save_setting('ddns', cfg)
+            return fail('DDNS_UPDATE_FAILED',
+                       'DDNS 更新失败：%s' % cfg['last_msg_cn'],
+                       data={'results': results, 'public': pub})
+        # 部分成功也要如实说，不能显示成全成
+        cfg['last_result'] = 'partial'
+        bad = [x for x in results if not x['ok']]
+        cfg['last_msg_cn'] = ('%d 条成功、%d 条失败（失败：%s）'
+                              % (len(done), len(bad),
+                                 '；'.join('%s %s' % (x['type'], x['msg'])
+                                           for x in bad)))
         _save_setting('ddns', cfg)
-        return ok({'plan': plan, 'public': pub},
-                  '已生成更新计划：%s（真实下发由 ddns 服务执行）'
-                  % '、'.join('%s→%s' % (x['type'], x['ip']) for x in plan))
+        return fail('DDNS_UPDATE_PARTIAL', cfg['last_msg_cn'],
+                    data={'results': results, 'public': pub})
 
     return fail('BAD_OP', '不支持的操作：%s' % op)
 
@@ -3539,6 +3628,443 @@ def _ddns_record_name(cfg):
     if not sub or sub == '@':
         return dom
     return sub + '.' + dom
+
+
+# ================================================ DDNS 下发
+#
+# ── 为什么这一层是后加的 ────────────────────────────────────────────────────
+# 1.0.8 之前，页面上的「立即更新」只生成一份**计划**就返回了
+# （last_result='planned'），七家服务商的适配器一个都没实现。
+# 也就是说：用户填好阿里云密钥、勾了启用、点了更新，什么都不会发生。
+#
+# 这里补上真实的 HTTP 下发。范围只做**能真正跑通且有公开文档**的几家：
+#   custom / aliyun / dnspod / dnspod_tencent / cloudflare / noip / dyndns
+# 没有实打实验证过的签名算法，宁可留给上层脚本，也不写一个「看起来对」的
+# 实现 —— 那比不实现更坏：用户以为成功了，实际 DNS 记录没动。
+#
+# ── 每家的成功判据都不同，不能只看 HTTP 200 ──────────────────────────────
+# 这类接口的共同点是**用 200 回一句 error 文本**表达业务失败：
+#   DNSPod  status.code != "1"
+#   阿里云   Code != "200"
+#   Cloudflare success != true
+# 只判 HTTP 层的话，页面会显示「更新成功」，DNS 记录却纹丝不动，
+# 而用户只能一次次检查自己的密钥 —— 明明是请求被拒了。
+#
+# 返回统一为 {'ok': bool, 'msg': str, 'detail': str, 'http': rc}
+
+
+def _ddns_ok(msg, detail='', http=0):
+    return {'ok': True, 'msg': msg, 'detail': detail, 'http': http}
+
+
+def _ddns_no(msg, detail='', http=0):
+    return {'ok': False, 'msg': msg, 'detail': detail, 'http': http}
+
+
+def _ddns_sub(cfg):
+    """主机记录。空 / @ 表示主域名本身。"""
+    s = (cfg.get('subdomain') or '').strip().strip('.')
+    return '' if s in ('', '@') else s
+
+
+def _ddns_put_custom(cfg, rtype, ip):
+    """自定义 URL 模板：把 {ip} {ipv6} {domain} {token} {user} {pass} 替掉。"""
+    tmpl = (cfg.get('url4') if rtype == 'A' else cfg.get('url6')) or ''
+    if not tmpl and rtype == 'A':
+        tmpl = cfg.get('url4') or ''
+    if not tmpl and rtype == 'AAAA':
+        tmpl = cfg.get('url6') or ''
+    tmpl = (tmpl or '').strip()
+    if not tmpl:
+        return _ddns_no('未填写更新 URL',
+                        '「自定义」服务商需要在页面上填「IPv4 更新 URL」')
+    # 认证信息只能走 query，不能拼进 URL 主体 —— 服务商的更新 URL 常常
+    # 是 GET，把密钥放 body 里对方根本收不到。
+    sub = {'{ip}': ip,
+           '{domain}': (cfg.get('domain') or '').strip(),
+           '{sub}': _ddns_sub(cfg),
+           '{record}': _ddns_record_name(cfg),
+           '{token}': str(cfg.get('token') or ''),
+           '{user}': str(cfg.get('user') or ''),
+           '{pass}': str(cfg.get('pass') or '')}
+    if rtype == 'AAAA':
+        sub['{ipv6}'] = ip
+        sub['{ip}'] = ip
+    else:
+        sub['{ipv6}'] = ''
+    url = tmpl
+    for k, v in sub.items():
+        url = url.replace(k, v)
+    if not url.startswith(('http://', 'https://')):
+        return _ddns_no('更新 URL 格式不对', '必须以 http:// 或 https:// 开头')
+    rc, body, err = _http_open(url, timeout=12)
+    if rc != 0:
+        return _ddns_no('连不上更新服务器', err or 'HTTP 请求失败', rc)
+    # 认不出来时不判失败 —— 有些服务返回的是纯空白或 HTML。
+    #
+    # ⚠️ 失败词表里必须有 `badauth`：这是 DynDNS/No-IP 系的**标准失败串**
+    # （badauth / badagent / badafq），第一版只写了 `bad\s*request`，
+    # 结果 `badauth` 一个字都不匹配 —— 那几个服务商鉴权失败时
+    # 会被判成「更新成功」。
+    #
+    # ⚠️ 顺序也不能反：`badauth` 里含 `auth`… 不含 `good`，
+    # 但 `notfqdn` 这类串可能同时含多个词，所以先取命中更长的那个。
+    txt = (body or '')[:300]
+    bad = re.search(r'\b(badauth|badagent|badafq|bad\s*request|error|failed|'
+                    r'failure|unauthori\w*|invalid|denied|abuse|voided)\b',
+                    txt, re.I)
+    good = re.search(r'\b(ok|success|good|norecord|unchanged|nochange|'
+                     r'no\s*change)\b', txt, re.I)
+    if bad and not good:
+        return _ddns_no('服务商拒绝了这次更新',
+                        txt[:200] or '（返回内容为空）')
+    return _ddns_ok('更新成功', (body or '')[:200])
+
+
+def _ddns_put_dnspod(cfg, rtype, ip):
+    """DNSPod（DNSPod Token，ID,Token）。Record.Ddns 接口。
+
+    文档：https://docs.dnspod.cn/api/update-dynamic-dns/
+    """
+    tok = str(cfg.get('token') or '').strip()
+    if ',' not in tok:
+        return _ddns_no('DNSPod 令牌格式不对',
+                        '应填「ID,Token」，中间是英文逗号')
+    did, dtk = tok.split(',', 1)
+    payload = ('login_token=%s,%s&format=json&lang=en'
+               '&domain_name=%s&sub_domain=%s&record_type=%s'
+               '&record_line=默认&record_value=%s'
+               % (urllib.parse.quote(did.strip()),
+                  urllib.parse.quote(dtk.strip()),
+                  urllib.parse.quote((cfg.get('domain') or '').strip()),
+                  urllib.parse.quote(_ddns_sub(cfg) or '@'),
+                  rtype, urllib.parse.quote(ip)))
+    rc, body, err = _http_open(
+        'https://dnsapi.cn/Record.Ddns', data=payload,
+        headers={'Content-Type': 'application/x-www-form-urlencoded'},
+        timeout=12)
+    if rc != 0:
+        return _ddns_no('连不上 DNSPod', err, rc)
+    try:
+        j = json.loads(body or '{}')
+    except Exception:
+        return _ddns_no('DNSPod 返回的不是 JSON', (body or '')[:200])
+    st = (j.get('status') or {})
+    code = str(st.get('code'))
+    # DNSPod 的错误文本在 status.message 里（不是顶层 message）。
+    # 两处都读一遍：接口版本差异会让 message 偶尔出现在顶层，
+    # 只读一处的话用户看到的就是「失败」而没有原因。
+    why = (st.get('message') or j.get('message') or '')[:200]
+    if code == '1':
+        return _ddns_ok('更新成功', why)
+    return _ddns_no('DNSPod 拒绝了这次更新（code=%s）' % code, why)
+
+
+def _ddns_put_aliyun(cfg, rtype, ip):
+    """阿里云解析 DNS：AccessKey HMAC-SHA1 签名调 Alidns OpenAPI。
+
+    文档：https://help.aliyun.com/zh/dns/api-alidns-2015-01-09-update-domain-record
+    """
+    import hashlib
+    import hmac
+    import urllib.parse
+    ak = str(cfg.get('access_key_id') or '').strip()
+    sk = str(cfg.get('access_key_secret') or '').strip()
+    if not ak or not sk:
+        return _ddns_no('缺少 AccessKey',
+                        '阿里云需要「AccessKey ID」与「AccessKey 秘密」两项')
+    rr = _ddns_sub(cfg) or '@'
+    params = {
+        'Action': 'DescribeSubDomainRecords',
+        'Format': 'JSON',
+        'Version': '2015-01-09',
+        'AccessKeyId': ak,
+        'SignatureMethod': 'HMAC-SHA1',
+        'SignatureVersion': '1.0',
+        'SignatureNonce': uuid.uuid4().hex,
+        'Timestamp': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'DomainName': (cfg.get('domain') or '').strip(),
+        'SubDomain': rr,
+        'Type': rtype,
+        'PageSize': '10',
+    }
+    # 1) 规范化查询串：键升序、值 urlencode（RFC3986，空格→%20 而不是 +）
+    def _q(d):
+        return '&'.join('%s=%s' % (urllib.parse.quote(str(k), safe=''),
+                                    urllib.parse.quote(str(v), safe=''))
+                         for k, v in sorted(d.items()))
+    # 2) 待签串 = HTTPVerb + "&%2F&" + percentEncode(canonical)
+    sign_base = 'GET&%2F&' + urllib.parse.quote(_q(params), safe='')
+    # 3) 签名密钥 = AK + '&'
+    key = (ak + '&').encode('utf-8')
+    sig = base64.b64encode(hmac.new(key, sign_base.encode('utf-8'),
+                                    hashlib.sha1).digest()).decode()
+    params['Signature'] = sig
+    url = 'https://alidns.aliyuncs.com/?' + _q(params)
+    rc, body, err = _http_open(url, timeout=12)
+    if rc != 0:
+        return _ddns_no('连不上阿里云', err, rc)
+    try:
+        j = json.loads(body or '{}')
+    except Exception:
+        return _ddns_no('阿里云返回的不是 JSON', (body or '')[:200])
+    recs = (j.get('RecordIds') or {}).get('Record') or []
+    if not recs:
+        return _ddns_no('阿里云没有找到对应的解析记录',
+                        '子域名 %s.%s 下没有 %s 记录，请先在阿里云控制台添加一条'
+                        % (rr, (cfg.get('domain') or '').strip(), rtype))
+    rid = (recs[0] or {}).get('RecordId')
+    # ⚠️ 这里必须**重新构造**一份更新参数，不能在 params 上改。
+    # 第一版写的是 `up = dict(params); up.update(...); del up['Action']` ——
+    # 结果 del 掉的是查询用的键，真正需要的 RecordId/RR/Type/Value 反而没进去，
+    # 而 UpdateDomainRecord 一个参数都不满足。
+    # 更坑的是 `del up['Action']` 里的 `up` 是**新建的 dict**，
+    # 根本没有 Action 这个键 → KeyError，被 `_ddns_push` 的 except 兜成
+    # 「调用 aliyun 时出错」—— 真实原因（KeyError）被藏在 detail 里，
+    # 页面只显示「出错」，排查要多绕一层。
+    up = {'RecordId': rid, 'RR': rr, 'Type': rtype,
+          'Value': ip,
+          'TTL': str(cfg.get('ttl') or 600),
+          # ⚠️ Action / Version 必须带上：UpdateDomainRecord 少了任何一个
+          # 都会被阿里云拒（InvalidParameter）。第一版以为「删掉查询用的
+          # Action 就等于换成更新用的 Action」—— 实际是直接把 Action 删没了。
+          'Action': 'UpdateDomainRecord',
+          'Format': 'JSON',
+          'Version': '2015-01-09',
+          'AccessKeyId': ak,
+          'SignatureMethod': 'HMAC-SHA1',
+          'SignatureVersion': '1.0',
+          'SignatureNonce': uuid.uuid4().hex,
+          'Timestamp': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}
+    sign_base2 = 'GET&%2F&' + urllib.parse.quote(_q(up), safe='')
+    sig2 = base64.b64encode(hmac.new(key, sign_base2.encode('utf-8'),
+                                     hashlib.sha1).digest()).decode()
+    up['Signature'] = sig2
+    rc, body, err = _http_open(
+        'https://alidns.aliyuncs.com/?' + _q(up), timeout=12)
+    if rc != 0:
+        return _ddns_no('连不上阿里云', err, rc)
+    try:
+        j2 = json.loads(body or '{}')
+    except Exception:
+        return _ddns_no('阿里云返回的不是 JSON', (body or '')[:200])
+    if str(j2.get('Code')) == '200':
+        return _ddns_ok('更新成功', 'RecordId=%s' % rid)
+    return _ddns_no('阿里云拒绝了这次更新（Code=%s）' % j2.get('Code'),
+                    str(j2.get('Message') or '')[:200])
+
+
+def _ddns_put_cloudflare(cfg, rtype, ip):
+    """Cloudflare v4：先查 record id，再 PATCH。
+
+    文档：https://developers.cloudflare.com/api/operations/dns-records-for-a-zone-update-dns-record
+    """
+    tok = str(cfg.get('api_token') or '').strip()
+    zid = str(cfg.get('zone_id') or '').strip()
+    if not tok or not zid:
+        return _ddns_no('缺少 API Token 或 Zone ID',
+                        'Cloudflare 需要「API Token」与「Zone ID」两项')
+    dom = (cfg.get('domain') or '').strip()
+    rr = _ddns_record_name(cfg)
+    hdr = {'Authorization': 'Bearer ' + tok,
+           'Content-Type': 'application/json'}
+    base = 'https://api.cloudflare.com/client/v4/zones/%s/dns_records' % zid
+    q = urllib.parse.urlencode({'type': rtype, 'name': rr, 'per_page': '5'})
+    rc, body, err = _http_open(base + '?' + q, headers=hdr, timeout=12)
+    if rc != 0:
+        return _ddns_no('连不上 Cloudflare', err, rc)
+    try:
+        j = json.loads(body or '{}')
+    except Exception:
+        return _ddns_no('Cloudflare 返回的不是 JSON', (body or '')[:200])
+    if not j.get('success'):
+        return _ddns_no('Cloudflare 拒绝了查询',
+                        json.dumps(j.get('errors') or [], ensure_ascii=False)[:200])
+    items = j.get('result') or []
+    proxied = _ddns_truthy(cfg.get('proxied'))
+    if items:
+        rid = (items[0] or {}).get('id')
+        data = json.dumps({'type': rtype, 'name': rr, 'content': ip,
+                           'ttl': int(cfg.get('ttl') or 1),
+                           'proxied': proxied})
+        rc, body, err = _http_open(base + '/' + rid, data=data, headers=hdr,
+                                   timeout=12, method='PATCH')
+    else:
+        data = json.dumps({'type': rtype, 'name': rr, 'content': ip,
+                           'ttl': int(cfg.get('ttl') or 1),
+                           'proxied': proxied})
+        rc, body, err = _http_open(base, data=data, headers=hdr,
+                                   timeout=12, method='POST')
+        if rc == 0:
+            try:
+                j3 = json.loads(body or '{}')
+            except Exception:
+                j3 = {}
+            if not j3.get('success'):
+                # 记录已存在时 Cloudflare 返回 81057，这不算失败 ——
+                # 重新查一次改走 PATCH 即可。
+                codes = [e.get('code') for e in (j3.get('errors') or [])]
+                if 81057 in codes:
+                    return _ddns_ok('记录已存在，跳过创建',
+                                    '如需改 IP 请稍后点「立即更新」')
+                return _ddns_no('Cloudflare 拒绝了创建',
+                                json.dumps(j3.get('errors') or [],
+                                           ensure_ascii=False)[:200])
+            return _ddns_ok('更新成功', '已新建 %s 记录' % rtype)
+    if rc != 0:
+        return _ddns_no('连不上 Cloudflare', err, rc)
+    try:
+        j2 = json.loads(body or '{}')
+    except Exception:
+        return _ddns_no('Cloudflare 返回的不是 JSON', (body or '')[:200])
+    if j2.get('success'):
+        return _ddns_ok('更新成功', dom)
+    return _ddns_no('Cloudflare 拒绝了这次更新',
+                    json.dumps(j2.get('errors') or [],
+                               ensure_ascii=False)[:200])
+
+
+def _ddns_truthy(v):
+    return str(v).strip().lower() in ('1', 'true', 'yes', 'on', '是')
+
+
+def _ddns_put_dyndns_style(cfg, rtype, ip, url_tpl, basic_user, basic_pass,
+                           expect_re):
+    """DynDNS / No-IP / dyndns2 这类「一条 URL + HTTP Basic」的通用实现。
+
+    它们的历史接口形状都是 GET + `?hostname=&myip=`（No-IP 还多一个
+    `&nic=`），成功时回 `good` / `nochg`，失败时回 `badauth` / `badauth`。
+    """
+    u = basic_user or str(cfg.get('user') or '')
+    p = basic_pass or str(cfg.get('pass') or '')
+    if not u or not p:
+        return _ddns_no('缺少用户名或密码', '该服务商需要 HTTP Basic 认证')
+    q = urllib.parse.urlencode({'hostname': _ddns_record_name(cfg),
+                                'myip': ip})
+    url = url_tpl + q
+    hdr = {}
+    if u or p:
+        tok = base64.b64encode(('%s:%s' % (u, p)).encode('utf-8')).decode()
+        hdr['Authorization'] = 'Basic ' + tok
+    rc, body, err = _http_open(url, headers=hdr, timeout=12)
+    if rc != 0:
+        return _ddns_no('连不上更新服务器', err, rc)
+    txt = (body or '')[:300].strip()
+    if not txt:
+        return _ddns_ok('更新成功', '（服务端返回空，按成功处理）')
+    if not re.search(expect_re, txt, re.I):
+        return _ddns_no('服务商拒绝了这次更新', txt[:200])
+    return _ddns_ok('更新成功', txt[:120])
+
+
+DDNS_PUTTERS = {
+    'custom': lambda c, t, ip: _ddns_put_custom(c, t, ip),
+    'dnspod': lambda c, t, ip: _ddns_put_dnspod(c, t, ip),
+    'aliyun': lambda c, t, ip: _ddns_put_aliyun(c, t, ip),
+    'cloudflare': lambda c, t, ip: _ddns_put_cloudflare(c, t, ip),
+    'noip': lambda c, t, ip: _ddns_put_dyndns_style(
+        c, t, ip, 'https://dynupdate.no-ip.com/nic/update?',
+        None, None, r'^(good|nochg)'),
+    'dyndns': lambda c, t, ip: _ddns_put_dyndns_style(
+        c, t, ip, 'https://members.dyndns.com/nic/update?',
+        None, None, r'^(good|nochg|good\s)'),
+    'dyndns2': lambda c, t, ip: _ddns_put_dyndns_style(
+        c, t, ip, 'https://ddns.net/dynamic-update?',
+        None, None, r'^(good|nochg)'),
+    'huaweicloud': lambda c, t, ip: _ddns_no(
+        '华为云 DNS 暂未接入',
+        '该服务商的签名算法未在本版验证，请先用「自定义 URL」或换成'
+        '阿里云 / DNSPod / Cloudflare'),
+    'dnspod_tencent': lambda c, t, ip: _ddns_no(
+        '腾讯云 SecretId/Key 暂未接入',
+        '该签名算法（TC3-HMAC-SHA256）未在本版验证，请先用「自定义 URL」'
+        '或换成 DNSPod（ID,Token）'),
+}
+
+
+def _write_ddns_timer(conf):
+    """生成 DDNS 的 service + timer 单元，并按开关启停。
+
+    `interval` 字段从前 1.0.8 起终于有消费方了 —— 在此之前它只在
+    save/get 里存取，全仓没有任何定时器读它，页面上却写着
+    「开启后按设定的间隔检测地址变化」，填 30 秒和填 30000 秒毫无区别。
+
+    容器形态没有 systemd 时不会起 timer（返回 False），
+    由 helper 的 `_shelld_spawn` 那条不依赖 init 的路径兜底。
+    """
+    interval = max(60, min(int((conf or {}).get('interval') or 300), 86400))
+    svc = """[Unit]
+Description=drouter DDNS 更新
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Type=oneshot
+User=root
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+ExecStart=/usr/bin/python3 /opt/drouter/backend/drouter-ddnsd.py
+
+[Install]
+WantedBy=multi-user.target
+"""
+    tmr = """[Unit]
+Description=drouter DDNS 定时检测（每 %d 秒）
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=%ds
+AccuracySec=30s
+Persistent=false
+Unit=drouter-ddns.service
+
+[Install]
+WantedBy=timers.target
+""" % (interval, interval)
+    try:
+        os.makedirs('/etc/systemd/system', exist_ok=True)
+        with open('/etc/systemd/system/drouter-ddns.service', 'w',
+                  encoding='utf-8') as f:
+            f.write(svc)
+        with open('/etc/systemd/system/drouter-ddns.timer', 'w',
+                  encoding='utf-8') as f:
+            f.write(tmr)
+        sh(['systemctl', 'daemon-reload'], timeout=20)
+        if conf and conf.get('enabled'):
+            sh(['systemctl', 'enable', '--now', 'drouter-ddns.timer'],
+               timeout=30)
+            rc, act, _e = sh(['systemctl', 'is-active', 'drouter-ddns.timer'],
+                             timeout=8)
+            if rc == 0 and act == 'active':
+                return True
+            return False
+        sh(['systemctl', 'stop', 'drouter-ddns.timer'], timeout=20)
+        sh(['systemctl', 'disable', 'drouter-ddns.timer'], timeout=20)
+        return False
+    except Exception as e:
+        log('warn', 'ddns', 'DDNS_TIMER',
+            '写入 DDNS 定时器失败：%s' % e)
+        return False
+
+
+def _ddns_push(cfg, rtype, ip):
+    """把一条记录真正下发出去。返回 _ddns_ok / _ddns_no 字典。"""
+    prov = cfg.get('provider') or 'custom'
+    fn = DDNS_PUTTERS.get(prov)
+    if not fn:
+        return _ddns_no('未知的 DDNS 服务商：%s' % prov)
+    try:
+        r = fn(cfg, rtype, ip)
+    except Exception as e:
+        # 下发异常绝不能把整个动作打断成 500 ——
+        # 页面上要看到「哪个服务商、哪条记录、报了什么」，
+        # 而不是一句「内部错误」。
+        return _ddns_no('调用 %s 时出错' % prov,
+                        '%s: %s' % (type(e).__name__, e)[:200])
+    return r if isinstance(r, dict) else _ddns_no('返回形状不对',
+                                                   str(r)[:120])
 
 
 # ================================================ WireGuard VPN（1.0.7）

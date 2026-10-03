@@ -4584,7 +4584,8 @@ async function viewDdns() {
 
     <div class="card">
       <h3>DDNS 开关</h3>
-      <p class="desc">开启后按设定的间隔检测地址变化，变化时自动更新域名解析记录。</p>
+      <p class="desc">开启后由后台定时任务按下面设定的间隔检测公网地址，
+        <b>只在地址变化时才下发</b>（IP 没变不会去敲服务商的接口，避免触发频率限制）。</p>
       <label class="switch"><input type="checkbox" id="dd-en" ${c.enabled ? 'checked' : ''}><i></i>启用动态域名解析</label>
       <div class="row">
         <label>记录类型
@@ -4597,6 +4598,13 @@ async function viewDdns() {
         <label>检测间隔（秒）<input id="dd-int" type="number" value="${esc(c.interval || 300)}" min="60" max="86400"></label>
       </div>
       <p class="hint-inline">IPv6 地址常为动态前缀，建议间隔 ≤ 300 秒、TTL ≤ 300 秒，以加快变更生效。</p>
+      <div class="kv" style="margin-top:8px"><b>自动更新定时器</b><span>
+        ${c.enabled
+          ? (c.timer_active
+            ? '<span class="tag ok">运行中</span> 每 ' + esc(c.interval || 300) + ' 秒检测一次'
+            : '<span class="tag warn">未启动</span> 未能拉起 ' + esc(c.timer_unit || 'drouter-ddns.timer') +
+              '，自动更新不会发生。请点下方「保存配置」重试，或检查这台机器是否支持 systemd。')
+          : '未启用（打开上方开关后生效）'}</span></div>
     </div>
 
     <div class="card">
@@ -4614,6 +4622,10 @@ async function viewDdns() {
       <div class="kv"><b>当前服务商</b><span>${esc(prov.n || '')}
         <span class="tag ${DDNS_REGION_TAG(prov.region)}">${esc(prov.region || '')}</span></span></div>
       <p class="desc" style="margin-top:6px">${esc(prov.desc || '')}</p>
+      ${c.provider_supported === false ? `<div class="notice warn" style="margin-top:8px">
+        <b>${esc(prov.n)}在本版尚未接入真实下发</b>，点「立即更新」只会得到「暂未接入」的失败提示，
+        DNS 记录不会变动。建议改用阿里云 / DNSPod / Cloudflare / 自定义 URL
+        —— 这几种已验证可用，覆盖了绝大多数家庭宽带与 NAS 的需求。</div>` : ''}
       ${prov.doc ? `<p class="hint-inline">官方文档：<a href="${esc(httpUrl(prov.doc))}" target="_blank" rel="noopener noreferrer">${esc(prov.doc)}</a></p>` : ''}
       <div id="dd-fields" style="margin-top:10px"></div>
       <div class="kv"><b>完整域名</b><span class="mono" id="dd-fqdn">—</span></div>
@@ -4684,12 +4696,23 @@ async function viewDdns() {
   const gp = $('#dd-gopubip');
   if (gp) gp.onclick = () => go('pubip');
   $('#dd-update').onclick = async () => {
-    $('#dd-out').innerHTML = '<pre>正在生成更新计划…</pre>';
-    const r2 = await api('/api/ddns', { method: 'POST', body: { op: 'update' } });
-    const p = (r2.data || {}).plan || [];
-    $('#dd-out').innerHTML = `<pre>${esc(r2.msg_cn || '')}\n` +
-      p.map(x => `  • ${esc(x.type)} 记录  ${esc(x.record)} → ${esc(x.ip)}（${esc(x.provider)}）`).join('\n') + '</pre>';
-    toast(r2.msg_cn, r2.ok ? 'ok' : 'err');
+    const out = $('#dd-out');
+    out.innerHTML = '<pre>正在下发更新…</pre>';
+    $('#dd-update').disabled = true;
+    try {
+      const r2 = await api('/api/ddns', { method: 'POST', body: { op: 'update' } });
+      const rs = (r2.data || {}).results || [];
+      const lines = rs.map(x =>
+        `  ${x.ok ? '✓' : '✗'} ${esc(x.type)}  ${esc(x.record)} → ${esc(x.ip)}（${esc(x.provider)}）`
+        + (x.ok ? '' : `\n      失败原因：${esc(x.msg || '')}`
+                 + (x.detail ? `　${esc(x.detail)}` : ''))).join('\n');
+      out.innerHTML = `<pre>${esc(r2.msg_cn || '')}${lines ? '\n' + lines : ''}</pre>`;
+      toast(r2.msg_cn, r2.ok ? 'ok' : 'err');
+    } finally {
+      // ⛔ 必须在 finally 里恢复按钮：请求失败（网络断、helper 超时）时
+      // 抛异常走不到这里，按钮就永久卡在 disabled —— 用户只能刷新页面。
+      $('#dd-update').disabled = false;
+    }
   };
   $('#dd-refresh').onclick = () => { toast('已刷新 DDNS 状态', 'ok'); viewDdns(); };
 
