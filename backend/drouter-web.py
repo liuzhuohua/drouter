@@ -1063,6 +1063,11 @@ class Api:
             return self.snapshot_delete()
         if p in ('/api/snapshot/prune',) and method == 'POST':
             return self.snapshot_prune()
+        # 快照备注编辑 / 上锁解锁（两者都只改 _meta.json，不碰快照内容）
+        if p in ('/api/snapshot/note',) and method == 'POST':
+            return self.snapshot_note()
+        if p in ('/api/snapshot/protect',) and method == 'POST':
+            return self.snapshot_protect()
         # 自动快照策略（查询 / 保存 / 立即执行）
         if p in ('/api/snapshot/auto',) and method in ('GET', 'POST'):
             return self.auto_snapshot()
@@ -1509,7 +1514,8 @@ class Api:
         if not self.auth():
             return
         b = self.body()
-        res = self.helper('snapshot', {'tag': b.get('tag') or 'manual'})
+        res = self.helper('snapshot', {'tag': b.get('tag') or 'manual',
+                                       'protected': b.get('protected')})
         audit(self.user, '创建快照', res.get('msg_cn'), res.get('ok', False))
         return self.json(res)
 
@@ -1522,9 +1528,52 @@ class Api:
         if not self.auth():
             return
         b = self.body()
-        res = self.helper('snapshot_delete', {'ts': b.get('ts')})
+        # force 只在用户对「已上锁」那份点了二次确认之后才为真。
+        # 审计要记下这是强制删除，否则日志上只看得到「删了快照」，
+        # 看不出删的是用户特意保下来的那一份。
+        res = self.helper('snapshot_delete', {'ts': b.get('ts'),
+                                              'force': b.get('force')})
         if res.get('ok'):
-            audit(self.user, '删除快照', b.get('ts'), True)
+            audit(self.user, '删除快照',
+                  '%s%s' % (b.get('ts'), '（受保护，已强制删除）' if b.get('force') else ''),
+                  True)
+        return self.json(res)
+
+    def snapshot_note(self):
+        """改快照备注。"""
+        if not self.auth():
+            return
+        b = self.body()
+        payload = {'ts': b.get('ts')}
+        # 允许清空：前端传 tag:''（空串）而不是不传，所以要按 key 在不在
+        # 来区分「清空」和「没改这个字段」。
+        if 'tag' in b:
+            payload['tag'] = b.get('tag')
+        else:
+            payload['tag'] = b.get('note')
+        res = self.helper('snapshot_note', payload)
+        if res.get('ok'):
+            audit(self.user, '修改快照备注', '%s → %s' % (b.get('ts'), payload['tag']), True)
+        return self.json(res)
+
+    def snapshot_protect(self):
+        """给/取消快照上锁。"""
+        if not self.auth():
+            return
+        b = self.body()
+        # ⚠️ 只有用户**真的传了** protected 才透传。
+        # 无条件写进 payload（哪怕值是 None）会让 helper 的
+        # `if 'protected' in p` 永远成立，于是「不传就取反」这条语义
+        # 从 HTTP 这条路上彻底失效 —— 而前端的上锁开关正是靠取反工作的，
+        # 表现是「点一下开关没反应」。判「传没传」要按 key 在不在，
+        # 不能按值是否为真。
+        payload = {'ts': b.get('ts')}
+        if 'protected' in b:
+            payload['protected'] = b.get('protected')
+        res = self.helper('snapshot_protect', payload)
+        if res.get('ok'):
+            audit(self.user, '快照保护',
+                  '%s %s' % (b.get('ts'), res.get('msg_cn')), True)
         return self.json(res)
 
     def snapshot_prune(self):

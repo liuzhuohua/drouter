@@ -11239,7 +11239,88 @@ def _sqlite_snapshot(dst_dir):
             return False, str(e)
 
 
-def _snapshot(tag='manual'):
+def _snap_load_meta(d):
+    """读一份快照目录的 _meta.json。读不出来就返回空 dict。
+
+    prune 与 list 都要读meta，重复一遍 try/except 只会让「读失败」这件事
+    在两处各自漂成不同的默认值 —— 所以统一走这里，**默认 protected=False**
+    （读不到就当没保护，宁可多留一份，也别因为 meta 损坏就把用户上锁的
+    快照当成没上锁给清掉了）。
+    """
+    p = os.path.join(d, '_meta.json')
+    if not os.path.isfile(p):
+        return {}
+    try:
+        with open(p, encoding='utf-8') as f:
+            m = json.load(f)
+        return m if isinstance(m, dict) else {}
+    except Exception:
+        return {}
+
+
+def _snap_save_meta(d, updates):
+    """原地改一份快照的 _meta.json（只改传入的键），返回最新 meta。
+
+    先写临时文件再 os.replace：meta 是 prune 唯一的判据来源，
+    写到一半被打断会留下一个 JSON 解析不了的残file，那份快照就再也
+    认不出自己上没上锁了。
+    """
+    meta = _snap_load_meta(d)
+    meta.update(updates or {})
+    p = os.path.join(d, '_meta.json')
+    tmp = p + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, p)
+    except Exception as e:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        raise e
+    return meta
+
+
+SNAP_TAG_MAX = 60
+
+
+def _snap_clean_tag(raw, fallback='manual'):
+    """把用户填的备注压成一个安全的单行短标签。
+
+    tag 会被拼进日志消息、导出文件名和 shell 片段，所以控制字符和换行
+    必须在这里就掐掉 —— 不然后面每一处都得各自记得转义一遍，漏一处
+    就是日志注入或文件名注入。
+
+    ⚠️ 不可打印字符一律**替换成空格**，不是删掉。
+    第一版只把 \\r \\n 换成空格，剩下的走 `if ch.isprintable()` 过滤 ——
+    而 isprintable() 对 \\t 也返回 False，于是 \\t 被**删除**：
+    'a\\tb' 变成 'ab'，相邻两个词被粘成一坨；控制字符夹在词中间时
+    用户看到的备注是莫名其妙连在一起的。删字符等于替用户改内容，
+    换成空格才是「压成一行」的本意（后面的 `\\s+ → ' '` 会再折叠）。
+    """
+    s = ''.join(ch if ch.isprintable() else ' ' for ch in str(raw or ''))
+    s = re.sub(r'\s+', ' ', s).strip()
+    if len(s) > SNAP_TAG_MAX:
+        s = s[:SNAP_TAG_MAX].rstrip() + '…'
+    return s or fallback
+
+
+def _snap_dir(root, ts):
+    """定位一份快照的目录，顺带做合法性校验（防路径穿越）。"""
+    if not re.match(r'^[0-9]{8}-[0-9]{6}$', str(ts or '')):
+        return None
+    root = os.path.abspath(root)
+    d = os.path.abspath(os.path.join(root, str(ts)))
+    try:
+        if os.path.commonpath([d, root]) != root:
+            return None
+    except Exception:
+        return None
+    return d if os.path.isdir(d) else None
+
+
+def _snapshot(tag='manual', protected=False):
     ts = datetime.now().strftime('%Y%m%d-%H%M%S')
     root = snap_root()
     d = os.path.join(root, ts)
@@ -11290,6 +11371,9 @@ def _snapshot(tag='manual'):
         'size_kb': _dir_size_kb(d),
         'root': root,
         'expire_at': '',
+        # 用户显式上锁。上锁后自动清理（按天 / 按数量）一律跳过这份，
+        # 但手动删除仍然允许 —— 否则上锁就成了「删不掉」。
+        'protected': bool(protected),
     }
     with open(os.path.join(d, '_meta.json'), 'w', encoding='utf-8') as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -11354,8 +11438,60 @@ def _disk_usage(path):
 
 def act_snapshot(p):
     p = p or {}
-    ts, d = _snapshot(p.get('tag') or 'manual')
-    return ok({'ts': ts, 'path': d}, '已创建配置快照：%s' % ts)
+    tag = _snap_clean_tag(p.get('tag') or '', 'manual')
+    # checkbox 未勾选时前端不会带这个键，所以只有「显式为真」才算上锁。
+    protect = p.get('protected') in (True, '1', 'true', 'on', 1)
+    ts, d = _snapshot(tag, protected=protect)
+    return ok({'ts': ts, 'path': d, 'tag': tag, 'protected': protect},
+              '已创建配置快照：%s%s' % (ts, '（已上锁，不参与自动清理）' if protect else ''))
+
+
+def act_snapshot_note(p):
+    """改一份已存在快照的备注。
+
+    备注字段本来就有，但此前只能在创建时填，存下来之后就只能看不能改
+    —— 于是「先随手拍一张，回头再补上说明」这个最自然的用法走不通：
+    拍的时候不知道该写什么，等想明白了又改不了。
+    """
+    p = p or {}
+    d = _snap_dir(snap_root(), p.get('ts'))
+    if not d:
+        return fail('快照不存在：%s' % (p.get('ts') or ''))
+    # 允许清空备注（传空串），但不能因为空就退回 'manual' 那类占位词
+    raw = p.get('tag')
+    tag = _snap_clean_tag(raw, '') if raw is not None else \
+        _snap_clean_tag(p.get('note'), '')
+    try:
+        meta = _snap_save_meta(d, {'tag': tag})
+    except Exception as e:
+        return fail('写入快照备注失败：%s' % e)
+    log('info', 'system', 'SNAPSHOT_NOTE', '已修改快照 %s 的备注' % os.path.basename(d),
+        {'tag': tag})
+    return ok({'ts': os.path.basename(d), 'tag': meta.get('tag', '')},
+              '已保存快照备注' if tag else '已清空快照备注')
+
+
+def act_snapshot_protect(p):
+    """给/取消一份快照的上锁。返回切换后的状态。"""
+    p = p or {}
+    d = _snap_dir(snap_root(), p.get('ts'))
+    if not d:
+        return fail('快照不存在：%s' % (p.get('ts') or ''))
+    if 'protected' in p:
+        want = p.get('protected') in (True, '1', 'true', 'on', 1)
+    else:
+        want = not bool(_snap_load_meta(d).get('protected'))
+    try:
+        _snap_save_meta(d, {'protected': bool(want)})
+    except Exception as e:
+        return fail('写入快照保护状态失败：%s' % e)
+    name = os.path.basename(d)
+    log('info', 'system', 'SNAPSHOT_PROTECT',
+        '快照 %s %s' % (name, '已上锁，自动清理将跳过' if want else '已解除上锁'),
+        {'protected': bool(want)})
+    return ok({'ts': name, 'protected': bool(want)},
+              '快照 %s 已上锁，自动清理不会删除它' % name if want
+              else '已解除 %s 的保护' % name)
 
 
 def act_snapshot_list(_):
@@ -11364,26 +11500,33 @@ def act_snapshot_list(_):
         return ok({'items': [], 'root': root, 'scope': SNAPSHOT_SCOPE})
     items = []
     for name in sorted(os.listdir(root), reverse=True):
-        meta = os.path.join(root, name, '_meta.json')
-        if os.path.isfile(meta):
-            try:
-                with open(meta, encoding='utf-8') as f:
-                    m = json.load(f)
-                m.setdefault('ts', name)
-                m.setdefault('size_kb', _dir_size_kb(os.path.join(root, name)))
-                items.append(m)
-            except Exception:
-                items.append({'ts': name, 'tag': 'unknown', 'files': []})
-        elif os.path.isdir(os.path.join(root, name)):
+        d = os.path.join(root, name)
+        m = _snap_load_meta(d)
+        if m:
+            m.setdefault('ts', name)
+            m.setdefault('size_kb', _dir_size_kb(d))
+            # setdefault 而不是 m.get：老快照的 meta 里压根没这个键，
+            # 界面上要显示成「未上锁」而不是「空白」，否则用户会以为
+            # 加载失败。
+            m.setdefault('protected', False)
+            items.append(m)
+        elif os.path.isdir(d):
             items.append({'ts': name, 'tag': 'unknown', 'files': [],
-                          'size_kb': _dir_size_kb(os.path.join(root, name))})
+                          'size_kb': _dir_size_kb(d), 'protected': False})
     total, used, free = _disk_usage(root)
     return ok({'items': items, 'root': root, 'scope': SNAPSHOT_SCOPE,
                'disk': {'total_mb': total, 'used_mb': used, 'free_mb': free}})
 
 
 def act_snapshot_delete(p):
-    """删除指定快照（用于自动清理与手动删除）。"""
+    """删除指定快照（用于自动清理与手动删除）。
+
+    受保护的快照必须显式带 force=1 才能删。上锁的语义是「自动清理别碰
+    它」，不是「它成了只读」——但如果点一下普通删除就能把用户特意保下来
+    的那份弄掉，那上锁就是个骗人的开关。所以这里不直接拒绝，而是**要求
+    二次确认**：前端收到 needs_force 后弹一次「这份已上锁，确定要删吗」，
+    确认后带 force 回来。
+    """
     p = p or {}
     ts = str(p.get('ts') or '').strip()
     if not re.match(r'^[0-9]{8}-[0-9]{6}$', ts):
@@ -11394,8 +11537,12 @@ def act_snapshot_delete(p):
         return fail('非法的快照路径')
     if not os.path.isdir(d):
         return fail('快照不存在：%s' % ts)
+    locked = bool(_snap_load_meta(d).get('protected'))
+    if locked and p.get('force') not in (True, '1', 'true', 'on', 1):
+        return fail('这份快照已上锁，自动清理不会删除它。若确实要删除，请确认后重试。',
+                    data={'needs_force': True, 'ts': ts, 'protected': True})
     shutil.rmtree(d, ignore_errors=True)
-    log('warn', 'system', 'SNAPSHOT_DELETED', '已删除快照 %s' % ts)
+    log('warn', 'system', 'SNAPSHOT_DELETED', '已删除快照 %s%s' % (ts, '（受保护，已强制删除）' if locked else ''))
     return ok({'ts': ts}, '已删除快照 %s' % ts)
 
 
@@ -11405,7 +11552,15 @@ def act_snapshot_prune(p):
       keep_days   —— 超过 N 天的快照删除（0 = 不按时间清）
       keep_count  —— 最多保留 N 份（0 = 不限数量）
       keep_manual —— 是否保留手动/救援等非自动快照（默认 True）
-    返回删除清单。
+
+    上锁（_meta.json 里的 protected）的快照在两条规则下都无条件跳过。
+    它跟 keep_manual 是两件不同的事，别混成一条判据：
+      keep_manual —— 按 tag 是否以 auto 开头**猜**来源，手动创建、
+                    救援前、升级前拍的都算手动；是全局策略开关。
+      protected   —— 用户对**这一份**的显式意图，跨策略生效。
+    所以判据是 `not e['protected']` 单独加在删除分支上，而不是改
+    `auto` 的算法 —— 把 protected 混进 auto 的话，一份上了锁的
+    auto 快照就会开始占用 keep_count 配额，反而把别的自动快照挤掉。
     """
     p = p or {}
     try:
@@ -11425,25 +11580,23 @@ def act_snapshot_prune(p):
         full = os.path.join(root, name)
         if not os.path.isdir(full) or not re.match(r'^[0-9]{8}-[0-9]{6}$', name):
             continue
-        tag = ''
-        meta = os.path.join(full, '_meta.json')
-        if os.path.isfile(meta):
-            try:
-                with open(meta, encoding='utf-8') as f:
-                    tag = (json.load(f) or {}).get('tag') or ''
-            except Exception:
-                tag = ''
+        m = _snap_load_meta(full)
+        tag = m.get('tag') or ''
         try:
             born = datetime.strptime(name, '%Y%m%d-%H%M%S')
         except Exception:
             born = datetime.min
         entries.append({'name': name, 'tag': tag, 'born': born,
-                        'auto': tag.startswith('auto')})
+                        'auto': tag.startswith('auto'),
+                        'protected': bool(m.get('protected'))})
     now = datetime.now()
     removed = []
+    kept_locked = [e['name'] for e in entries if e['protected']]
     # 1) 按天
     if keep_days > 0:
         for e in list(entries):
+            if e['protected']:
+                continue
             age_days = (now - e['born']).total_seconds() / 86400.0
             if age_days > keep_days and not (keep_manual and not e['auto']):
                 shutil.rmtree(os.path.join(root, e['name']), ignore_errors=True)
@@ -11451,7 +11604,9 @@ def act_snapshot_prune(p):
                 entries.remove(e)
     # 2) 按数量（只对自动快照计数，手动的不占用配额）
     if keep_count > 0:
-        autos = [e for e in entries if e['auto']]
+        # 上锁的自动快照不参与计数：它反正删不掉，让它占配额等于
+        # 把 keep_count 悄悄削掉一份，用户会看着「保留 5 份」却只剩 4 份。
+        autos = [e for e in entries if e['auto'] and not e['protected']]
         for e in autos[keep_count:]:
             shutil.rmtree(os.path.join(root, e['name']), ignore_errors=True)
             removed.append(e['name'])
@@ -11459,7 +11614,8 @@ def act_snapshot_prune(p):
     if removed:
         log('info', 'system', 'SNAPSHOT_PRUNED',
             '自动清理快照 %d 份（保留 %d）' % (len(removed), len(entries)), removed)
-    return ok({'removed': removed, 'kept': len(entries), 'root': root},
+    return ok({'removed': removed, 'kept': len(entries), 'root': root,
+               'kept_locked': kept_locked},
               '已清理 %d 份过期快照' % len(removed))
 
 
@@ -21056,6 +21212,8 @@ ACTIONS = {
     'snapshot_list': act_snapshot_list,
     'snapshot_delete': act_snapshot_delete,
     'snapshot_prune': act_snapshot_prune,
+    'snapshot_note': act_snapshot_note,
+    'snapshot_protect': act_snapshot_protect,
     'snapshot_pack': act_snapshot_pack,
     'backup': act_backup,
     'read:backupd': read_backupd,

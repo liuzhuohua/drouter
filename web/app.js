@@ -1732,7 +1732,11 @@ function viewFw(kind) {
       body: { module: key, data: $w(key), check_only: true, live: false } });
     toast(r.msg_cn, r.ok ? 'ok' : 'err', 6000);
   };
-  $('#fw-rollback').onclick = listSnapshots;
+  /* 防火墙页的「回滚」入口。快照列表现在只存在于系统设置页的
+     「紧急救援通道」卡片里（内嵌，不再有 modal 分支），所以这里
+     直接带用户过去，而不是渲染一个残缺的弹窗 —— 那个弹窗里
+     压根没有备注和上锁开关，回滚哪一份只能靠猜时间戳。 */
+  $('#fw-rollback').onclick = () => { go('sys'); toast('请在「紧急救援通道 → 可回滚的快照」里挑选并回滚', 'ok', 5000); };
   fwLogBind(kind);
 }
 
@@ -7454,10 +7458,12 @@ function viewSys() {
       <div id="sy-scope-box" class="snap-scope"></div>
       <div class="row">
         <label style="flex:0 0 240px">快照备注<input id="sy-tag" placeholder="例如：切换前备份"></label>
+        <label class="switch" style="flex:0 0 auto"><input type="checkbox" id="sy-protect"><i></i>创建后上锁</label>
         <button class="ghost fixed" id="sy-snap">立即创建快照</button>
         <button class="ghost fixed" id="sy-list">刷新快照列表</button>
       </div>
-      <div id="sy-snapout" style="margin-top:12px"></div>
+      <p class="hint-inline">快照创建后仍可随时改备注、随时上锁解锁 —— 列表见下方
+        <a href="#" id="sy-gorescue">紧急救援通道</a>。</p>
     </div>
     <div class="card">
       <h3>自动快照</h3>
@@ -7478,6 +7484,8 @@ function viewSys() {
         <label class="switch"><input type="checkbox" id="as-manual"><i></i>手动快照不参与自动清理</label>
         <label class="switch"><input type="checkbox" id="as-apply"><i></i>每次「保存并应用」前自动拍一张</label>
       </div>
+      <p class="hint-inline">「手动快照不参与自动清理」是<b>全局开关</b>：按创建方式自动识别，凡不是自动拍的一律保留（手动创建、回滚前、升级前拍的都是手动）。
+      若只想保住<b>其中某一份</b>，在下方「紧急救援通道 → 可回滚的快照」里给它单独上锁即可 —— 上锁的那份在任何自动清理下都不会被删，且不占用「最多保留份数」的额度。</p>
       <div class="row">
         <button class="primary fixed" id="as-save">保存自动快照策略</button>
         <button class="ghost fixed" id="as-run">立即执行一次</button>
@@ -7494,6 +7502,8 @@ function viewSys() {
       常规手段往往已经进不去路由器。<b>紧急救援通道</b>是一条完全独立于 WAN 口 / LAN 口的应急入口：
       它会在网卡上额外绑定一组虚拟地址，因此<b>把网线插到任意一个网口都能访问</b>，
       进入后可一键还原最近的快照并自动重启，让设备恢复到可用状态。</p>
+      <p class="hint-inline">下面这份快照列表就是救援通道的「还原材料」。<b>网络已经打崩的时候，最怕的不是没有快照，是不知道该回滚哪一份</b> ——
+      所以列表直接放在这里，看得清每份快照的备注、体积和是否受保护，回滚按钮就在手边。</p>
       <div class="row" style="align-items:center">
         <label class="switch"><input type="checkbox" id="rs-en"><i></i>开启紧急救援通道</label>
         <span class="hint-inline" id="rs-state"></span>
@@ -7521,6 +7531,16 @@ function viewSys() {
       <div class="kv"><b>服务状态</b><span id="rs-svc">—</span></div>
       <div class="kv"><b>虚拟网卡</b><span id="rs-vif">—</span></div>
       <div id="rs-addrs" class="mono" style="margin-top:8px;font-size:12px;color:var(--muted)"></div>
+      <h3 style="margin-top:22px">可回滚的快照</h3>
+      <p class="desc">回滚 = 把界面配置与系统配置文件整体恢复到快照那一刻的状态，并重启相关服务。
+      动手前先看清<b>哪一份是你要的</b>：备注是你自己写的话，回滚就不容易选错。
+      回滚之前系统会自动再拍一张 <span class="mono">before-rollback</span> 快照，回滚完不满意还能退回来。</p>
+      <div class="notice" id="sy-locktip">
+        <b>自动清理规则</b>：<b>手动快照</b>与<b>已上锁的快照</b>都不会被「自动快照」的过期清理删掉。
+        两者区别在于——「手动快照」是按创建方式自动识别的全局策略（在「自动快照」卡片里可关），
+        <b>上锁</b>则是你对<b>这一份</b>的单独决定，任何自动清理都跳过它。上锁不影响手动删除，只是删之前会多问一次。
+      </div>
+      <div id="sy-snapout" style="margin-top:12px"></div>
     </div>
     <div class="card">
       <h3>网络后端迁移（高级）</h3>
@@ -7554,10 +7574,30 @@ function viewSys() {
     if (r.ok) { $('#sy-old').value = $('#sy-new').value = $('#sy-new2').value = ''; }
   };
   $('#sy-snap').onclick = async () => {
-    const r = await api('/api/snapshot', { method: 'POST', body: { tag: $('#sy-tag').value || 'manual' } });
+    const r = await api('/api/snapshot', { method: 'POST',
+      body: { tag: $('#sy-tag').value || 'manual', protected: $('#sy-protect').checked } });
     toast(r.msg_cn, r.ok ? 'ok' : 'err');
+    if (r.ok) {
+      // 建完就把输入框清空并取消勾选：留着旧备注会让下一张快照
+      // 顶着同一个名字，列表里两行长得一模一样。
+      $('#sy-tag').value = '';
+      $('#sy-protect').checked = false;
+      listSnapshots();
+    }
   };
-  $('#sy-list').onclick = listSnapshots;
+  /* 刷新列表：列表已内嵌到本卡片下方的「可回滚的快照」，所以只要
+     容器在就地刷新，不必再弹窗。容器不在（比如从防火墙页触发）
+     就把用户带到系统设置页去 —— 别静默什么都不做。 */
+  $('#sy-list').onclick = async () => {
+    if (!$('#sy-snapout')) { go('sys'); toast('已切到系统设置页，快照列表在「紧急救援通道」里', 'ok', 4000); return; }
+    await listSnapshots();
+  };
+  const gotoRescue = $('#sy-gorescue');
+  if (gotoRescue) gotoRescue.onclick = e => {
+    e.preventDefault();
+    const t = document.getElementById('sy-snapout');
+    if (t) t.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
   loadAutoSnapshot();
   loadRescue();
   // Web 端口修改
@@ -7633,7 +7673,12 @@ function viewSys() {
   };
 }
 
-/* ---------- 配置快照：列表 / 下载 / 回滚 / 删除 ---------- */
+/* ---------- 配置快照：列表 / 备注 / 上锁 / 下载 / 回滚 / 删除 ---------- */
+/* 列表内嵌在「紧急救援通道」卡片里（容器 #sy-snapout）。
+   此前这里是 `if (S.page === 'sys') 内嵌 else modal(...)` 的分叉：同一个
+   渲染函数、同一份 HTML，走两条路。结果是**只有系统设置页能改备注/上锁**，
+   别的页（防火墙页的 #fw-rollback 按钮）弹出来的 modal 里只有三个按钮。
+   现在统一走内嵌，modal 分支删掉 —— 快照从哪看、在哪操作，是同一件事。 */
 async function listSnapshots() {
   const r = await api('/api/snapshots');
   const d = r.data || {};
@@ -7647,25 +7692,58 @@ async function listSnapshots() {
         (g.items || []).map(i => `<li>${esc(i)}</li>`).join('')}</ul></div>`).join('');
   }
   const disk = d.disk ? `磁盘：剩余 ${fmtBytes((d.disk.free_mb || 0) * 1024 * 1024)} / 共 ${fmtBytes((d.disk.total_mb || 0) * 1024 * 1024)}` : '';
+  const lockedN = rows.filter(x => x.protected).length;
   const html = rows.length ? `
-    <p class="hint-inline">共 ${rows.length} 份快照，存放于 <span class="mono">${esc(root)}</span>。${esc(disk)}</p>
+    <p class="hint-inline">共 ${rows.length} 份快照${lockedN ? `，其中 <b>${lockedN}</b> 份已上锁` : ''}，存放于 <span class="mono">${esc(root)}</span>。${esc(disk)}</p>
     <table><thead><tr>
-      <th style="width:150px">时间</th><th>备注</th><th style="width:70px">大小</th>
-      <th style="width:70px">配置库</th><th style="width:200px">操作</th></tr></thead><tbody>
+      <th style="width:150px">时间</th><th>备注</th><th style="width:74px">保护</th>
+      <th style="width:66px">大小</th><th style="width:70px">配置库</th>
+      <th style="width:212px">操作</th></tr></thead><tbody>
     ${rows.map(x => `<tr>
       <td class="mono">${esc(x.ts)}</td>
-      <td>${esc(x.tag || '')}</td>
+      <td><input class="snap-tag-input" data-tag="${esc(x.ts)}" maxlength="60"
+            value="${esc(x.tag || '')}" placeholder="（未命名）"></td>
+      <td><label class="switch" style="margin:0"><input type="checkbox" data-lock="${esc(x.ts)}"
+            ${x.protected ? 'checked' : ''}><i></i></label></td>
       <td class="mono">${x.size_kb != null ? esc(x.size_kb) + ' KB' : '—'}</td>
       <td>${x.db_included ? '<span class="tag-ok">已含</span>' : '<span class="tag-warn">旧版</span>'}</td>
       <td>
+        <button class="small" data-save-tag="${esc(x.ts)}">存备注</button>
         <button class="small" data-dl="${esc(x.ts)}">下载</button>
         <button class="small" data-rb="${esc(x.ts)}">回滚</button>
         <button class="small danger" data-del="${esc(x.ts)}">删除</button>
       </td></tr>`).join('')}</tbody></table>`
-    : '<p class="desc">暂无快照。</p>';
-  if (S.page === 'sys') { const b = $('#sy-snapout'); if (b) b.innerHTML = html; }
-  else modal('配置快照列表', html, null, '关闭');
+    : '<p class="desc">暂无快照。可在上方「配置快照与回滚」里立即创建一份，或等自动快照按计划生成。</p>';
+  // 纯内嵌。不再回退到 modal —— 页面上永远只有一处快照列表。
+  const box = $('#sy-snapout');
+  if (box) box.innerHTML = html;
 
+  /* 备注编辑：点「存备注」才提交。
+     别在 input 上绑 onchange/每键输入就发请求 —— 那是把一次编辑
+     变成几十次 HTTP，而且用户按 Esc 想放弃都来不及。 */
+  $$('[data-save-tag]').forEach(b => b.onclick = async () => {
+    const ts = b.dataset.saveTag;
+    const inp = document.querySelector(`[data-tag="${CSS.escape(ts)}"]`);
+    const val = inp ? inp.value : '';
+    b.disabled = true;
+    const res = await api('/api/snapshot/note', { method: 'POST', body: { ts: ts, tag: val } });
+    toast(res.msg_cn, res.ok ? 'ok' : 'err', 4000);
+    b.disabled = false;
+    if (res.ok && inp) inp.value = (res.data && res.data.tag) || '';
+  });
+  /* 上锁开关：change 事件（而不是 onclick），这样键盘操作和
+     label 包裹的点击也都能触发，且不会重复提交。 */
+  $$('[data-lock]').forEach(b => b.onchange = async () => {
+    const ts = b.dataset.lock;
+    b.disabled = true;
+    const res = await api('/api/snapshot/protect',
+      { method: 'POST', body: { ts: ts, protected: b.checked } });
+    toast(res.msg_cn, res.ok ? 'ok' : 'err', 4000);
+    b.disabled = false;
+    // 后端拒绝了（例如已被别的会话删掉）就把勾去掉，别让界面显示
+    // 一个后端并不认同的状态。
+    if (!res.ok) b.checked = !b.checked;
+  });
   $$('[data-dl]').forEach(b => b.onclick = async () => {
     const ts = b.dataset.dl;
     toast('正在打包快照 ' + ts + '…', 'ok', 2500);
@@ -7694,12 +7772,27 @@ async function listSnapshots() {
     toast(r2.msg_cn, r2.ok ? 'ok' : 'err', 8000);
     if (r2.ok) listSnapshots();
   }, '确认回滚'));
-  $$('[data-del]').forEach(b => b.onclick = () => modal('删除快照',
-    `<p>确定删除快照 <b class="mono">${esc(b.dataset.del)}</b> 吗？此操作不可恢复。</p>`, async () => {
-    const r2 = await api('/api/snapshot/delete', { method: 'POST', body: { ts: b.dataset.del } });
-    toast(r2.msg_cn, r2.ok ? 'ok' : 'err');
-    if (r2.ok) listSnapshots();
-  }, '删除'));
+  /* 删除：后端对已上锁的那份会先回 needs_force，这里据此追加一次确认。
+     不能一上来就把「已上锁」三个字去掉 —— 上锁的本意就是「别顺手
+     弄没了」，顺手点一下就删掉等于上锁没用。 */
+  $$('[data-del]').forEach(b => b.onclick = async () => {
+    const ts = b.dataset.del;
+    const doDel = async force => {
+      const r2 = await api('/api/snapshot/delete', { method: 'POST', body: { ts: ts, force: !!force } });
+      if (!r2.ok && r2.data && r2.data.needs_force) return 'again';
+      toast(r2.msg_cn, r2.ok ? 'ok' : 'err', r2.ok ? 3000 : 6000);
+      if (r2.ok) listSnapshots();
+      return r2.ok;
+    };
+    const first = await doDel(false);
+    if (first === 'again') {
+      modal('这份快照已上锁',
+        `<p>快照 <b class="mono">${esc(ts)}</b> 已上锁，<b>自动清理不会删除它</b>。</p>
+         <p class="desc">上锁只挡自动清理，不挡你手动删。确定要删掉它吗？此操作不可恢复。</p>`,
+        async () => { await doDel(true); }, '仍要删除');
+      return;
+    }
+  });
 }
 
 /* ---------- 自动快照策略 ---------- */

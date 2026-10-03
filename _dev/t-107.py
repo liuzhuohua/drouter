@@ -46,6 +46,11 @@ import json
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = sys.executable
+# 别的检查器会用 subprocess 调本文件，工作目录不保证是 _dev/。
+# 不显式把脚本自身目录加进 path，`from jsstrip import ...` 就只在
+# 「恰好 cd 到 _dev」时才work —— 那种依赖cwd 的 import 平时看不出问题，
+# 换个人从仓库根跑就 ModuleNotFoundError。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 def read(rel):
@@ -230,11 +235,20 @@ def js_code_only(src):
 
     前端改文案时同样会在注释里引用旧文案（「那句是猜的」）。
     不剥注释就会把说明当成残留代码。
+
+    ⚠️ 这里**必须**用 _dev/jsstrip.py 的词法扫描版，不能用
+    `re.sub(r'/\\*.*?\\*/', '', src, flags=re.S)`。
+    那个写法在本仓 app.js 上会吃掉三千多行真代码：app.js 8222 行附近
+    有一句讲「怎么防止 CSS 注释被提前闭合」的**行注释**，注释里写了
+    `/* */` 这两个字面量 —— 先剥块注释时它还在原文里，于是被当成真
+    注释开头，一路吃到几千行之后。
+    证据：app.js 里 `/*` 169 次而 `*/` 170 次（HEAD 版 163 / 164），
+    数量不等 = 配对错位一格，而错位会传播到文件末尾。判据读的是一份
+    被掏空的文件，绿灯全是假的。
+    详见 _dev/jsstrip.py 的模块 docstring。
     """
-    out = re.sub(r'/\*.*?\*/', '', src, flags=re.S)
-    # 行注释：// 后面不能紧跟引号（那是 URL 里的 //）
-    out = re.sub(r'(?<!:)//[^\n\'"`]*$', '', out, flags=re.M)
-    return out
+    from jsstrip import js_code_only as _real
+    return _real(src)
 
 
 def py_func_src(name, src=HELPER):

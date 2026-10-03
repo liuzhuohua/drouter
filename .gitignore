@@ -63,3 +63,6 @@ id_rsa*
 .credentials
 .env
 .env.*
+
+# jsstrip 自检的中间产物（剥完的 app.js，只给 node 侧交叉验证用）
+_dev/.jsstrip-*.out

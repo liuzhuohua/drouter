@@ -269,6 +269,10 @@ svg[role=img]{display:block;margin:0 auto}
 .snap-g b{display:block;color:var(--pri);font-size:12.5px;margin-bottom:3px}
 .snap-g ul{margin:0;padding-left:18px;color:var(--txt2);line-height:1.75}
 .snap-g li{list-style:disc}
+/* 快照列表里的备注输入框。宽度给满一列但设上限：全宽会让「时间」列
+   被挤到换行，而 max-width 保证备注一长也不会把操作按钮顶出屏幕。 */
+.snap-tag-input{width:100%;max-width:420px;padding:5px 9px;font-size:12.5px}
+.snap-tag-input:focus{outline:2px solid var(--pri);outline-offset:0}
 .tag-ok{display:inline-block;font-size:11px;padding:1px 7px;border-radius:5px;
   font-weight:500;background:var(--ok-l);color:var(--ok)}
 .tag-warn{display:inline-block;font-size:11px;padding:1px 7px;border-radius:5px;
