@@ -47,6 +47,26 @@ ckc() {  # ckc <描述> <期望命中次数> <实际命中次数>
   fi
 }
 
+ckg() {  # ckg <描述> <期望出现的关键字> <grep -c 的输出>
+  # 问的是「命中数 ≥1 吗」而不是「输出里含不含这个关键字」。
+  # ⛔ 别用 ck 配 `grep -c` —— grep -c 只吐一个数字，数字里永远不会
+  # 含代码片段，所以那种写法**恒为假**。ckc 又只能问「恰好等于几」，
+  # 「出现过没有」这个中间档没有对应函数，于是 1.0.7 冒烟里 4 条断言
+  # 全栽在这儿（其中 3 条还是恒绿：路径拼错时 grep 往 stderr 打的
+  # 是错误信息，`2>&1` 把它收了进来，「期望 0 次」照样满足）。
+  # 顺带：非数字输出（grep 的报错）也判失败，
+  # 免得「查错了文件」又被读成「代码不在」。
+  local desc="$1" key="$2" got="$3"
+  if [[ "$got" =~ ^[0-9]+$ ]] && [ "$got" -ge 1 ]; then
+    echo "  ✔ $desc（命中 $got 次）"; pass=$((pass+1))
+  else
+    echo "  ✘ $desc"
+    echo "     期望命中 ≥1 次，关键词: $key"
+    echo "     实际    : $(head -c 200 <<<"$got")"
+    fail=$((fail+1))
+  fi
+}
+
 cleanup() {
   $PODMAN rm -f "$NAME" >/dev/null 2>&1 && echo "  容器已删除"
   # podman 用 netavark 驱动，跑过一次容器就会在宿主留下 `table inet netavark`
@@ -57,6 +77,24 @@ cleanup() {
     nft delete table inet netavark 2>/dev/null \
       && echo "  已移除 podman 的 netavark 表（备份 /root/netavark-table-backup.nft）"
   fi
+  # 基线还原的**断言必须写在 cleanup 里面**。
+  # 之前它被放在函数体末尾、cleanup 之前 —— 而 cleanup 是 trap EXIT 触发的，
+  # 那时容器还活着、netavark 表当然还在（podman 每次 run 都会重建），
+  # 于是这条断言**结构性必红**。顺序错了，判据再对也没用。
+  #
+  #⛔ 但 trap 在 `exit $fail` **之后**才跑，此时 $fail 已经求值传给内核了，
+  # 在这里 `fail=$((fail+1))` 改计数毫无作用（1.0.8 首次就踩了）。
+  # 想让「基线未还原」真的让脚本红，只能在 trap 里自己 exit。
+  if nft list table inet netavark >/dev/null 2>&1; then
+    echo "  ✘ podman 的 netavark 表未能删除（基线未还原）"
+    BASELINE_BAD=1
+  else
+    echo "  ✔ podman 的 netavark 表已删除（基线还原）"
+  fi
+  if [ "${BASELINE_BAD:-0}" = 1 ]; then
+    exit $(( ${RC_AT_EXIT:-0} + 1 ))
+  fi
+  exit ${RC_AT_EXIT:-0}
 }
 trap cleanup EXIT
 
@@ -208,17 +246,26 @@ ckc "sync-isp-dns.sh 写盘失败非零退出（不能静默 rc=0）" 2 \
 
 echo
 echo "=== 12. 1.0.7 新增的三个守护在镜像里且语法正确 ==="
-# 容器形态没有 systemd，守护不能只靠 systemctl。这里只验「文件在 + 能编译 +
-# 有不依赖 init 的拉起路径」，真跑起来要等 sync.sh 那轮真机验证。
+# 容器形态没有 systemd。这里只验「文件在 + 能编译 + 被 deploy.sh 安装」，
+# 真跑起来要等 sync.sh 那轮真机验证。
+#
+#⛔ 不要在这里断言「有 Popen / start_new_session」——
+# 那是**常驻服务**（shelld 那类）的需求，而这三个是 **oneshot 型timer**：
+# timer 定时把它拉起来、脚本自己跑完就退出，压根不需要脱离 init 常驻。
+# 1.0.7 的冒烟里写了这三条断言，三个守护一个都没有 Popen →
+# 每次冒烟必红 3 条，于是 1.0.8 有人把期望从 1 改成别的数字来「修绿」，
+# 那是把判据迁就实现。判据该问的是它自己的形态对不对。
 for d in backupd alertd quotad; do
   ck "drouter-$d.py 存在" "drouter-$d\.py" \
      "$($PODMAN exec "$NAME" ls /opt/drouter/backend/drouter-$d.py 2>&1)"
   ckc "drouter-$d.py 语法正确" 0 \
       "$($PODMAN exec "$NAME" python3 -c "import ast,sys;ast.parse(open(sys.argv[1],encoding='utf-8').read())" /opt/drouter/backend/drouter-$d.py 2>&1; echo $?)"
-  # 自启动回退：容器里没有 init，必须有 Popen / start_new_session 这类不依赖
-  # systemd 的路径，否则守护永远起不来（真机上 systemctl 是有的，容易漏）
-  ckc "drouter-$d.py 有不依赖 init 的拉起路径" 1 \
-      "$($PODMAN exec "$NAME" grep -cE 'Popen|start_new_session' /opt/drouter/backend/drouter-$d.py 2>&1)"
+  # 形态自证：oneshot 守护的入口是 main()，跑完即退。
+  # 常驻守护才有「起一个子进程」的需求，出现 Popen 反而要警惕它跑不飞。
+  ckg "drouter-$d.py 是 oneshot（有 main 入口、无常驻子进程）" '__main__' \
+      "$($PODMAN exec "$NAME" grep -c '__main__' /opt/drouter/backend/drouter-$d.py 2>&1)"
+  ckc "drouter-$d.py 不含常驻子进程（Popen=0，oneshot 不需要）" 0 \
+      "$($PODMAN exec "$NAME" grep -c 'Popen' /opt/drouter/backend/drouter-$d.py 2>&1)"
 done
 ck "三个新守护在 deploy.sh 里被安装" 'drouter-backupd\.py' \
    "$($PODMAN exec "$NAME" grep -oE 'drouter-(backupd|alertd|quotad)\.py' /opt/drouter/scripts/deploy.sh 2>&1 | head -3)"
@@ -228,23 +275,40 @@ ckc "deploy.sh 里三个新守护齐全" 3 \
 
 echo
 echo "=== 13. 1.0.7 修的三个隐蔽缺陷在镜像里 ==="
+# ⓪ 先确认文件在位。下面每一条都往这个路径 grep —— 路径拼错时 grep 会往
+# stderr 打 "No such file or directory"，**而这个字符串被 2>&1 收进输出**，
+# 于是「期望 0 次」那几条照样绿（错一次 == 期望值），
+# 「期望包含 xxx」那几条则因为拿到的是报错而非内容而恒假。
+# 一条 1.0.7 冒烟就栽在这里：/opt/douter 少个r，4 条断言一直是假红，
+# 而它们本该守的 3 个真缺陷「看起来」早就修好了。
+H2=/opt/drouter/backend/drouter-helper.py
+ckc "helper 路径拼写正确（先验路径再谈内容）" 0 \
+    "$($PODMAN exec "$NAME" sh -c "test -f $H2" 2>&1; echo $?)"
 # ① 默认备份不再整目录排除 /etc/drouter
+# ⛔ 反向断言必须**排除注释**。这个字面量就写在解释 bug 来历的注释里
+#（helper 11669 行：「早先的版本写了 sensitive=(d == '/etc/drouter')」），
+# 直接 grep -c 必然命中 1 → 每次冒烟假红。
+# 用 `grep -v` 先剔掉注释行；行首锚定 `^[^#]*` 兜住缩进后的注释。
 ckc "备份不再整目录标敏感（sensitive=(d == ...) 已消失）" 0 \
-    "$($PODMAN exec "$NAME" grep -c "sensitive=(d == '/etc/drouter')" /opt/drouter/backend/drouter-helper.py 2>&1)"
-ck "备份有逐文件敏感判定" '_bk_is_sensitive' \
-   "$($PODMAN exec "$NAME" grep -c '_bk_is_sensitive' /opt/douter/backend/drouter-helper.py 2>&1 | head -1)"
+    "$($PODMAN exec "$NAME" grep -v '^[[:space:]]*#' $H2 2>&1 | grep -c "sensitive=(d ==")"
+#ⓐ ckc 比数字，ckc 才问「数字等于几」；问「含不含 xxx」要用 ckg（见下）
+ckg "备份有逐文件敏感判定" '_bk_is_sensitive' \
+   "$($PODMAN exec "$NAME" grep -c '_bk_is_sensitive' $H2 2>&1 | head -1)"
 # ② VPN status 不再返回含私钥的 raw
+#⛔ 同一个坑 + 一个更隐蔽的：helper 里另有一处 'raw'（打印服务的
+# `cfg = {'cups': ..., 'raw': dict(PRINT_DEFAULTS['raw'])}`），
+# 与 VPN 毫无关系。所以既要去注释，还得把范围限在 _vpn_status 函数内。
 ckc "_vpn_status 不再返回 'raw': d" 0 \
-    "$($PODMAN exec "$NAME" grep -cE "'raw': d" /opt/douter/backend/drouter-helper.py 2>&1)"
-ck "_vpn_mask 仍在（脱敏没被一起删掉）" '_vpn_mask' \
-   "$($PODMAN exec "$NAME" grep -c '_vpn_mask' /opt/douter/backend/drouter-helper.py 2>&1 | head -1)"
+    "$($PODMAN exec "$NAME" sh -c "awk '/^def _vpn_status/,/^def [^_]/' $H2 | grep -v '^[[:space:]]*#' | grep -c \"'raw':\"" 2>&1)"
+ckg "_vpn_mask 仍在（脱敏没被一起删掉）" '_vpn_mask' \
+   "$($PODMAN exec "$NAME" grep -c '_vpn_mask' $H2 2>&1 | head -1)"
 # ③ ip_network 成员判断必须用对象（3.13 回归）
-ck "ip_network 归属判断用对象" 'aobj not in net' \
-   "$($PODMAN exec "$NAME" grep -cE 'aobj not in net' /opt/drouter/backend/drouter-helper.py 2>&1)"
+ckg "ip_network 归属判断用对象" 'aobj not in net' \
+   "$($PODMAN exec "$NAME" grep -cE 'aobj not in net' $H2 2>&1)"
 # ④ wireguard 登记进 DEPS
-ck "DEPS 登记 wireguard-tools" "wireguard-tools" \
-   "$($PODMAN exec "$NAME" grep -c 'wireguard-tools' /opt/drouter/backend/drouter-helper.py 2>&1 | head -1)"
-# ⑤ Python 版本必须是 3.13 —— 本轮修的 ip_network 缺陷正是 3.13 才暴露的
+ckg "DEPS 登记 wireguard-tools" "wireguard-tools" \
+   "$($PODMAN exec "$NAME" grep -c 'wireguard-tools' $H2 2>&1 | head -1)"
+# ⑤ Python 版本必须是 3.13 —— 1.0.7 修的 ip_network 缺陷正是 3.13 才暴露的
 ck "镜像 Python 是 3.13（3.12 上这条断言无意义）" 'Python 3\.13' \
    "$($PODMAN exec "$NAME" python3 -V 2>&1)"
 
@@ -254,7 +318,8 @@ echo "=== 14. 1.0.8 VPN 四态诊断在容器形态下的表现 ==="
 # 关键不是「能不能装上」，而是**别判错态** ——
 # 1.0.7 之前只分「有/无」，本轮才拆成四态并给出可执行的下一步。
 H="/opt/drouter/backend/drouter-helper.py"
-ck "_vpn_env 四态函数在镜像里" 'def _vpn_env' \
+# ckg 而不是 ck：grep -c 只吐数字，问「数字含不含 def _vpn_env」恒为假。
+ckg "_vpn_env 四态函数在镜像里" 'def _vpn_env' \
    "$($PODMAN exec "$NAME" grep -c 'def _vpn_env' $H 2>&1 | head -1)"
 # ⛔ 判据不能只 grep 字面量：注释/docstring 里也会写这些词。
 # 所以下面真把函数跑起来，看它在**本机**返回哪一态。
@@ -308,13 +373,18 @@ else
     fi
   fi
 fi
-# 开机自启文件由 fix 写，镜像里不该预先存在
+# 开机自启文件由 fix 写，镜像里不该预先存在。
+#⛔ `test ! -e` 成功时退出码是 **0**，这里原来写期望 1 → 必红。
+# 另外别用 ls：它失败时把错误信息打到 stdout，而
+# `2>&1 >/dev/null` 那个顺序也不对（2>&1 在前，重定向的是已复制的旧 fd），
+# echo $? 拿到的根本不是 ls 的退出码。
 ckc "镜像里不预置 modules-load.d 配置" 0 \
-    "$($PODMAN exec "$NAME" ls /etc/modules-load.d/drouter-wireguard.conf 2>&1 >/dev/null; echo $?)"
-# 前端：老后端（没有 env 字段）必须显示 unknown 而不是 unsupported
-ck "前端老后端兜底是 unknown" "state: 'unknown'" \
+    "$($PODMAN exec "$NAME" sh -c 'test ! -e /etc/modules-load.d/drouter-wireguard.conf' >/dev/null 2>&1; echo $?)"
+# 前端：老后端（没有 env 字段）必须显示 unknown 而不是 unsupported。
+#⛔ 又一个 grep -c 配 ck 的恒假 —— 前两条 1.0.8 首次跑就是红的。
+ckg "前端老后端兜底是 unknown" "state: 'unknown'" \
    "$($PODMAN exec "$NAME" grep -c "state: 'unknown'" /opt/drouter/web/app.js 2>&1 | head -1)"
-ck "前端有 VPN 一键修复按钮" 'id="vp-fix"' \
+ckg "前端有 VPN 一键修复按钮" 'id="vp-fix"' \
    "$($PODMAN exec "$NAME" grep -c 'id="vp-fix"' /opt/drouter/web/app.js 2>&1 | head -1)"
 
 echo
@@ -323,10 +393,17 @@ echo "  容器冒烟：通过 $pass / 失败 $fail"
 echo "================================================"
 
 echo
-echo "=== 宿主侧安全基线（应无变化）==="
+echo "=== 宿主侧安全基线 ==="
+# ⚠️ 这里**只能读**，不能断言。cleanup 是 trap EXIT 触发的，在这几行之后
+# 才执行；此时容器还在、netavark 表已经被 podman 重建了 ——
+# 基线断言放在这里必然红。断言在 cleanup() 内部做。
 echo "  ip_forward = $(cat /proc/sys/net/ipv4/ip_forward)"
 echo "  nft 表     = $(nft list tables 2>/dev/null | tr '\n' ' ')"
 echo "  默认路由   = $(ip route | grep '^default' | head -1)"
-echo "  5900 监听  = $(ss -lnt 2>/dev/null | grep -c ':5900' )"
+# 5900 是 RealVNC，本项目**绝不触碰**。这里只读不改，
+# 出现监听是正常的（用户自己在用 VNC）。
+echo "  5900 监听  = $(ss -lnt 2>/dev/null | grep -c ':5900' )（只读，从不干预）"
 
+# RC_AT_EXIT 给 cleanup() 里的 trap 用 —— 它要在这个exit 之后决定最终退出码。
+RC_AT_EXIT=$fail
 exit $fail
