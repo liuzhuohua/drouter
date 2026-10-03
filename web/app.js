@@ -3511,12 +3511,18 @@ function pubipVerdictTag(level) {
 async function pubipCheck(force) {
   const box = $('#pi-body');
   if (!box) return;
-  box.innerHTML = '<p class="desc">正在判定（会并发查询多个外部回显服务，约需 10–30 秒）…</p>';
+  box.innerHTML = '<p class="desc">正在判定（会并发查询多个外部回显服务，首次约需 10 秒，之后走缓存）…</p>';
   const r = await api('/api/pubip', { method: 'POST', body: { op: 'check', force: !!force } });
   if (!r.ok) { box.innerHTML = `<div class="notice err">${esc(r.msg_cn || '判定失败')}</div>`; return; }
   const d = r.data || {};
   const vd = d.verdict || {};
   const tag = pubipVerdictTag(vd.level);
+
+  // 「复用缓存」提示里那个重测按钮。
+  // 放在 innerHTML 写完之后拿 —— 元素是 innerHTML 生成的，
+  // 在写之前 find 必然是 null。
+  const f2 = document.getElementById('pi-force2');
+  if (f2) f2.onclick = () => pubipCheck(true);
 
   const ev = (d.evidence || []).map(e => `
     <div class="dep-item ${e.pass ? 'ok' : (e.probed === false ? 'warn' : 'err')}">
@@ -3546,7 +3552,9 @@ async function pubipCheck(force) {
     <ul class="desc" style="margin:0;padding-left:20px;line-height:1.9">
       ${vd.advice.map(a => `<li>${esc(a)}</li>`).join('')}
     </ul>` : ''}
-    <p class="desc" style="margin-top:10px">判定时间：${esc(d.checked_at || '')}</p>`;
+    <p class="desc" style="margin-top:10px">判定时间：${esc(d.checked_at || '')}</p>
+    ${d.evidence_cached ? `<p class="desc" style="margin-top:4px">「多源回显一致性」与「首跳链路」两条复用了上一次探测的结果（30 分钟内）。
+       刚改过网络、宽带或端口转发的话，点上方<button class="ghost small" id="pi-force2">重新检测</button>重测。</p>` : ''}`;
 }
 
 async function pubipProbe(op) {

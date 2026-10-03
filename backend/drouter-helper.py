@@ -31,6 +31,7 @@ import uuid
 import base64
 import threading
 import ipaddress
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 # ---------------------------------------------------------------- PATH 归一化
@@ -2522,28 +2523,114 @@ def _http_get_text(url, timeout=6):
         return ''
 
 
+def _echo_one(table_row, family):
+    """探测单个回显服务，返回 (ip, name) 或 ('', '')。给线程池用。"""
+    name, url, pat = table_row
+    try:
+        txt = _http_get_text(url, timeout=ECHO_TIMEOUT)
+    except Exception:
+        return '', ''
+    if not txt:
+        return '', ''
+    m = re.search(pat, txt)
+    if not m:
+        return '', ''
+    ip = m.group(1)
+    # IPv6 综合校验，避免把服务名之类误判
+    if family == '6' and not _is_global_v6(ip):
+        return '', ''
+    if family == '4' and _is_private_v4(ip):
+        return '', ''
+    return ip, name
+
+
 def _echo_public_ip(family='4'):
-    """通过多个回显服务获取本机出口公网地址。返回 (ip, source) 或 ('', '')。"""
+    """通过多个回显服务获取本机出口公网地址。返回 (ip, source) 或 ('', '')。
+
+    ⚠️ **必须并发**，这是页面载入慢的头号原因。
+    原来是串行 for 循环逐个试，每个 timeout=6 秒。表里 IPv4 有 5 个服务、
+    IPv6 有 4 个 —— 全部失败（或前几个通、后面的域名解析不了）时，
+    这一行就是 5×6 = 30 秒起步。实测这台机器上：
+      ipify.org   立即失败（000）
+      cloudflare  满 6 秒超时（DNS/路由到 1.1.1.1 通不了）
+    串行下这两笔白花的时间就是白等。
+    `/api/pubip` 实测 10.2 秒 → `/api/ddns` 7.1 秒（它内部还要再调一次），
+    而前端切页是并发的，**页面载入时间约等于最慢的那个接口** ——
+    所以用户看到的就是「页面卡 10 秒」。
+
+    现在一次性把全部服务丢进线程池，谁先成功用谁，
+    最坏耗时从「服务数 × 超时」降到「一个超时」。
+    """
     table = IP_ECHO_V4 if family == '4' else IP_ECHO_V6
-    for name, url, pat in table:
-        txt = _http_get_text(url, timeout=6)
-        if not txt:
-            continue
-        m = re.search(pat, txt)
-        if m:
-            ip = m.group(1)
-            # IPv6 综合校验，避免把服务名之类误判
-            if family == '6' and not _is_global_v6(ip):
+    if not table:
+        return '', ''
+    # 服务多于 4 个时也不加线程 —— 表就这么长，再多只是空耗 fd
+    pool = ThreadPoolExecutor(max_workers=min(len(table), 6))
+    try:
+        futs = [pool.submit(_echo_one, row, family) for row in table]
+        # as_completed 保证「谁快用谁」，不必等第一个慢的
+        for f in as_completed(futs):
+            try:
+                ip, name = f.result()
+            except Exception:
                 continue
-            if family == '4' and _is_private_v4(ip):
-                continue
-            return ip, name
+            if ip:
+                # 不 cancel 剩下的是有意的：它们已在飞行中，
+                # cancel 只能取消还没开始的任务，而此时多半都已经在发包了。
+                # 让它们自己跑完（超时上限 ECHO_TIMEOUT）即可，
+                # 这次的调用反正已经拿到结果了。
+                return ip, name
+    finally:
+        pool.shutdown(wait=False)
     return '', ''
+
+
+def _echo_all_v4():
+    """并发探测**全部** IPv4 回显服务，返回 {ip: [服务名, ...]}。
+
+    与 _echo_public_ip 的区别：那个只要第一个成功就返回（短路），
+    这个必须跑完全部 —— 「多源一致性」这条证据靠的就是多个服务的
+    答案，短路了就没法交叉验证。
+    """
+    seen = {}
+    if not IP_ECHO_V4:
+        return seen
+    with ThreadPoolExecutor(max_workers=min(len(IP_ECHO_V4), 6)) as _p:
+        futs = [_p.submit(_echo_one, row, '4') for row in IP_ECHO_V4]
+        for f in as_completed(futs):
+            try:
+                ip, name = f.result()
+            except Exception:
+                continue
+            if ip:
+                seen.setdefault(ip, []).append(name)
+    return seen
 
 
 # 公网能力探测结果短缓存（默认 20 秒），兼顾「实时」与「不打爆外部接口」
 _PUBIP_CACHE = {'ts': 0.0, 'data': None}
 _PUBIP_LOCK = threading.Lock()
+# 进程内缓存在这里几乎不起作用：helper 是被 fork 出去执行动作的，
+# 每次调用都是新进程，_PUBIP_CACHE 永远是空的。所以真正的缓存必须落盘。
+_PUBIP_DISK = '/run/drouter/pubip-cache.json'
+_PUBIP_DISK_TTL = 300          # 落盘缓存放 5 分钟：公网 IP 不会一分钟一变，
+                                # 而 5 分钟足够让「连开两个页面」都命中
+ECHO_TIMEOUT = 4               # 单个回显服务的超时。比原来的 6 小：
+                                # 并发之后最坏耗时 = 这个值，没必要再等
+
+# check 分支里两块「诊断性」证据的落盘缓存。
+#
+# ⚠️ 为什么要单独一份、而且 TTL 比公网 IP 长得多：
+#   detect_public_ip 的结果 5 分钟就够（IP 本身很少变）；
+#   而「多源回显一致性」和「首跳链路」是用来解释结论的诊断信息，
+#   它们天然是「这一刻的网络长什么样」，几分钟前的完全够用，
+#   放 30 分钟免得用户每开一次页面就重新 traceroute 一遍。
+#
+#   ⚠️ 缓存的是**探测的原始结果**（{ip: [服务名]} 和 [跳表]），
+#   不是判定结论。结论仍然每次现算 —— 这样缓存只影响快慢，
+#   不影响判定逻辑，也不会因为改了判定规则而给出过期结论。
+_PUBIP_EV_DISK = '/run/drouter/pubip-evidence.json'
+_PUBIP_EV_TTL = 1800
 
 
 def detect_public_ip(force=False, ttl=20):
@@ -2570,14 +2657,23 @@ def detect_public_ip(force=False, ttl=20):
            'combo': 'neither', 'egress': '', 'checked_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
     # 1) 本地默认路由出口
-    rc, r4, _e = sh(['ip', '-4', 'route', 'show', 'default'], timeout=6)
+    #    原来这里连着 sh() 三次（route / addr / addr6），每次都 fork 一个
+    #    进程。ip 的这些子命令各自都是毫秒级的，三次 fork 的开销加起来
+    #    反而比命令本身还贵。三条并发跑，墙钟时间 = 最慢那一条。
+    _t0 = time.time()
+    with ThreadPoolExecutor(max_workers=3) as _p:
+        _f_route = _p.submit(sh, ['ip', '-4', 'route', 'show', 'default'], 6)
+        _f_addr = _p.submit(sh, ['ip', '-4', '-o', 'addr', 'show'], 6)
+        _f_addr6 = _p.submit(sh, ['ip', '-6', '-o', 'addr', 'show', 'scope', 'global'], 6)
+        rc, r4, _e = _f_route.result()
+        rc, raw, _e = _f_addr.result()
+        rc, raw6, _e = _f_addr6.result()
     m = re.search(r'default via (\S+) dev (\S+)', r4 or '')
     if m:
         res['egress'] = m.group(2)
         res['gw'] = m.group(1)
     # 2) 出口网卡上的 IPv4（若无默认路由，取第一张 UP 的物理口）
     dev = res['egress']
-    rc, raw, _e = sh(['ip', '-4', '-o', 'addr', 'show'], timeout=6)
     cands = []
     for line in (raw or '').splitlines():
         mm = re.match(r'\d+:\s+(\S+)\s+inet\s+(\S+)', line)
@@ -2595,7 +2691,6 @@ def detect_public_ip(force=False, ttl=20):
                 res['egress'] = res['egress'] or n
                 break
     # 3) IPv6 全局地址
-    rc, raw6, _e = sh(['ip', '-6', '-o', 'addr', 'show', 'scope', 'global'], timeout=6)
     for line in (raw6 or '').splitlines():
         mm = re.match(r'\d+:\s+(\S+)\s+inet6\s+(\S+)', line)
         if mm:
@@ -2605,11 +2700,27 @@ def detect_public_ip(force=False, ttl=20):
                 res['v6_iface'] = mm.group(1)
                 break
     # 4) 外部回显
-    ip4, src4 = _echo_public_ip('4')
+    #    落盘缓存里已经有结果就直接用，不再走外网。
+    #    这一步是「页面载入慢」的第二半原因：概览、DDNS、端口转发
+    #    三个页面都要公网 IP，第一次探到之后 5 分钟内都该复用。
+    #    force=True（用户点了「重新检测」）时必须跳过缓存，
+    #    否则「重新检测」按钮点了没反应，那是能直接把人气坏的 bug。
+    disk = None if force else _pubip_disk_read()
+    ip4 = src4 = ip6 = src6 = ''
+    if disk:
+        ip4, src4 = disk.get('v4_public') or '', disk.get('v4_source') or ''
+        ip6, src6 = disk.get('v6_public') or '', disk.get('v6_source') or ''
+    else:
+        ip4, src4 = _echo_public_ip('4')
+        if ip4:
+            res['v4_public'] = ip4
+            res['v4_source'] = src4
+        # IPv6 回显只在真的拿到全局地址时才试 —— 没有 IPv6 地址时
+        # 那 4 个 IPv6 回显服务必然全部超时，白等 4 秒。
+        ip6, src6 = _echo_public_ip('6') if res['v6_local'] else ('', '')
     if ip4:
         res['v4_public'] = ip4
         res['v4_source'] = src4
-    ip6, src6 = _echo_public_ip('6') if res['v6_local'] else ('', '')
     if ip6:
         res['v6_public'] = ip6
         res['v6_source'] = src6
@@ -2634,7 +2745,89 @@ def detect_public_ip(force=False, ttl=20):
     with _PUBIP_LOCK:
         _PUBIP_CACHE['ts'] = now
         _PUBIP_CACHE['data'] = res
+    _pubip_disk_write(res)
     return res
+
+
+def _pubip_disk_read():
+    """读落盘缓存。**只回显出来的部分**能用，网卡地址不能缓存 ——
+    网卡地址来自 `ip addr`，本机取值是毫秒级的，缓存它没意义；
+    而公网 IP 要走外网，那才是慢的那一段。"""
+    try:
+        st = os.stat(_PUBIP_DISK)
+        if time.time() - st.st_mtime > _PUBIP_DISK_TTL:
+            return None
+        with open(_PUBIP_DISK, encoding='utf-8') as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def _pubip_disk_write(res):
+    """把公网 IP 落盘，供后续进程复用。
+
+    为什么必须落盘：helper 的每个动作都是 **fork 出去的一次性进程**，
+    `_PUBIP_CACHE` 这种模块级变量每次都是空的 —— 20 秒的进程内缓存
+    在这个架构下等于没写。落到 /run/drouter/ 才跨进程有效，
+    连着打开「概览」「DDNS」「端口转发」三个页面时，
+    第一次探测、后面两次直接读文件。
+    """
+    try:
+        os.makedirs(os.path.dirname(_PUBIP_DISK), exist_ok=True)
+        keep = {k: res.get(k) for k in
+                ('v4_public', 'v4_source', 'v6_public', 'v6_source')}
+        tmp = _PUBIP_DISK + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(keep, f, ensure_ascii=False)
+        os.replace(tmp, _PUBIP_DISK)
+    except Exception:
+        # 缓存写不了不是错误 —— 顶多下次慢一点，不能因此让探测失败
+        pass
+
+
+def _pubip_ev_read():
+    """读 check 分支两块诊断证据的落盘缓存，返回 dict 或 None。
+
+    返回 None 有两种含义，**必须区分**，因为处理方式不同：
+      - 文件不存在 / 解析失败 → 缓存从来没建过（首次访问），正常探测
+      - 存在但已过期         → 用户太久没刷新，该重探
+    实际返回时统一成 None 就够，两种情况的下游动作是一样的（重新探测）。
+    """
+    try:
+        st = os.stat(_PUBIP_EV_DISK)
+        if time.time() - st.st_mtime > _PUBIP_EV_TTL:
+            return None
+        with open(_PUBIP_EV_DISK, encoding='utf-8') as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def _pubip_ev_write(seen, hops):
+    """把两块诊断证据的原始结果落盘。
+
+    seen 的值是 {ip: [服务名, ...]}，从 JSON 读回来是 list，
+    下游只用 `len()` 和 join，不依赖类型 —— 但 hops 是 list of str，
+    读回来也得是 list。这两个都要能在「文件被人手改坏」时优雅退化成空，
+    所以写入前先做一次形状校验。
+    """
+    try:
+        if not isinstance(seen, dict):
+            seen = {}
+        if not isinstance(hops, (list, tuple)):
+            hops = []
+        keep = {'seen': {str(k): [str(x) for x in (v or [])]
+                         for k, v in seen.items()},
+                'hops': [str(x) for x in hops]}
+        os.makedirs(os.path.dirname(_PUBIP_EV_DISK), exist_ok=True)
+        tmp = _PUBIP_EV_DISK + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(keep, f, ensure_ascii=False)
+        os.replace(tmp, _PUBIP_EV_DISK)
+    except Exception:
+        pass
 
 
 # 四种组合的中文结论（前端直接展示，避免各页面重复措辞）
@@ -2888,15 +3081,30 @@ def _probe_read_hits():
 
 
 def _traceroute_first_hops(target='223.5.5.5', max_hops=4):
-    """取到公网的头几跳，用来看本机是不是又套了一层私网 NAT。"""
+    """取到公网的头几跳，用来看本机是不是又套了一层私网 NAT。
+
+    traceroute 与 mtr 是**同一个用途的退路**，没装 traceroute 才试 mtr。
+    原来两者串行、各25 秒超时 —— 一台没装 traceroute 的机器上，
+    这一项就是 50 秒。并发化之后：不装 traceroute 时两个同时跑，
+    谁先回用谁，最坏25 秒而不是 50。
+    """
     hops = []
-    rc, out, _e = sh(['traceroute', '-n', '-w', '2', '-q', '1', '-m', str(max_hops), target],
-                     timeout=25)
-    if rc != 0 or not out:
-        # 没装 traceroute 就用 mtr 的单次模式，再不行就放弃（这条只是旁证）
-        rc, out, _e = sh(['mtr', '-n', '-r', '-c', '1', '-m', str(max_hops), target],
-                         timeout=25)
-    for line in (out or '').splitlines()[1:]:
+    with ThreadPoolExecutor(max_workers=2) as _p:
+        _f_tr = _p.submit(sh, ['traceroute', '-n', '-w', '2', '-q', '1',
+                               '-m', str(max_hops), target], 25)
+        _f_mtr = _p.submit(sh, ['mtr', '-n', '-r', '-c', '1',
+                                '-m', str(max_hops), target], 25)
+        rc, out, _e = _f_tr.result()
+        if rc == 0 and out:
+            lines = out.splitlines()[1:]
+        else:
+            # traceroute 没回（或没装），退到 mtr
+            try:
+                rc2, out2, _e2 = _f_mtr.result()
+            except Exception:
+                rc2, out2 = 1, ''
+            lines = (out2 or '').splitlines()[1:] if rc2 == 0 else []
+    for line in lines:
         m = re.search(r'(\d{1,3}(?:\.\d{1,3}){3})', line)
         if m:
             hops.append(m.group(1))
@@ -3038,8 +3246,53 @@ def act_pubip(p):
         return ok({'state': 'stopped', 'msg_cn': '入向实测已停止'})
 
     # ================= op == 'check' =================
+    #
+    # 这一段有三块**互不依赖**的外部探测：
+    #   detect_public_ip()      → 公网 IP（会打一轮回显）
+    #   多源回显一致性证据       → 再打一轮回显（要看全部服务，不能短路）
+    #   _traceroute_first_hops()→ traceroute / mtr（最长 25 秒）
+    #
+    # 第一步：串行 → 并发，一次请求的墙钟时间从「三块之和」变成「最慢那块」。
+    # 第二步（更要紧）：**不 force 时读落盘缓存**。
+    #
+    # ⚠️ 之前只给 detect_public_ip 加了缓存，以为这就够了 —— 不够。
+    # 前端 `pubipCheck(false)` 是**页面载入时自动跑的**（不是用户点按钮），
+    # 而 check 分支里的 `_echo_all_v4` 和 `_traceroute_first_hops`
+    # 当时并没有走缓存，每次都实时重打。实测热缓存下 /api/pubip 仍要
+    # 9.8 秒 —— 因为缓存只挡住了三块里最便宜的那一块，
+    # 剩下两块（回显全跑 + traceroute）照旧几十秒地等。
+    #
+    # 「页面载入慢」这类问题最容易犯的错就是**只优化了查到一半的东西**：
+    # 改完一测确实快了，就以为好了 —— 直到发现慢的是另一条没看进去的路径。
+    # 判据必须盯「整个请求耗时」，不能盯「某个函数变快了」。
     force = bool(p.get('force'))
-    info = detect_public_ip(force=force)
+
+    ev_cache = None if force else _pubip_ev_read()
+    if ev_cache:
+        # 缓存里两块都在才用。**只命中一半也照样全量重探** ——
+        # 半套缓存拼不出「多源一致性」（要多个服务的答案），
+        # 拼出来的是残缺证据，比没有更误导。
+        _c_seen = ev_cache.get('seen')
+        _c_hops = ev_cache.get('hops')
+        if isinstance(_c_seen, dict) and isinstance(_c_hops, list):
+            seen_c, hops_c = _c_seen, _c_hops
+        else:
+            ev_cache = None
+
+    if ev_cache:
+        # 命中缓存：只剩 detect_public_ip 需要看，而它自己也有缓存，
+        # 所以这一路基本是纯本地读文件，毫秒级。
+        info = detect_public_ip(force)
+        _echo_seen, hops_all = seen_c, hops_c
+    else:
+        with ThreadPoolExecutor(max_workers=3) as _p:
+            _f_det = _p.submit(detect_public_ip, force)
+            _f_echo = _p.submit(_echo_all_v4)
+            _f_trace = _p.submit(_traceroute_first_hops)
+            info = _f_det.result()
+            _echo_seen = _f_echo.result()
+            hops_all = _f_trace.result()
+        _pubip_ev_write(_echo_seen, hops_all)
     v4 = info.get('v4_public') or info.get('v4_local') or ''
 
     evidence = []
@@ -3058,12 +3311,8 @@ def act_pubip(p):
     })
 
     # ② 多源一致性
-    seen = {}
-    for name, url, pat in IP_ECHO_V4:
-        txt = _http_get_text(url, timeout=6)
-        m = re.search(pat, txt or '') if txt else None
-        if m and not _is_private_v4(m.group(1)):
-            seen.setdefault(m.group(1), []).append(name)
+    #    （探测已在上面与其他两项并发跑完，这里只取结果）
+    seen = _echo_seen
     addrs = sorted(seen.keys(), key=lambda k: -len(seen[k]))
     consistent = len(addrs) == 1 and len(seen[addrs[0]]) >= 2 if addrs else False
     evidence.append({
@@ -3079,7 +3328,7 @@ def act_pubip(p):
     })
 
     # ③ 首跳链路
-    hops = _traceroute_first_hops()
+    hops = hops_all
     nat_hops = [h for h in hops if _is_private_v4(h)]
     evidence.append({
         'key': 'path', 'name': '首跳链路',
@@ -3147,6 +3396,10 @@ def act_pubip(p):
         'probe_state': pstate,
         'combo': info.get('combo') or 'neither',
         'checked_at': info.get('checked_at') or '',
+        # 诊断证据是不是复用了缓存。前端要如实告诉用户，
+        # 否则「30 分钟前的首跳链路」会被当成「刚测的」看 ——
+        # 网络拓扑变了的时候，这个差别是要误判的。
+        'evidence_cached': bool(ev_cache),
         'msg_cn': '判定完成：' + v['title'],
     })
 
@@ -3292,7 +3545,7 @@ def _ddns_record_name(cfg):
 #
 # ── 为什么只做 WireGuard，不做 OpenVPN ──────────────────────────────────────
 # Debian 13 的内核**自带** WireGuard（5.6 之后并入上游内核），不需要装任何
-# 第三方软件，也不���要 DKMS 编译模块。这台是 4GB/2CPU 的软路由，让用户为了
+# 第三方软件，也不需要 DKMS 编译模块。这台是 4GB/2CPU 的软路由，让用户为了
 # 远程回家访问 NAS 去编译内核模块是不能接受的。wg-quick 是 systemd 单元，
 # 配置就是 INI 格式，几十行就够。
 #
@@ -7080,6 +7333,39 @@ def _print_apply(cfg, errs):
         sh(['systemctl', 'disable', 'cups-browsed.service'], timeout=20)
 
 
+# lpinfo -v 的落盘缓存。与公网 IP 同一套理由：helper 是 fork 出去的一次性
+# 进程，进程内缓存在这个架构下等于没写。
+#
+# ⚠️ **只缓存成功结果**。失败（超时 / rc!=0）不写缓存 ——
+#   否则一次网络抖动会让「这一轮没扫到设备」被固化 120 秒，
+#   而用户明明 5 秒后就重启好 cups 了，打开页面还是「无设备」。
+#   缓存失败结果是把瞬时故障变成长时间故障。
+_PRINT_LPINFO_DISK = '/run/drouter/lpinfo-cache.txt'
+_PRINT_LPINFO_TTL = 120
+
+
+def _print_lpinfo_cache_read():
+    try:
+        st = os.stat(_PRINT_LPINFO_DISK)
+        if time.time() - st.st_mtime > _PRINT_LPINFO_TTL:
+            return None
+        with open(_PRINT_LPINFO_DISK, encoding='utf-8') as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def _print_lpinfo_cache_write(text):
+    try:
+        os.makedirs(os.path.dirname(_PRINT_LPINFO_DISK), exist_ok=True)
+        tmp = _PRINT_LPINFO_DISK + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(text or '')
+        os.replace(tmp, _PRINT_LPINFO_DISK)
+    except Exception:
+        pass
+
+
 def _print_status():
     cfg = _print_load()
     inst = bool(shutil.which('cupsd') or os.path.isfile('/usr/sbin/cupsd'))
@@ -7090,11 +7376,77 @@ def _print_status():
     cups = _svcs['cups.service']
     browsed = _svcs['cups-browsed.service']
     raw = _svcs[PRINT_RAW_SERVICE]
-    ver = ''
-    if inst:
-        rc, out, _e = sh(['dpkg-query', '-W', '-f=${Version}', 'cups'], timeout=12)
+
+    # ⚠️ 性能：下面这一堆慢查询**必须并发**，这是打印页载入慢的全部原因。
+    # 实测这台机器上的单项耗时：
+    #     dpkg-query -W cups   ~0.1s
+    #     lpstat -p             0.05s   ← 队列列表，页面的主信息
+    #     lpinfo -v             4.21s   ← 设备后端，页面的辅助信息
+    #     lsusb                 0.1s
+    # 串行加起来 4.4 秒 —— 而页面真正等着用的是 lpstat -p 那 0.05 秒，
+    # 用户为了看「有没有打印机」等了 4 秒只因为一个辅助列表。
+    # 改成并发后墙钟时间 = 最慢那一条 ≈ 4.2s；再给 lpinfo 单独压超时，
+    # 慢的那条退化时页面也不至于整块卡住。
+    _PRINT_STATUS_CONC_TIMEOUT = 8
+
+    def _q_dpkg():
+        return sh(['dpkg-query', '-W', '-f=${Version}', 'cups'], timeout=6)
+
+    def _q_lpstat():
+        return sh(['lpstat', '-p'], timeout=25, env=_print_c_locale_env())
+
+    def _q_lpinfo():
+        # lpinfo -v 是 cups 的**网络发现扫描**：它会真的去扫局域网里的
+        # 631 端口，所以慢是它的固有成本（实测 4.21 秒），不是异常。
+        # 打印机不会 30 秒内凭空多出一台，所以结果落盘缓存 120 秒 ——
+        # 用户连续刷两次页面，第二次就是 0 秒。
+        _c = _print_lpinfo_cache_read()
+        if _c is not None:
+            # ⚠️ 必须返回 **3 元组**，跟 sh() 的形状一致。
+            # 第一版这里返回 (0, _c) 两个值，而调用方按 `rc, lpv, _e = ...`
+            # 解包 —— 直接抛 ValueError: not enough values to unpack。
+            #
+            # 这个 bug 在真机上的表现极具欺骗性：
+            #   页面 0.08 秒载入（很快，因为异常被 except 吞掉了）
+            #   但 devices=[] 且 devices_timed_out=True —— **数据是错的**
+            # 「快」和「对」是两件事，只看耗时永远发现不了。
+            # 而且异常被 except Exception 兜住之后没有任何日志，
+            # 从外面看就是「设备列表空了」，会引着人去查打印机。
+            return 0, _c, ''
+        rc, out, _e = sh(['lpinfo', '-v'], timeout=_PRINT_STATUS_CONC_TIMEOUT)
         if rc == 0:
-            ver = (out or '').strip()
+            _print_lpinfo_cache_write(out)
+        return rc, out
+
+    def _q_usb():
+        return _print_usb_printers()
+
+    def _q_listen():
+        return _print_listen_now()
+
+    # ⚠️ 别漏掉后面那两个：`_print_usb_printers()` 要 lsusb + 读 sysfs，
+    # `_print_listen_now()` 要 ss。它们各自都不慢，但**串在 lpinfo 后面
+    # 就变成了 4.2s + 0.2s** —— 优化只做一半是最容易发生的情况，
+    # 因为「看起来慢的那一条」通常只有一条。
+    with ThreadPoolExecutor(max_workers=5) as _p:
+        _f_ver = _p.submit(_q_dpkg)
+        _f_lp = _p.submit(_q_lpstat)
+        _f_lpi = _p.submit(_q_lpinfo) if inst else None
+        _f_usb = _p.submit(_q_usb)
+        _f_lst = _p.submit(_q_listen)
+        rc_ver, out_ver, _e = _f_ver.result()
+        rc2, lp, _e2 = _f_lp.result()
+        usbs, nodes = _f_usb.result()
+        listen_now = _f_lst.result()
+        if _f_lpi is not None:
+            try:
+                rc, lpv, _e = _f_lpi.result()
+            except Exception:
+                rc, lpv = 1, ''
+        else:
+            rc, lpv = 1, ''
+
+    ver = (out_ver or '').strip() if rc_ver == 0 else ''
     queues = []
     if inst:
         try:
@@ -7105,7 +7457,6 @@ def _print_status():
         # cupsd 延迟写盘：别人（或本页上一次操作）刚加的队列可能只在内存里。
         # 用 lpstat 补齐 —— 只补「文件里没有的」，绝不据此删掉文件里有的，
         # 免得把 cups-browsed 还没来得及重新生成的队列弄丢。
-        rc2, lp, _e2 = sh(['lpstat', '-p'], timeout=25, env=_print_c_locale_env())
         if rc2 == 0:
             have = set(q.get('name') for q in queues)
             for x in _print_parse_lpstat_p(lp):
@@ -7116,7 +7467,6 @@ def _print_status():
                                'make_model': '', 'state': x['state'],
                                'accepting': x['accepting'], 'shared': False,
                                'not_saved_yet': True})
-    rc, lpv, _e = sh(['lpinfo', '-v'], timeout=30) if inst else (1, '', '')
     devices = []
     if rc == 0:
         for ln in lpv.splitlines():
@@ -7125,17 +7475,21 @@ def _print_status():
                 continue
             parts = ln.split(None, 1)
             devices.append({'kind': parts[0], 'uri': parts[1] if len(parts) > 1 else ''})
-    usbs, nodes = _print_usb_printers()
     lan = _print_lan_ip()
+    # lpinfo 超时被砍到 8 秒时，页面会拿到空的设备列表。
+    # 那不是「没有设备」，是「没查到」—— 两者必须分开，
+    # 否则用户看到空白列表会去排查打印机，而问题在别处。
+    devices_timed_out = bool(inst) and rc != 0
     return ok({
         'cfg': cfg,
         'installed': inst,
         'need_install': [] if inst else PRINT_PKGS,
         'cups': cups, 'browsed': browsed, 'raw': raw,
         'cups_version': ver,
-        'listen': _print_listen_now(),
+        'listen': listen_now,
         'queues': queues,
         'devices': devices,
+        'devices_timed_out': devices_timed_out,
         'usb_printers': usbs,
         'usb_nodes': nodes,
         'drivers': PRINT_DRIVERS,
