@@ -64,6 +64,16 @@ a:hover{text-decoration:underline}
 #app.side-collapsed .nitem-t,#app.side-collapsed .nitem-tag{display:none}
 #app.side-collapsed .nitem,#app.side-collapsed .ng-head{justify-content:center}
 .brand{display:flex;align-items:center;gap:11px;padding:18px 18px 14px}
+/* brand 是 <a>（可点击回概述页），要显式去掉 <a> 的默认外观 ——
+   只写 .brand-home 的样式不够，浏览器给 <a> 的 color/text-decoration
+   是 UA 样式表里的规则，作者样式表不声明就仍然生效。
+   padding/flex 沿用上面的 .brand，这里不重复声明。 */
+.brand-home{text-decoration:none;color:inherit;border-radius:8px;transition:background .15s}
+/* 焦点环不能去掉：这是纯键盘用户的唯一路标 */
+.brand-home:focus-visible{outline:2px solid var(--pri);outline-offset:-2px}
+.brand-home:hover{background:var(--line2)}
+/* 侧栏收起时只剩 logo，此时 hover 反馈面积很小 */
+#app.side-collapsed .brand-home{padding-left:0;padding-right:0;justify-content:center}
 .brand-mark{color:var(--pri);flex:0 0 auto}
 .brand-txt{min-width:0}
 .brand-txt b{display:block;font-size:17px;font-weight:700;color:var(--txt);letter-spacing:.3px;line-height:1.2}

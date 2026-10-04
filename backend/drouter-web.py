@@ -61,6 +61,28 @@ HELPER = '/opt/drouter/backend/drouter-helper.py'
 LOG_DIR = '/var/log/drouter'
 BUILD_FLAG = '/etc/drouter/BUILD_MODE'
 
+# ---- 版本号（唯一真源 = packaging/VERSION，构建时安装到 /opt/drouter/VERSION）----
+# 早先版本号在 openapi 里硬编码，于是「页面显示什么版本」和「包管理器认为
+# 是哪个版本」是两条互不相干的线，只能靠人手记着同步 —— 漏一次就是一个
+# 改不掉的 bug（apt 按 control 认版本，文件名是 1.0.9 它就当 1.0.8）。
+VERSION_FALLBACK = '1.0.9'
+_VERSION_READ = [False]
+
+
+def app_version():
+    """当前版本号。读一次就缓存 —— /opt/drouter/VERSION 不会在运行期变。"""
+    if not _VERSION_READ[0]:
+        _VERSION_READ[0] = True
+        try:
+            with open(os.path.join(BASE, 'VERSION')) as f:
+                v = f.read().strip()
+            # 只认形如 1.2.3 的，避免把构建事故（空文件/半截写入）显示到页面上
+            if re.match(r'^\d+\.\d+(\.\d+)?([-+~][\w.]+)?$', v):
+                return v
+        except Exception:
+            pass
+    return VERSION_FALLBACK
+
 
 def in_build_mode():
     """构建保护模式：存在该标志文件时，禁止一切抢端口/改网络的动作。"""
@@ -344,51 +366,162 @@ _WORKER_SEM = threading.BoundedSemaphore(MAX_WORKERS)
 MAX_SESSIONS_WEB = 500
 
 # ---- 静态资源压缩缓存（#7）----
-# app.js 有 437KB，压缩后约 90KB。但每次请求都重压一遍纯属浪费 CPU，
-# 所以按 (文件路径, 修改时间, 大小) 做键把压缩结果缓在内存里；
+# app.js 有 583KB，gzip 后 198KB。每次请求都重压一遍纯属浪费 CPU，
+# 所以按 (文件路径, 修改时间, 大小, 编码) 做键把压缩结果缓在内存里；
 # 文件一变（部署新版本）键就变了，旧条目自动失效。
-_gz_lock = threading.Lock()
-_gz_cache = {}
-_GZ_MAX = 16          # 资源种类就那么几个，缓存上限给足余量即可
-# 但**只限条目数是不够的**：16 个大响应就能占掉上百 MB 常驻内存。
+#
+# ⚠️ 编码必须进键：同一份数据 gzip 出来 198KB、brotli 出来 150KB，
+# 共用一个键就会互相覆盖 —— 拿到 br 的客户端可能收到 gzip 版，
+# 浏览器解不开就是满屏乱码。
+_comp_lock = threading.Lock()
+_comp_cache = {}
+_COMP_MAX = 24         # 资源种类就那么几个，缓存上限给足余量即可
+# 但**只限条目数是不够的**：24 个大响应就能占掉上百 MB 常驻内存。
 # 4GB 机器上按字节再设一道闸（超过就整表清空，重建成本很低）。
-_GZ_MAX_BYTES = 24 * 1024 * 1024
-_gz_bytes = [0]
+_COMP_MAX_BYTES = 32 * 1024 * 1024
+_comp_bytes = [0]
+
+# brotli 质量档。实测 app.js（583KB）：
+#   q5 → 约 160KB，压缩耗时 ~0.1s
+#   q11 → 150KB，压缩耗时 1.5-3s（2 核小机器上很明显）
+# 省下的 10KB 不值 2 秒，**首屏最怕的是等**。q5 是这个权衡的平衡点。
+BROTLI_QUALITY = 5
+
+
+def _accepts(headers, token):
+    """Accept-Encoding 里是否含某个编码（大小写不敏感、带 q=0 视为不支持）。
+
+    ⚠️ 不能只做 `'br' in s`：`Accept-Encoding: br;q=0` 的意思是
+    「我认识 br 但明确不要」，按子串匹配会正好发一份它解不开的东西。
+    """
+    try:
+        s = (headers.get('Accept-Encoding') or '').lower()
+    except Exception:
+        return False
+    for part in s.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        bits = part.split(';')
+        name = bits[0].strip()
+        if name != token:
+            continue
+        for q in bits[1:]:
+            q = q.strip()
+            if q.startswith('q='):
+                try:
+                    return float(q[2:]) > 0
+                except ValueError:
+                    return True
+        return True
+    return False
 
 
 def _want_gzip(headers):
-    try:
-        return 'gzip' in (headers.get('Accept-Encoding') or '').lower()
-    except Exception:
-        return False
+    return _accepts(headers, 'gzip')
 
 
-def _gzip_cached(path, data):
-    """返回 (body, encoding)。data 已经是最终字节内容时传 path=None。"""
+def _want_brotli(headers):
+    """浏览器是否收 br。
+
+    实测 app.js（583KB 源码）：gzip → 198KB，**brotli → 160KB**（q5），
+    再省 20%。走外网（cloudflared / 远程打开面板）这个差别是实打实的秒数。
+
+    ⚠️ 只在客户端**明确**带 br 时才用。发一份客户端解不开的编码，
+    表现是页面全是乱码 —— 比慢严重得多。
+    """
+    return _accepts(headers, 'br')
+
+
+def _compress_cached(path, data, enc):
+    """压一次并缓存。返回 (body, enc) 或 (data, None)（压不动就直出）。"""
     try:
         st = os.stat(path)
-        key = (path, int(st.st_mtime), st.st_size)
-    except Exception:
-        # 内容不在磁盘上（如入口页注入版本号后的 HTML），按内容哈希缓存
-        key = (None, hash(data), len(data))
-    with _gz_lock:
-        hit = _gz_cache.get(key)
+        key = (path, int(st.st_mtime), st.st_size, enc)
+    except (OSError, TypeError):
+        # path=None（JSON 响应不在磁盘上）或文件刚好被删 → 按内容哈希缓存。
+        # 只接 OSError/TypeError：os.stat 失败就这两种，再宽就会把
+        # 拼错路径之类的编程错误一起吞掉。
+        key = (None, hash(data), len(data), enc)
+    with _comp_lock:
+        hit = _comp_cache.get(key)
     if hit is not None:
-        return hit, 'gzip'
+        return hit, enc
     try:
-        import gzip
-        z = gzip.compress(data, 6)
+        if enc == 'br':
+            import brotli
+            z = brotli.compress(data, quality=BROTLI_QUALITY)
+        else:
+            import gzip
+            z = gzip.compress(data, 6)
     except Exception:
         return data, None
     if len(z) >= len(data):
         return data, None
-    with _gz_lock:
-        if len(_gz_cache) >= _GZ_MAX or _gz_bytes[0] + len(z) > _GZ_MAX_BYTES:
-            _gz_cache.clear()
-            _gz_bytes[0] = 0
-        _gz_cache[key] = z
-        _gz_bytes[0] += len(z)
-    return z, 'gzip'
+    with _comp_lock:
+        if (len(_comp_cache) >= _COMP_MAX
+                or _comp_bytes[0] + len(z) > _COMP_MAX_BYTES):
+            _comp_cache.clear()
+            _comp_bytes[0] = 0
+        _comp_cache[key] = z
+        _comp_bytes[0] += len(z)
+    return z, enc
+
+
+def _brotli_cached(path, data):
+    """brotli 版。**brotli 模块不可用时返回 (None, None)** —— 由调用方
+    决定回退到 gzip，这里不能自己吐原文（那等于 583KB 裸传）。
+
+    兜底只覆盖 ImportError：模块没装是预期情况（Debian 13 的包名是
+    python3-brotli，属于可选依赖）。其余异常照抛 —— 被宽 except 吞掉的
+    内部错误会伪装成「压缩没生效」，见 _gzip_cached 里的说明。
+    """
+    try:
+        import brotli  # noqa: F401
+    except ImportError:
+        return None, None
+    return _compress_cached(path, data, 'br')
+
+
+def _gzip_cached(path, data):
+    """gzip 版。返回 (body, encoding)。data 已是最终字节内容时传 path=None。
+
+    ⚠️ 兜底**只接 ImportError**（gzip 是标准库，实际等于不接），
+    刻意不写 `except Exception`、也不接 TypeError/ValueError：
+    早先写的是宽 except，结果一次 NameError（漏注入 _comp_lock）被静默
+    吞成「返回原文」，表现是**压缩功能完好但从不生效**，
+    页面照常能开，只看「响应头有没有 Content-Encoding」的判据也发现不了，
+    583KB 一直裸传。TypeError/ValueError 同样不能接 ——
+    「把 str 传给要 bytes 的接口」也是 TypeError，接了等于没接。
+    真出这类错就该抛出来：请求 500 比静默劣化好排查得多。
+    """
+    return _compress_cached(path, data, 'gzip')
+
+
+def _encode_body(headers, path, data, min_size=GZIP_MIN):
+    """按客户端能力挑编码：br > gzip > 原文。
+
+    **调用方负责已经判过 len(data) >= min_size** —— 这里不再重复判断。
+    返回 (body, encoding)；encoding 为 None 表示原样输出。
+
+    ⚠️ 降级必须是**逐级**的，不能「要 br 就只发 br」：
+    目标机没装 python3-brotli 时如果直接返回原文，583KB 就裸传了，
+    比优化前还慢。正确做法是 br 不可用 → 试 gzip → 都不行才原文。
+
+    这里也**不写宽 except**：压缩链出内部错误时宁可让请求 500，
+    也不要静默返回一个「没压缩但看起来正常」的响应 ——
+    那正是 583KB 裸传却没人发现的成因。
+    """
+    # 顺序不能换：brotli 压得更小，但要先确认客户端真的收。
+    # 反过来（先 gzip 再问 br）会让不支持 br 的客户端拿到 br 版。
+    if _want_brotli(headers):
+        body, enc = _brotli_cached(path, data)
+        if enc:
+            return body, enc
+        # 落到这里 = brotli 模块没有 / 压不小 → 继续试 gzip
+    if _want_gzip(headers):
+        return _gzip_cached(path, data)
+    return data, None
 _helpd_lock = threading.Lock()
 _helpd_down_until = [0.0]      # 在这个时间戳之前，不再尝试连 socket
 _helpd_down_logged = [False]
@@ -613,8 +746,8 @@ class Api:
         # 十分之一。局域网里无所谓，但通过 cloudflared / 外网访问时这是数量级
         # 的差别。小响应不压——省下的字节还不如压缩本身的花销。
         enc = None
-        if len(body) >= GZIP_MIN and _want_gzip(self.h.headers):
-            body, enc = _gzip_cached(None, body)
+        if len(body) >= GZIP_MIN:
+            body, enc = _encode_body(self.h.headers, None, body)
         self.h.send_response(status)
         self.h.send_header('Content-Type', 'application/json; charset=utf-8')
         if enc:
@@ -2198,7 +2331,7 @@ def build_openapi(base):
         'openapi': '3.0.3',
         'info': {
             'title': 'Drouter 通用管理 API',
-            'version': '1.0.8',
+            'version': app_version(),
             'description': ('Drouter（Debian 13 拼装主路由）的统一 REST 接口。'
                             '任意语言 / 框架（curl、Python、Node、Go、PHP、Java、.NET、'
                             'Shell、Postman、工单系统、IoT 网关）均可直接调用。'
@@ -2400,7 +2533,10 @@ def _inject_asset_version(raw):
             return m.group(0)
         return '%s%s?v=%d%s' % (pre, url, ver(url), post)
 
-    return _ASSET_RE.sub(sub, text).encode('utf-8')
+    # 页脚版本号。放在同一个函数里做，是因为**同一份字节只算一次哈希**：
+    # 拆成两次注入就得各算一遍 key，(None, hash, len, enc) 缓存会失效。
+    text = _ASSET_RE.sub(sub, text).replace('__APP_VERSION__', app_version())
+    return text.encode('utf-8')
 
 
 class _Server(ThreadingHTTPServer):
@@ -2473,18 +2609,39 @@ class Handler(BaseHTTPRequestHandler):
         elif full.endswith('.css'):
             ctype = 'text/css; charset=utf-8'
 
-        # ETag 协商缓存：没变就回 304，省掉整个响应体（app.js 437KB）。
+        # ETag 协商缓存：没变就回 304，省掉整个响应体（app.js 583KB）。
         # 键里带 mtime 和大小，部署新版本后自动失效。
         try:
             st = os.stat(full)
             etag = '"%s-%s"' % (int(st.st_mtime), st.st_size)
         except Exception:
             etag = ''
+        # ⚠️ index.html 要**额外**把版本号并进 ETag。
+        # 它发出去的不是文件原样，而是注入过资源指纹和 __APP_VERSION__ 的产物；
+        # 只按 mtime+size 算的话，光改 /opt/drouter/VERSION（文件本身一个字节
+        # 都没动）时 ETag 不变，客户端拿 If-None-Match 换到 304 就继续用旧副本，
+        # 页面底下的版本号会一直停在旧版本 —— 恰好是最该更新的地方不更新。
+        if full.endswith('index.html'):
+            etag = '"%s-%s"' % (etag.strip('"'), app_version())
+        # ⚠️ 缓存策略分两种，靠**有没有指纹**区分，不是靠扩展名：
+        #   带 ?v=<mtime>（index.html 注入的）→ URL 变了就是新文件，
+        #     可以放心 immutable 长缓存，浏览器第二次打开直接本地命中，
+        #     583KB 一秒都不传。
+        #   没指纹（用户手输 /app.js、收藏夹、别的页面链过来）
+        #     → 必须 no-cache，否则部署新版本后用户拿到的是旧文件。
+        #
+        # 早先不分这两种，一律 no-cache —— 首屏每次都要重传 583KB（gzip 后 198KB），
+        # 而指纹明明已经注入了，白白浪费了长缓存。局域网感觉不出来，
+        # 走外网（cloudflared / 远程访问）就是每开一次面板多传 200KB。
+        # 指纹不匹配的判据在 t-gzip.py 里。
+        fingerprinted = 'v=' in (self.path or '')
+        static_cc = ('public, max-age=31536000, immutable'
+                     if fingerprinted else 'no-cache')
         if etag and (self.headers.get('If-None-Match') or '') == etag:
             self.send_response(304)
             if etag:
                 self.send_header('ETag', etag)
-            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Cache-Control', static_cc)
             self.end_headers()
             return
 
@@ -2498,8 +2655,8 @@ class Handler(BaseHTTPRequestHandler):
             data = _inject_asset_version(data)
 
         enc = None
-        if _want_gzip(self.headers) and len(data) >= GZIP_MIN:
-            data, enc = _gzip_cached(full, data)
+        if len(data) >= GZIP_MIN:
+            data, enc = _encode_body(self.headers, full, data)
 
         self.send_response(200)
         self.send_header('Content-Type', ctype)
@@ -2512,7 +2669,7 @@ class Handler(BaseHTTPRequestHandler):
         if full.endswith('.html'):
             self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
         else:
-            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Cache-Control', static_cc)
         self.end_headers()
         if self.command != 'HEAD':
             self.wfile.write(data)

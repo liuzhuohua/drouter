@@ -13,7 +13,14 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="${1:-1.0.8}"
+# ⚠️ 版本号的**唯一真源**是 packaging/VERSION，不要在脚本里另写一份。
+# 早先 4 个构建脚本各写死一个默认值，改版本时漏改一处就产出一个
+# 「文件名是 1.0.9、control 里是 1.0.8」的包 —— apt 会按 control 认版本，
+# 表现为 `dpkg -l` 永远显示旧版，升级也升不上去。
+VERSION_FILE="$HERE/packaging/VERSION"
+[ -f "$VERSION_FILE" ] || { echo "缺少 $VERSION_FILE（版本号唯一真源）"; exit 1; }
+VERSION="${1:-$(tr -d ' \t\r\n' < "$VERSION_FILE")}"
+[ -n "$VERSION" ] || { echo "$VERSION_FILE 为空"; exit 1; }
 DIST="$HERE/dist"
 PKG="drouter"
 STAGE="$DIST/${PKG}_${VERSION}_all"
@@ -43,6 +50,10 @@ for d in "$HERE"/docs/*; do
   install -m 0644 "$d" "$STAGE/opt/drouter/docs/"
 done
 install -m 0755 "$HERE"/scripts/*.sh          "$STAGE/opt/drouter/scripts/"
+# 版本号随包落到 /opt/drouter/VERSION —— 页面底部的版本号和 openapi 的
+# version 字段都从它读。不装的话后端只能退回硬编码的兜底值，
+# 表现是「deb 装的是 1.0.9，页面却显示 1.0.8」。
+install -m 0644 "$VERSION_FILE"                 "$STAGE/opt/drouter/VERSION"
 # 一键运维命令：直接随包提供，postinst 里再做一次兜底安装
 install -m 0755 "$HERE/scripts/drouter-ctl.sh" "$STAGE/usr/local/bin/drouter-ctl"
 

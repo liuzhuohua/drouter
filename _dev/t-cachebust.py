@@ -46,6 +46,11 @@ for name in ('app.js', 'app.css'):
     os.utime(p, (1_700_000_000, 1_700_000_000))
 
 ns = {'os': os, 're': re, 'WEB_DIR': tmp}
+# _inject_asset_version 从 1.0.9 起还会替换页脚版本号占位符，
+# 所以要提供 app_version()。**漏了会 NameError** —— 而这个判据只
+# 抽了单个函数、不是整个模块，模块级定义一个都带不过来。
+# 凡是改了被抽函数的签名或新引用的模块级符号，替身必须同步补。
+ns['app_version'] = lambda: '9.9.9'
 exec(compile(ast.Module(body=picked, type_ignores=[]), SRC, 'exec'), ns)
 inject = ns['_inject_asset_version']
 
@@ -53,6 +58,7 @@ HTML = ('<!doctype html>\n'
         '<link rel="icon" href="/logo.svg" type="image/svg+xml">\n'
         '<link rel="stylesheet" href="/app.css">\n'
         '<link rel="stylesheet" href="/theme.css?v=123">\n'
+        '<span id="app-ver">v__APP_VERSION__</span>\n'
         '<script src="/app.js"></script>\n')
 
 out = inject(HTML.encode('utf-8')).decode('utf-8')
@@ -76,6 +82,10 @@ ck('不会重复追加（幂等）',
 ck('输出仍是合法 utf-8 且保留 doctype', out.startswith('<!doctype html>'))
 ck('单引号属性也能处理',
    "/app.css?v=" in inject(b"<link href='/app.css'>").decode('utf-8'))
+# 1.0.9：页脚版本号占位符也要被替换掉。
+# 漏了不会报错，只是页面底下一直显示 v__APP_VERSION__ 字面量。
+ck('页脚 __APP_VERSION__ 被替换成真实版本号',
+   '__APP_VERSION__' not in out and 'v9.9.9' in out)
 
-print('\n结果：%d 项，失败 %d 项' % (7, len(fails)))
+print('\n结果：%d 项，失败 %d 项' % (8, len(fails)))
 raise SystemExit(1 if fails else 0)

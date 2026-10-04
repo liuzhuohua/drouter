@@ -4265,11 +4265,19 @@ def _vpn_env():
     # 不能只认 .ko：Debian 默认压成 .ko.xz，个别发行版用 .ko.zst。
     mod_file = ''
     for _n in ('wireguard.ko', 'wireguard.ko.xz', 'wireguard.ko.zst'):
-        _p = os.path.join('/lib/modules', kver,
-                          'kernel/drivers/net/wireguard', _n)
+        _p = os.path.join('/lib/modules', kver, _n)
         if os.path.isfile(_p):
             mod_file = _p
             break
+    # ⚠️ 四态必须**逐级降级**，顺序不能换、不能漏：
+    #     已加载 + 有工具   → ready
+    #     已加载 + 没工具   → need_tool
+    #     没加载 + 有模块文件 → need_module   ← 这一级以前**整个漏掉了**
+    #     两头都没有        → unsupported
+    # 漏掉 need_module 的后果不是「少一个状态」，而是 docstring 里写的
+    # 那个原 bug 原地复活：PVE 的 KVM 虚机内核明明有 wireguard.ko.xz
+    # 却报 unsupported，前端配一句写死的「通常说明跑在精简容器里」，
+    # 把排查方向整个带偏（用户会去查容器镜像，真正该做的是 modprobe）。
     if mod_loaded and tool:
         state = 'ready'
     elif mod_loaded:

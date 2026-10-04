@@ -13302,6 +13302,21 @@ function closeDrawer() {
   if (el) el.classList.remove('m-drawer');
 }
 
+/* 左上角 logo → 回系统概览。
+   go() 自己会 closeDrawer()，窄屏下抽屉会一起收起，不用额外处理。
+   ⚠️ 已经在 dash 页时不重复 go()：go() 会 stopPageTimers + 重新拉数据，
+   在概览页上连点 logo 会白白清掉轮询再重建，看着像「卡了一下」。
+   概览页自己有刷新按钮，需要重拉数据用那个。 */
+const brandHome = $('#brand-home');
+if (brandHome) {
+  brandHome.addEventListener('click', e => {
+    e.preventDefault();
+    closeDrawer();
+    if (S.page === 'dash') return;
+    go('dash');
+  });
+}
+
 $('#btn-side').onclick = () => {
   // 窄屏走抽屉，不写折叠状态——否则回到宽屏时会莫名是折叠的
   if (isNarrow()) { $('#app').classList.toggle('m-drawer'); return; }

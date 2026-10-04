@@ -15,7 +15,11 @@
 #       把标签从 buildah 的 localhost/... 改成 docker 惯用的名字。
 set -e
 
-VER="${1:-1.0.8}"
+# 版本号唯一真源是 packaging/VERSION（见 packaging/build-deb.sh 里的说明）
+_HERE="$(cd "$(dirname "$0")/.." && pwd)"
+VF="$_HERE/packaging/VERSION"
+[ -f "$VF" ] || { echo "缺少 $VF（版本号唯一真源）"; exit 1; }
+VER="${1:-$(tr -d ' \t\r\n' < "$VF")}"
 SRC="${2:-/tmp/drouter-build}"
 cd "$SRC" || exit 1
 

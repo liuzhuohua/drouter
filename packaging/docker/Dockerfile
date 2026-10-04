@@ -54,6 +54,9 @@ COPY web/            /opt/drouter/web/
 # 进镜像纯属白白撑大体积
 COPY docs/*.md       /opt/drouter/docs/
 COPY scripts/*.sh    /opt/drouter/scripts/
+# 版本号（唯一真源）。页面底部与 openapi 的 version 字段都读它 ——
+# 不拷的话容器里只能退回硬编码兜底值，镜像 tag 是 1.0.9 页面却显示 1.0.8。
+COPY packaging/VERSION /opt/drouter/VERSION
 COPY packaging/docker/docker-init.sh /opt/drouter/bin/docker-init.sh
 RUN chmod +x /opt/drouter/bin/docker-init.sh /opt/drouter/scripts/*.sh
 

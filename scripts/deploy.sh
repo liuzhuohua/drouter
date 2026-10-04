@@ -86,6 +86,14 @@ install -m 0644 $SRC/web/app.js     $OPT/web/app.js
 if [ -f "$SRC/web/logo.svg" ]; then
   install -m 0644 $SRC/web/logo.svg $OPT/web/logo.svg
 fi
+# 版本号（1.0.9 新增）。页面底部的版本号与 /api/openapi 的 version 字段
+# 都从 /opt/drouter/VERSION 读。缺了不报错，只是永远显示后端的兜底值 ——
+# 部署了新版却显示旧版本号，比什么都不做更让人困惑。
+# devtools/sync.sh 负责把 packaging/VERSION 打进源码包；源码包里没有就跳过。
+if [ -f "$SRC/packaging/VERSION" ]; then
+  install -m 0644 $SRC/packaging/VERSION $OPT/VERSION
+  echo "  版本号 $(cat $OPT/VERSION)"
+fi
 
 echo "=== 3.5 安装运维脚本（自检/回归用）==="
 if [ -d "$SRC/scripts" ]; then

@@ -51,13 +51,17 @@
 
 <div id="app" class="hidden">
   <aside class="sidebar" id="sidebar">
-    <div class="brand">
+    <!-- 左上角 logo 回概述页。
+         用 <a> 而不是 <div onclick>：Tab 能聚焦、Enter 能触发、读屏会念
+         「链接」。role/button + tabindex 只能骗过一部分辅助工具，语义标签
+         是免费的。href="#" 会被下面的 click preventDefault 吃掉。 -->
+    <a class="brand brand-home" href="#dash" id="brand-home" title="返回系统概览">
       <svg class="brand-mark" width="30" height="30" aria-hidden="true"><use href="#drouter-logo"/></svg>
       <div class="brand-txt">
         <b>Drouter</b>
         <span id="host-tag"></span>
       </div>
-    </div>
+    </a>
     <div class="nav-search">
       <input id="nav-filter" placeholder="搜索菜单…" autocomplete="off">
     </div>
@@ -119,6 +123,8 @@
       <a href="https://github.com/liuzhuohua" target="_blank" rel="noopener noreferrer">https://github.com/liuzhuohua</a>
       <span class="sep">·</span>
       <span>遵循 MIT 开源协议</span>
+      <span class="sep">·</span>
+      <span class="site-ver" id="app-ver" title="当前安装的版本">v__APP_VERSION__</span>
     </footer>
   </main>
 </div>

@@ -27,7 +27,10 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="${1:-1.0.8}"
+# 版本号唯一真源是 packaging/VERSION（见 build-deb.sh 里的说明）
+VF="$HERE/packaging/VERSION"
+[ -f "$VF" ] || { echo "缺少 $VF（版本号唯一真源）"; exit 1; }
+VERSION="${1:-$(tr -d ' \t\r\n' < "$VF")}"
 OUTDIR="${2:-$HERE/dist}"
 ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 

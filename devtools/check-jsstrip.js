@@ -65,7 +65,7 @@ if (!fs.existsSync(STRIPPED)) {
   // ---------- 3) 剥后关键 token 数量不该变多 ----------
   // ⚠️ 判据是「只多不少」，**不是**「完全相等」。
   // 写死相等会红：注释里经常提到这些标识符（比如「这里之前用
-  // innerHTML 于是…���这种讲 bug 来历的话），剥注释会连带剥掉它们。
+  // innerHTML 于是…这种讲 bug 来历的话），剥注释会连带剥掉它们。
   // 而「变多」才是误吃的信号 —— 原文被切开重组时 token 数会膨胀。
   const TOKENS = ['function', 'const', 'innerHTML',
     'addEventListener', 'querySelector'];

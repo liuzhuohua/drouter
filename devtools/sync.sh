@@ -43,6 +43,11 @@ PY
 "$PYBIN" _dev/t-env-path.py || { echo "❌ 环境契约预检失败"; exit 1; }
 # 打包产物结构自检：deb 元数据 / 维护脚本 / Dockerfile（挡住「打出来的包不能用」）
 "$PYBIN" _dev/t-packaging.py || { echo "❌ 打包自检失败"; exit 1; }
+# 工作区残留预检：反向验证被 SIGTERM 打断时 finally 不执行，注入会留在源码里。
+# 这不是保险 —— 2026-10-04 就因为它，helper 的 _vpn_env 把 /lib/modules 写成
+# /nonexistent，need_module 整个状态从四态里消失，而这份缺陷**已经发到 v1.0.8**。
+# 放在所有判据之前：基线被污染时，后面每一条红都不可信。
+"$PYBIN" _dev/t-worktree-clean.py || { echo "❌ 工作区有注入残留，先还原再继续"; exit 1; }
 # 防火墙日志「为什么一条都没有」的状态判定：规则未载入 / 开关未开必须分开提示
 "$PYBIN" _dev/t-fwlog-state.py || { echo "❌ 防火墙日志状态预检失败"; exit 1; }
 # 外置存储（USB/Type-C/雷电）：格式化的三重保护是最容易造成不可逆损失的地方
@@ -73,8 +78,15 @@ PY
 "$PYBIN" _dev/t-helpd.py || { echo "❌ 常驻执行守护预检失败"; exit 1; }
 # 统一日志：conntrack -E 是阻塞事件流，曾经让每次查询固定白等 2 秒
 "$PYBIN" _dev/t-ulog-perf.py || { echo "❌ 统一日志性能预检失败"; exit 1; }
-# 响应压缩与 ETag 协商缓存：少了 Vary 会让代理把 gzip 喂给不支持的客户端
+# 响应压缩与 ETag 协商缓存：少了 Vary 会让代理把 gzip 喂给不支持的客户端。
+# 压缩策略本身（长缓存 / brotli 协商 / 逐级降级）由 t-static-perf.py 静态查、
+# t-encoding-runtime.py 真跑一遍验证。
 "$PYBIN" _dev/t-gzip.py || { echo "❌ 响应压缩预检失败"; exit 1; }
+# 静态资源传输层：指纹长缓存、brotli 协商、版本号单一真源、logo 回概述。
+# 这几条都是「不报错但功能悄悄失效」的类型 —— 压缩不生效、版本号停在旧版，
+# 面板照常能开，只有看传输量才发现得了。
+"$PYBIN" _dev/t-static-perf.py || { echo "❌ 静态资源传输层预检失败"; exit 1; }
+"$PYBIN" _dev/t-encoding-runtime.py || { echo "❌ 编码协商行为预检失败"; exit 1; }
 # 模块联动：前端「保存/应用」要处理的模块，后端必须接得住。
 # 曾经 system / pppoe / portfwd 三个页面点了应用直接弹「未知的模块」。
 "$PYBIN" _dev/t-linkage.py || { echo "❌ 模块联动预检失败"; exit 1; }
@@ -157,7 +169,10 @@ PY
 
 echo "=== 打包源码 ==="
 # docs 也要带上：deploy.sh 会装到 /opt/drouter/docs（systemd 的 Documentation 指向它）
-tar czf /tmp/drouter-src.tgz backend web scripts docs 2>/dev/null
+# packaging/VERSION 也必须带上：它是版本号唯一真源，deploy.sh 装到
+# /opt/drouter/VERSION，页面底部的版本号与 openapi 的 version 字段都读它。
+# 漏了它不会报错，只会让真机一直显示兜底硬编码的旧版本号。
+tar czf /tmp/drouter-src.tgz backend web scripts docs packaging/VERSION 2>/dev/null
 ls -la /tmp/drouter-src.tgz
 
 echo "=== 上传 ==="

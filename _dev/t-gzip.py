@@ -30,7 +30,11 @@ TREE = ast.parse(WEB)
 
 chk('定义了压缩下限 GZIP_MIN', 'GZIP_MIN = ' in WEB)
 chk('有 Accept-Encoding 判断', 'def _want_gzip' in WEB)
-chk('压缩结果带内存缓存（不每次重压）', 'def _gzip_cached' in WEB and '_gz_cache' in WEB)
+# ⚠️ 1.0.9 起压缩缓存从 _gz_cache/_br_cache 合并成一张 _comp_cache
+# （键里带编码）。这里跟着改名，别断言一个已经不存在的变量 ——
+# 判据断言错的名字比没有判据更糟：它会一直绿，而功能早就改了。
+chk('压缩结果带内存缓存（不每次重压）',
+    'def _compress_cached' in WEB and '_comp_cache' in WEB)
 chk('缓存按 mtime+size 失效（部署新版后自动重压）',
     "int(st.st_mtime), st.st_size" in WEB)
 chk('压缩后必须发 Content-Encoding', "send_header('Content-Encoding', enc)" in WEB)
@@ -41,8 +45,10 @@ chk('压缩比不划算时不压（原始数据更大就直出）', 'if len(z) >
 chk('静态资源支持 ETag 协商缓存', "send_header('ETag', etag)" in WEB)
 chk('ETag 命中回 304 且不回传响应体',
     "If-None-Match" in WEB and 'send_response(304)' in WEB)
-chk('JSON 接口也走压缩', '_gzip_cached(None, body)' in WEB)
-chk('静态资源也走压缩', '_gzip_cached(full, data)' in WEB)
+# 调用点 1.0.9 起统一走 _encode_body（自动挑 br/gzip），
+# 不再分别调 _gzip_cached —— 否则 br 永远没机会上场。
+chk('JSON 接口走统一编码协商', '_encode_body(self.h.headers, None, body)' in WEB)
+chk('静态资源走统一编码协商', '_encode_body(self.headers, full, data)' in WEB)
 chk('HEAD 请求不回响应体', "if self.command != 'HEAD'" in WEB)
 
 # 小响应不能被压：省下的字节还不如压缩开销
