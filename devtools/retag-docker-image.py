@@ -5,11 +5,11 @@
 
 为什么需要这个脚本
 ------------------
-镜像原本是用 **buildah** 以 root 构建的，标签被钉成 `localhost/drouter:1.0.8`。
+镜像原本是用 **buildah** 以 root 构建的，标签被钉成 `localhost/drouter:<版本>`。
 `localhost/` 是 Podman 的"本地镜像"约定，Docker 虽然能 load 进来，但这个前缀
 既不好看也容易让人误解（像是某个私服地址）。所以这里把标签改成：
-    主标签  drouter:1.0.8          ← docker load 后直接用这个跑
-    别名    liuzhuohua/drouter:1.0.8  ← 同时打一个带用户名的，方便以后推 Docker Hub
+    主标签  drouter:<版本>          ← docker load 后直接用这个跑
+    别名    liuzhuohua/drouter:<版本>  ← 同时打一个带用户名的，方便以后推 Docker Hub
 
 顺带修两个真实缺陷：
 1. 镜像 LABEL 里 `org.opencontainers.image.licenses` 写的是 **GPL-3.0**，
@@ -30,10 +30,23 @@ import os
 import sys
 import tarfile
 
-SRC = sys.argv[1] if len(sys.argv) > 1 else "dist/drouter-1.0.8-docker.tar"
-DST = sys.argv[2] if len(sys.argv) > 2 else "dist/drouter-1.0.8-docker.tar.new"
+# ⚠️ 版本号**必须显式传**，不要再写死默认值。
+# 之前这里硬编码 1.0.8，于是「拿 1.0.9 的镜像跑重标记」会打上 1.0.8 的标签，
+# 用户 docker load 完看到的是 drouter:1.0.8，与 Release 附件里的说明对不上。
+# 现在版本从 packaging/VERSION 读（唯一真源），命令行可覆盖。
+_HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_VF = os.path.join(_HERE, "packaging", "VERSION")
+if not os.path.isfile(_VF):
+    sys.exit(f"缺少 {_VF}（版本号唯一真源）")
+with open(_VF, encoding="utf-8") as f:
+    VER = f.read().strip()
+if not VER:
+    sys.exit(f"{_VF} 为空")
 
-NEW_TAGS = ["drouter:1.0.8", "liuzhuohua/drouter:1.0.8"]
+SRC = sys.argv[1] if len(sys.argv) > 1 else f"dist/drouter-{VER}-docker.tar"
+DST = sys.argv[2] if len(sys.argv) > 2 else f"dist/drouter-{VER}-docker.tar.new"
+
+NEW_TAGS = [f"drouter:{VER}", f"liuzhuohua/drouter:{VER}"]
 
 with tarfile.open(SRC, "r:") as tin:
     members = tin.getmembers()

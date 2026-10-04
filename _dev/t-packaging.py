@@ -238,6 +238,69 @@ ck('deploy.sh 的 for 清单不是脱离 backend/ 的另一份',
    '→ build-deb 有而 deploy.sh 无：%s'
    % sorted(set(BACKEND_MODULES) - dp_named))
 
+print('\n五、Release 附件的版本号一致性')
+
+# 背景：docker-compose.yml 和 DOCKER-GUIDE.md 是**直接挂到 GitHub Release 上**的
+# 附件，用户照着抄命令。早先这两个文件里硬编码了具体版本号，于是每次发版都要
+# 人工 sed 一遍 —— v1.0.9 发版前就发现附件里还写着 drouter:1.0.8，而镜像 tar
+# 加载后的标签是 drouter:1.0.9，`docker compose up` 会直接报「找不到镜像」。
+#
+# 现在它们是 __VERSION__ 模板，由 build-docker.sh 渲染。判据要卡住两件事：
+#   1) 模板里不许再出现任何具体版本号（否则占位符替换会漏掉那一处）
+#   2) 模板里必须有占位符，且构建脚本真的会渲染它
+# 只抓「看起来像 drouter 自身版本」的写法，不能一刀切拦所有 x.y。
+# 反例（这些是**故意**固定的，拦了就是误报）：
+#   「1.0.1 起 Web 终端绕开 init」  —— 历史沿革说明，与当前版本无关
+#   「GPL-3.0 → MIT」              —— 许可证名，不是版本
+# 所以判据要求版本号**紧挨着 drouter 标识或产物文件名**才算硬编码。
+VER_RE = re.compile(r'(?<![\w.])(?:drouter[:\-_]|drouter-)?'
+                    r'(\d+\.\d+(?:\.\d+)?)(?![\w.])')
+# 出现在「起」「新增」「改成」等叙述语境里的是历史沿革，放行
+HISTORY_HINT = re.compile(r'(起|新增|开始|之前|以前|历史|沿革)')
+
+
+def hardcoded_versions(body):
+    """挑出真正碍事的版本号：形如 drouter:1.0.8 / drouter-1.0.8.tar 的。"""
+    bad = set()
+    for line in body.splitlines():
+        if HISTORY_HINT.search(line):
+            continue
+        for m in re.finditer(r'drouter[:\-_]v?(\d+\.\d+(?:\.\d+)?)', line):
+            bad.add(m.group(1))
+    return sorted(bad)
+
+
+ATTACH_TPL = ['packaging/docker/docker-compose.yml',
+              'packaging/docker/DOCKER-GUIDE.md']
+
+cur_ver = read('packaging/VERSION').strip()
+ck('packaging/VERSION 形如 x.y.z', bool(re.match(r'^\d+\.\d+\.\d+$', cur_ver)),
+   '→ 实际 %r' % cur_ver)
+
+for rel in ATTACH_TPL:
+    body = read(rel)
+    # 模板里不许再出现任何具体版本号（否则占位符替换会漏掉那一处）
+    hard = hardcoded_versions(body)
+    ck('%s 里没有硬编码版本号' % os.path.basename(rel), not hard,
+       '→ 出现 %s，应改成 __VERSION__' % hard if hard else '')
+    ck('%s 用了 __VERSION__ 占位符' % os.path.basename(rel),
+       '__VERSION__' in body)
+    ck('%s 无 CRLF' % os.path.basename(rel), no_crlf(rel))
+
+bd = read('packaging/build-docker.sh')
+ck('build-docker.sh 会渲染这两个附件', 'docker-compose.yml' in bd
+   and 'DOCKER-GUIDE.md' in bd and '__VERSION__' in bd)
+ck('build-docker.sh 渲染后校验占位符已清空',
+   "grep -q '__VERSION__'" in bd)
+
+# retag 脚本同理：它打的标签就是用户 docker load 后看到的名字。
+rt = read('devtools/retag-docker-image.py')
+ck('retag 脚本从 packaging/VERSION 读版本',
+   'packaging' in rt and 'VERSION' in rt)
+rt_code = '\n'.join(l for l in rt.splitlines() if not l.strip().startswith('#'))
+ck('retag 脚本代码里没有硬编码版本号', not hardcoded_versions(rt_code),
+   '→ 出现 %s' % hardcoded_versions(rt_code))
+
 print('\n结果：失败 %d 项' % len(fails))
 for f in fails:
     print('  ✘ ' + f)
