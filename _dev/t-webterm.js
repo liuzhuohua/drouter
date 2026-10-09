@@ -49,6 +49,12 @@ const document = {
 };
 const sandbox = {
   document, console,
+  // ⚠️ app.js 顶层就有 t('…') 调用（NAV 常量在模块加载时求值），
+  //    缺这个桩会在 `g: t('概览')` 那行直接 ReferenceError。
+  //    2026-10-05 部署时被它拦过。恒等桩即可：本判据不验文案内容。
+  t: (k) => k,
+  i18n: { t: (k) => k, setLang() {}, getLang: () => 'zh-CN', toggle() {},
+          onChange() {}, register() {}, applyDom() {}, rerenderAll() {} },
   fetch: async () => ({ status: 200, ok: true, json: async () => ({ ok: true, data: {} }) }),
   localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
   setTimeout, clearTimeout, setInterval: () => 0, clearInterval() {},

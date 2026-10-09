@@ -175,6 +175,19 @@ def main():
     chk('_dpi_installed 不再循环 fork bash -lc',
         "bash', '-lc'" not in seg_dpi)
 
+    # ---- ⑧ 高频接口里的「阻塞 sleep / 逐包 fork」（2026-10-09 真机实测）----
+    # 真机实测 read:docker 960ms、read:sysinfo 252ms，两者都在「每次切页面」
+    # 的路径上，且都是纯浪费：878ms 是逐个 fork apt-cache（每次都要加载
+    # 整个包索引），250ms 是 _read_cpu_usage() 里硬 sleep 的采样间隔。
+    seg_si2 = strip_comment_lines(hseg('read_sysinfo'))
+    chk('read_sysinfo 走 _cpu_pct_cached（不直接 _read_cpu_usage）',
+        '_read_cpu_usage(' not in seg_si2 and '_cpu_pct_cached(' in seg_si2)
+    seg_pa = strip_comment_lines(hseg('_pkgs_available'))
+    chk('_pkgs_available 一次 apt-cache 查全部（不逐个 fork）',
+        "'--no-all-versions'] + names" in seg_pa)
+    chk('_pkgs_available 用 apt 索引指纹缓存（不是盲 TTL）',
+        '_apt_lists_stamp()' in seg_pa and '_PKG_AVAIL_CACHE' in seg_pa)
+
     print('\n' + '=' * 58)
     print('通过 %d / 失败 %d' % (PASS, FAIL))
     return 1 if FAIL else 0

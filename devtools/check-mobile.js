@@ -93,6 +93,14 @@ function mk(tag, cls) {
 
 const documentStub = { createElement: t => mk(t) };
 const sandbox = { document: documentStub, console };
+// 1.0.10 起 app.js 的文案走 i18n 的 t()。本检查器**不加载** i18n.js
+// （它要 DOM + localStorage），给一个恒等兜底，保证渲染流程能跑完。
+// ⛔ 刻意不加载真 i18n.js —— 那会让本检查器依赖字典，掩盖真正的渲染问题。
+sandbox.t = k => k;
+sandbox.i18n = {
+  t: k => k, setLang() {}, getLang: () => 'zh-CN', toggle() {},
+  onChange() {}, applyDom() {}, dict: {}, register() {}, rerenderAll() {},
+};
 vm.createContext(sandbox);
 
 // 只抽取 wrapTables 函数体，避免牵扯整个 app.js

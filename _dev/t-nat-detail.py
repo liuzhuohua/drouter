@@ -12,8 +12,10 @@
   3) esc() 收到对象时不再吐 "[object Object]"（最后一道兜底）。
 """
 import ast
+import glob
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -21,8 +23,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(HERE, '..')
 SRC = os.path.join(ROOT, 'backend', 'drouter-helper.py')
 JS = os.path.join(ROOT, 'web', 'app.js')
-NODE = r'C:/Users/lyrz-pve-win10/.workbuddy/binaries/node/versions/22.22.2-3/node.exe'
-
+# ⚠️ 不要硬编码 node 的版本目录 —— WorkBuddy 升级后路径会变，
+#    2026-10-06 实测：写死 22.22.2-3 时实际是 22.22.2-6，
+#    全量回归里 t-nat-detail 直接 FileNotFoundError。
+NODE = None
+for _c in sorted(glob.glob(os.path.join(
+        os.path.expanduser('~'), '.workbuddy', 'binaries', 'node',
+        'versions', '*', 'node.exe')), reverse=True):
+    if os.path.isfile(_c):
+        NODE = _c
+        break
+if NODE is None:                    # 退回 PATH
+    NODE = shutil.which('node') or 'node'
 code = open(SRC, encoding='utf-8').read()
 js = open(JS, encoding='utf-8').read()
 

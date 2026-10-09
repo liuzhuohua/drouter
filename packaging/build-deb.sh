@@ -97,15 +97,21 @@ echo "== 4/6 校验 =="
 for f in render.py drouter-helper.py drouter-web.py drouter-logd.py \
          drouter-snapshotd.py drouter-rescue.py drouter-shelld.py \
          drouter-helpd.py drouter-backupd.py drouter-alertd.py \
-         drouter-quotad.py drouter-ddnsd.py theme.py; do
+         drouter-quotad.py drouter-ddnsd.py drouter-update.py \
+         theme.py; do
   [ -f "$STAGE/opt/drouter/backend/$f" ] || { echo "✘ 缺少 $f"; exit 1; }
-  python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' \
+  # ⚠️ 必须用 compile() 不是 ast.parse()：后者只做语法分析，抓不到
+  # 「重复关键字参数」这类语义错误（1.0.10 实测：ast.parse 通过，
+  # import 时 SyntaxError）。构建期就崩在这里，别等到真机才发现。
+  python3 -c 'import sys; compile(open(sys.argv[1],encoding="utf-8").read(),sys.argv[1],"exec")' \
     "$STAGE/opt/drouter/backend/$f"
 done
-[ -f "$STAGE/opt/drouter/web/app.js" ] || { echo "✘ 缺少 app.js"; exit 1; }
+for wf in app.js app.css index.html update.js update.css upstream.js netdetail.js realtime.js i18n.js; do
+  [ -f "$STAGE/opt/drouter/web/$wf" ] || { echo "✘ 缺少 $wf"; exit 1; }
+done
 # 这里的数字必须等于上面for 里的条目数。写错了不会让构建失败，
 # 但会让人以为清单是全的（历史上「7 个」和实际 12 个长期不符）。
-echo "  后端模块 13 个、语法全部通过"
+echo "  后端模块 14 个、语法全部通过"
 
 # systemd 单元齐全性：少一个就是「某项功能装完不工作」
 for u in drouter-web.service drouter-helpd.service drouter-shelld.service \

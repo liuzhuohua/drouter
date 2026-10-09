@@ -73,9 +73,14 @@ def main():
             passed.append(n)
         else:
             say('失败 rc=%s' % rc)
+            # 把红的那几行打出来 —— 只写 rc 的话，排查时只能一个个单独跑
+            # （2026-10-06：t-msg-en 在全量里红、单独跑绿，顺序依赖查不出来，
+            #  就是因为日志里只有「失败 rc=1」，看不到是哪条判据。）
+            # 各检查器的红标记不统一：有的用 [NG]、有的用 [FAIL]、有的打 ✘。
             for line in out.splitlines():
-                if re.search(r'\[NG\]|Traceback|Error|✘', line):
-                    say('      ' + line)
+                if re.search(r'\[NG\]|\[FAIL\]|Traceback|Error|✘|异常',
+                             line):
+                    say('      ' + line[:150])
             failed.append(n)
 
     log.close()

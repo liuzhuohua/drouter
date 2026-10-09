@@ -173,6 +173,57 @@ for sub in ('backend', 'packaging', 'scripts', 'devtools', 'web'):
         except Exception:
             pass
 chk('源码里没有 CRLF（Windows 编辑器整篇改行尾的常见后果）', not crlf, '')
+
+print()
+print('=== 5. 「注释与代码矛盾」检测（2026-10-10 新增）===')
+# 背景：反向验证被 SIGTERM 打断时，注入器可能已经把某处源码**换成了另一种写法**，
+# 而原来的解释性**注释还留在原地**。于是形成：
+#     # 正确写法：`(x.get('data') or {})`
+#     out['holds'] = helper(...).get('data', {}).get('holds', [])   ← 有 bug
+# 前 4 项都抓不到这种形态：
+#   ① 哨兵扫描 —— 注入文本里没有哨兵字样
+#   ② 语法检查 —— 语法完全正确
+#   ③ 注释掉的整行 —— 这次是「替换」不是「注释掉」
+#   ④ 换行符 —— 无关
+# 1.0.10 真的中过：holds 那行被改回 `.get('data', {})`，而我写的
+# P1-8 判据因为「and 第二个条件碰巧成立」而掩盖了问题。
+# → 通用做法：凡是「注释里出现了正确写法」的，都验证代码里确实是它。
+# ⚠️ 查代码时**必须连着上下文**（`res`/`x` 前缀 + 变量名一起），
+#    不能只查 `.get('data') or {})` 这个片段 ——
+#    文件里 VPN 相关代码有 4 处**合法**的 `(res.get('data') or {})`，
+#    只查片段会匹配到它们，于是「holds 处坏了」也照样报 OK。
+#    第一版就是这么写的，注入坏了验证两次都没抓到。
+CONTRADICTIONS = [
+    ('backend/drouter-web.py',
+     r"正确写法：\s*`?\(x\.get\('data'\) or \{\}\)`?",
+     r"helper\('pkg', \{'op': 'holds'\}\)\.get\('data'\)"
+     r"\s*\n?\s*or \{\}\)",
+     'holds 读取：注释说用 (x.get("data") or {})，代码必须也是'),
+    ('backend/drouter-helper.py',
+     r'必须放在\s*`?finally',
+     r'finally:[\s\S]{0,200}?os\.remove\(tmp\)',
+     '_verify 的临时文件清理必须在 finally'),
+]
+contra = []
+for rel, want_cmt, want_code, desc in CONTRADICTIONS:
+    p = os.path.join(ROOT, rel)
+    if not os.path.isfile(p):
+        continue
+    try:
+        with open(p, encoding='utf-8') as f:
+            src = f.read()
+    except Exception:
+        continue
+    if not re.search(want_cmt, src):
+        continue
+    # ⚠️ **必须先剥注释再查代码**：注释里那句「正确写法：`(x.get('data') or {})`」
+    #    本身就匹配代码正则 —— 不剥的话检查永远认为「代码里有」，
+    #    注入坏了也照样报 OK（第一版就栽在这，白验证一轮）。
+    code_only = re.sub(r'#.*$', '', src, flags=re.M)
+    if not re.search(want_code, code_only):
+        contra.append('%s：%s' % (rel, desc))
+chk('注释里声明的正确写法确实在代码里', not contra,
+    '→ 注释与代码矛盾（很可能是反向验证的残留）：%s' % contra)
 for c in crlf:
     print('       %s' % c)
 if crlf:

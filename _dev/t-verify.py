@@ -117,7 +117,17 @@ def main():
     ck("定义了 _missing_dev_nodes()", 'def _missing_dev_nodes(' in src)
     ck("_verify 里引用了它", '_missing_dev_nodes()' in src)
 
-    ns = extract_funcs(src, ['_missing_dev_nodes', '_verify'])
+    # ⚠️ 清单必须**跟着实现一起更新**（1.0.10 修）：1.0.10 把校验体从 _verify
+    # 拆进了 _verify_one（为了让 finally 能覆盖所有 return 路径），并新增
+    # _thread_id（临时文件名唯一化）。这里没同步 → 抽出来的 ns 里缺这两个，
+    # 一跑就是 NameError，看起来像实现坏了，其实是预检没跟上。
+    # 教训：拆函数/加辅助函数时，**所有按名字抽函数的预检都要一起改**。
+    ns = extract_funcs(src, ['_missing_dev_nodes', '_verify',
+                             '_verify_one', '_thread_id'])
+    ck("抽取名单含 _verify_one（拆函数后必须同步）",
+       '_verify_one' in ns, "预检抽不到它 → NameError")
+    ck("抽取名单含 _thread_id（临时名唯一化后必须同步）",
+       '_thread_id' in ns, "预检抽不到它 → NameError")
 
     print()
     print("二、_missing_dev_nodes：节点齐全时不该误报")

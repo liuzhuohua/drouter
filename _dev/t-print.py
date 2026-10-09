@@ -796,18 +796,36 @@ State Stopped
     chk('保存走 /api/print', "'/api/print'" in APP_SRC)
     chk('保存不再传多余的 timeout 参数（api() 只收两个参数）',
         re.search(r"api\('/api/print'.*\}\ \}\)", APP_SRC) is not None)
+    # ⚠️ 1.0.10 做了 i18n，下面几条原本查的是**硬编码中文原文**。
+    #    文案抽进字典后原文就不在 app.js 里了 → 判据全假红。
+    #    ✅ 改成两段验证：① app.js 用了对应的 t(key) ② 字典里确实有这个词条。
+    #       （只在 app.js 查 key 会漏「key 存在但没接线」；
+    #         只在字典查会漏「词条写了但没用到」—— 两者都要。）
+    # APP 指向 web/app.js，i18n.js 与它同目录
+    _I18N_SRC = io.open(os.path.join(os.path.dirname(APP), 'i18n.js'),
+                        encoding='utf-8').read()
     chk('三选一 radio（off/cups/raw）',
         'name="pt-mode"' in APP_SRC
-        and re.search(r"\{ k: 'off', n: '关闭打印服务'", APP_SRC) is not None
+        and re.search(r"\{ k: 'off',", APP_SRC) is not None
         and re.search(r"\{ k: 'cups',", APP_SRC) is not None
-        and re.search(r"\{ k: 'raw',", APP_SRC) is not None)
+        and re.search(r"\{ k: 'raw',", APP_SRC) is not None
+        and re.search(r"modeOff:\s*\{ zh: '关闭打印服务'", _I18N_SRC)
+        is not None,
+        '（模式项的文案已进字典，查的是 t() key + 词条存在）')
     chk('没检测到 USB 打印机时如实提示（这台虚拟机就是这种情况）',
-        '没有检测到 USB 打印机' in APP_SRC)
-    chk('页面讲清了两种模式抢设备的原理', '抢同一个设备' in APP_SRC)
+        re.search(r"[tT]\('print\.noUsb\w*", APP_SRC) is not None
+        and re.search(r"noUsb\w*:\s*\{ zh: '没有检测到 USB 打印机", _I18N_SRC)
+        is not None)
+    chk('页面讲清了两种模式抢设备的原理',
+        re.search(r"[tT]\('print\.diffBoth\w*", APP_SRC) is not None
+        and '抢同一个设备' in _I18N_SRC)
     chk('有 RAW 设备输入框', 'pt-raw-dev' in APP_SRC)
     chk('有共享开关', 'pt-share' in APP_SRC)
     chk('未安装时给出安装提示', 'need_install' in APP_SRC)
-    chk('只听 127.0.0.1 时给出警告', '只监听 127.0.0.1' in APP_SRC)
+    chk('只听 127.0.0.1 时给出警告',
+        re.search(r"[tT]\('print\.localhost\w*", APP_SRC) is not None
+        and re.search(r"localhost\w*:\s*\{ zh: '只监听 127\.0\.0\.1",
+                      _I18N_SRC) is not None)
 
     print('\n--- 安全红线：不许碰的东西 ---')
     chk('打印模块没有动 5900（VNC）', '5900' not in HELPER_SRC[

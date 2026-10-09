@@ -124,8 +124,16 @@ chk('_verify 用的是 VERIFY_DIR 而不是 root 私有目录',
     'checkdir = VERIFY_DIR' in HELPER)
 # chronyd 被 AppArmor 圈死，只能读 /etc/chrony/** 与 /etc/chrony.*
 chk('chrony 的预检文件落在 AppArmor 允许的路径上',
-    "'chrony': '/etc/chrony.drouter-verify.conf'" in HELPER)
-chk('_verify 会按模块选用预检路径', 'tmp = VERIFY_PATH.get(module)' in HELPER)
+    "'chrony': '/etc/chrony.drouter-verify" in HELPER)
+# ⚠️ 判据原来查 `tmp = VERIFY_PATH.get(module)` 这一行**字面量**。
+#    1.0.10 给临时文件名加线程 id 唯一化后，那行变成了
+#    `_vt = VERIFY_PATH.get(module)` + `if _vt:` 两步，判据就假红了。
+#    改��按**语义**查：确实读了 VERIFY_PATH 且确实据此分支。
+chk('_verify 会按模块选用预检路径',
+    'VERIFY_PATH.get(module)' in HELPER
+    and re.search(r'_vt\s*=\s*VERIFY_PATH\.get\(module\)\s*\n\s*if _vt:',
+                  HELPER) is not None,
+    '（要给两个分支都用上唯一化文件名，判定得跟实现一起改）')
 
 # ------------------------------------------------------- 4. 功能模块动作注册
 h_tree = ast.parse(HELPER)

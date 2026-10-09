@@ -1,0 +1,61 @@
+
+/* ===================== 版本检测 / 一键更新（#new） =====================
+   概览页「版本与更新」卡片 + 更新弹窗。
+   变量全部用 app.css 已有的（--panel/--line/--txt*/--pri/--ok/--warn/--err），
+   不要再引入新变量 —— 主题之家生成的是 app.css 的覆盖版，
+   用不存在的变量会静默变成透明/继承色。 */
+
+.upd-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+           margin-top:9px; }
+.upd-err { color:var(--txt3); font-size:12px; margin-top:8px; line-height:1.7; }
+
+/* ---- 更新弹窗 ---- */
+.upd-mask { position:fixed; inset:0; background:rgba(15,23,42,.45);
+            display:flex; align-items:center; justify-content:center;
+            z-index:1200; padding:20px; }
+.upd-box { background:#fff; border-radius:14px; width:100%; max-width:680px;
+           max-height:88vh; display:flex; flex-direction:column;
+           box-shadow:0 20px 60px rgba(15,23,42,.28); }
+.upd-box h3 { margin:0; padding:18px 22px 12px; font-size:16px;
+              border-bottom:1px solid var(--line); }
+.upd-body { padding:16px 22px; overflow-y:auto; flex:1 1 auto; }
+.upd-lead { font-size:14px; line-height:1.8; margin-bottom:14px; }
+.upd-sec { margin-bottom:16px; }
+.upd-sec h4 { margin:0 0 7px; font-size:13.5px; color:var(--txt2);
+              font-weight:600; }
+.upd-sec ul { margin:0; padding-left:19px; color:var(--txt2);
+              font-size:12.5px; line-height:1.9; }
+.upd-sec li { margin-bottom:4px; }
+.upd-sec b { color:var(--txt); }
+
+.upd-asset { display:flex; gap:9px; align-items:flex-start; padding:9px 11px;
+             border:1px solid var(--line); border-radius:8px; margin-bottom:7px;
+             cursor:pointer; }
+.upd-asset:hover { border-color:var(--pri); background:var(--pri-l); }
+.upd-asset b { display:block; font-size:13px; font-weight:600; }
+.upd-asset code { display:block; font-size:11.5px; color:var(--txt3);
+                  margin-top:3px; word-break:break-all; }
+
+.upd-bar-wrap { margin-top:6px; padding-top:14px;
+                border-top:1px solid var(--line); }
+.upd-bar { height:8px; background:var(--line); border-radius:99px;
+           overflow:hidden; }
+.upd-bar > i { display:block; height:100%; width:0; border-radius:99px;
+               background:linear-gradient(90deg,#3b82f6,#10b981);
+               transition:width .25s; }
+.upd-bar.warn > i { background:linear-gradient(90deg,#f59e0b,#ef4444); }
+.upd-msg { font-size:12.5px; color:var(--txt2); line-height:1.8;
+           margin-top:9px; min-height:20px; }
+.upd-meta { font-size:11.5px; color:var(--txt3); line-height:1.8;
+            margin-top:6px; word-break:break-all; }
+.upd-meta code { background:rgba(0,0,0,.05); padding:1px 5px; border-radius:4px; }
+
+@media (max-width:640px) {
+  .upd-box { max-height:92vh; }
+  .upd-body { padding:14px 16px; }
+}
+
+/* ---- 版本检测的「上次检查」时间戳（1.0.10）----
+   ⚠️ 补这条是因为「已是最新」时点「重新检查」没有任何提示，
+      用户无法确定自己点的操作生效了没有。时间戳让每次检查都有痕迹。 */
+.upd-when { color:var(--txt3); font-size:12px; line-height:1.7; }

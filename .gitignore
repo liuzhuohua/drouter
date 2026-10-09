@@ -66,3 +66,86 @@ id_rsa*
 
 # jsstrip 自检的中间产物（剥完的 app.js，只给 node 侧交叉验证用）
 _dev/.jsstrip-*.out
+
+# ── i18n / 排版 排查时的一次性脚本与真机抓取样本（2026-10-09/10）──
+# 根目录下划线的都是排查中间态，不是产品代码，也不是可复用的检查器。
+/_*.py
+/_*.js
+/_*.json
+/_*.raw
+/_*.txt
+/_page_notes.json
+/_extract_i18n.json
+
+# _dev/ 里「. 开头」的运行残留（探针、审计产物、JSON 快照）
+_dev/.*
+# 一次性修复脚本（fix-* / wire-* / wrap-* / i18n-en* / merge-en* / gen-opt-* 等）
+_dev/_fix-*.py
+_dev/_fu*.py
+_dev/_mk-*.py
+_dev/_dbg*.py
+_dev/_dbg*.js
+_dev/_chk_*.py
+_dev/_scan*.py
+_dev/_rev*.py
+_dev/_syntaxfix.py
+_dev/_integrity.py
+_dev/_patch*.py
+_dev/_expose*.py
+_dev/_unify*.py
+_dev/_restore*.py
+_dev/_opt-*.py
+_dev/_opt-*.js
+_dev/_opt-*.json
+_dev/_opt-*.txt
+_dev/_addmulti.py
+_dev/_backend-tables.json
+_dev/_bt-check.js
+_dev/_tables.txt
+_dev/_tk*.json
+_dev/_tmp_cover.py
+_dev/_wire-*.py
+_dev/_restorebt2.py
+_dev/fix-*.py
+_dev/apply-*.py
+_dev/merge-en*.py
+_dev/i18n-en*.py
+_dev/gen-opt-*.py
+_dev/i18n-scan.py
+_dev/i18n-progress.py
+_dev/i18n-where.py
+_dev/i18n-todo.txt
+_dev/missing-keys.py
+_dev/msg-en*.py
+_dev/scan-*.py
+_dev/scan-*.js
+_dev/wrap-*.py
+_dev/wire-bt2.py
+_dev/upd-inject.py
+_dev/i18nbatch/
+# 截图与审计运行产物
+_dev/shots-*/
+_dev/sync-deploy-*.txt
+_dev/verify-deploy-*.txt
+_dev/*.png
+_dev/.layout/
+# 真机审计的 JSON 产物（跑一次生成一批）
+_dev/.live-aud-*.json
+_dev/.live-*.txt
+_dev/.ocr-*.tsv
+_dev/.ocr-*.log
+_dev/.static-out*.txt
+_dev/.sync-out.txt
+_dev/.try-*.json
+_dev/.text-wide-*.txt
+# 反向验证备份
+_dev/*.rvbak
+_dev/*.bak
+# 一次性修复脚本（_fixseg 等无语义文件名）
+_dev/_fixseg.py
+_dev/_fix_check_views.py
+_dev/_fix_docker_note.py
+_dev/tpl-todo.txt
+_dev/probe-*.sh
+_dev/probe-*.js
+_dev/probe2.sh

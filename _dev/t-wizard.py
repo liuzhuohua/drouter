@@ -26,6 +26,15 @@ CSS = os.path.join(ROOT, 'web', 'app.css')
 PASS = FAIL = 0
 
 
+def _strip_t_wrapper(src):
+    """把 ${t('x')} / t('x') / ${T('x')} 还原成 x。"""
+    out = re.sub(r"\$\{[tT]\('((?:[^'\\\\]|\\\\.)*)'\)\}",
+                  lambda m: m.group(1), src)
+    out = re.sub(r"(?<![A-Za-z0-9_$.])[tT]\('((?:[^'\\\\]|\\\\.)*)'\)",
+                  lambda m: m.group(1), out)
+    return out
+
+
 def chk(name, cond, extra=''):
     global PASS, FAIL
     if cond:
@@ -39,6 +48,11 @@ def chk(name, cond, extra=''):
 HELPER_SRC = io.open(HELPER, encoding='utf-8').read()
 WEB_SRC = io.open(WEB, encoding='utf-8').read()
 APP_SRC = io.open(APP, encoding='utf-8').read()
+# 2026-10-07：中文已被包进 t('…')，裸中文匹配全部失效。
+# 构造一份「剥掉 t()/T() 包装」的源码副本，判据查它 ——
+# 这样「代码里有没有这段中文」与它是否被包 t() 无关。
+APP_SRC_PLAIN = _strip_t_wrapper(APP_SRC)
+
 CSS_SRC = io.open(CSS, encoding='utf-8').read()
 TREE = ast.parse(HELPER_SRC)
 
@@ -292,7 +306,7 @@ def main():
     chk('菜单标题解释了它是干什么的',
         re.search(r"k: 'wizard'.{0,200}第一次用这台机器", APP_SRC, re.S) is not None)
     chk('VIEWS 注册了 wizard', re.search(r"^\s*wizard:\s*viewWizard,", APP_SRC, re.M) is not None)
-    chk('定义了 viewWizard', 'async function viewWizard(' in APP_SRC)
+    chk('定义了 viewWizard', 'async function viewWizard(' in APP_SRC_PLAIN)
     chk('视图函数放在 VIEWS 之前使用（函数声明提升）',
         APP_SRC.index('const VIEWS') < APP_SRC.index('async function viewWizard('),
         'VIEWS 在模块顶层求值，viewWizard 必须是函数声明而不是 const 箭头函数')
@@ -302,17 +316,17 @@ def main():
         chk('定义了 %s' % fn, ('function %s(' % fn) in APP_SRC)
 
     print('\n=== 十七、前端范例提示（用户点名要求的）===')
-    chk('PPPoE 账号给了范例', '范例：0512' in APP_SRC)
-    chk('说明了「不是 Wi-Fi 密码」', '不是 Wi-Fi 密码' in APP_SRC)
-    chk('DHCP 说明给了接线范例', '光猫的 LAN 口' in APP_SRC)
-    chk('静态地址给了 /24 的解释', '表示掩码是 255.255.255.0' in APP_SRC)
-    chk('地址池给了「照着抄」的段落', '照着抄就行' in APP_SRC)
-    chk('地址池范例由后端下发（不写死）', 'base + \'.100\'' in APP_SRC)
-    chk('DNS 说明推荐了具体一家', '不知道选哪个就用它' in APP_SRC)
-    chk('解释了填两个 DNS 的作用', '一个不通时自动换另一个' in APP_SRC)
-    chk('IPv6 前缀给了范例', '2408:8207:1234:5678::/64' in APP_SRC)
-    chk('IPv6 说明点了 /64 的硬要求', '内网通告只能用 /64' in APP_SRC)
-    chk('IPv6 明确写了不开也不影响', '不开也不影响上网' in APP_SRC)
+    chk('PPPoE 账号给了范例', '范例：0512' in APP_SRC_PLAIN)
+    chk('说明了「不是 Wi-Fi 密码」', '不是 Wi-Fi 密码' in APP_SRC_PLAIN)
+    chk('DHCP 说明给了接线范例', '光猫的 LAN 口' in APP_SRC_PLAIN)
+    chk('静态地址给了 /24 的解释', '表示掩码是 255.255.255.0' in APP_SRC_PLAIN)
+    chk('地址池给了「照着抄」的段落', '照着抄就行' in APP_SRC_PLAIN)
+    chk('地址池范例由后端下发（不写死）', 'base + \'.100\'' in APP_SRC_PLAIN)
+    chk('DNS 说明推荐了具体一家', '不知道选哪个就用它' in APP_SRC_PLAIN)
+    chk('解释了填两个 DNS 的作用', '一个不通时自动换另一个' in APP_SRC_PLAIN)
+    chk('IPv6 前缀给了范例', '2408:8207:1234:5678::/64' in APP_SRC_PLAIN)
+    chk('IPv6 说明点了 /64 的硬要求', '内网通告只能用 /64' in APP_SRC_PLAIN)
+    chk('IPv6 明确写了不开也不影响', '不开也不影响上网' in APP_SRC_PLAIN)
 
     print('\n=== 十八、前端不重复后端的一份数据 ===')
     # 只看向导这一段，别把 WAN 页 / DNS 页里本来就有的 223.5.5.5 算进来。
@@ -321,15 +335,58 @@ def main():
     hard_default = re.search(r"=\s*'223\.5\.5\.5", wiz_body) is not None
     chk('向导默认 DNS 不由前端写死', not hard_default,
         '默认值应来自 n.default_custom（后端 WIZ_DNS_DEFAULT）')
-    chk('步骤名用后端下发的 s.n', 'esc(s.n)' in APP_SRC)
-    chk('上网方式说明用后端下发的 m.d', 'esc(m.d' in APP_SRC)
+    # 2026-10-05：步骤名改走 bt4('WIZ_STEPS', …) 查英文（后端零改动），
+    # 原来查 `esc(s.n)` 字面量形态，判据没跟上。
+    # ⛔ 2026-10-07：这两条原来断言 bt4(..., 'name', ...) / (..., 'desc', ...)，
+    #    但 i18n.js 的 WIZ_* 表字段是 'n' / 'd' —— 断言本身在认可错字段名。
+    #    bt4 查不到字段就回落后端中文，英文界面整段显示中文且**不报错**。
+    #    正解：断言「bt4 用的字段名必须真实存在于 i18n 的该表里」。
+    I18N = io.open(os.path.join(ROOT, 'web', 'i18n.js'), encoding='utf-8').read()
+
+    def _bt_field_ok(table, field):
+        m = re.search(r"'%s':\s*\{" % re.escape(table), I18N)
+        if not m:
+            return False
+        i = m.end() - 1
+        d = 0
+        for j in range(i, len(I18N)):
+            if I18N[j] == '{':
+                d += 1
+            elif I18N[j] == '}':
+                d -= 1
+                if d == 0:
+                    break
+        blk = I18N[i:j + 1]
+        return bool(re.search(r"'%s'\s*:" % re.escape(field), blk))
+
+    for _tb, _fld, _lbl in [('WIZ_STEPS', 'n', '步骤名'),
+                            ('WIZ_WAN_MODES', 'n', '上网方式名'),
+                            ('WIZ_WAN_MODES', 'd', '上网方式说明'),
+                            ('WIZ_DNS_PRESETS', 'n', 'DNS 服务商名'),
+                            ('WIZ_DNS_PRESETS', 'd', 'DNS 服务商说明')]:
+        chk('%s走 bt4 且字段名与 i18n 表一致（%s.%s）' % (_lbl, _tb, _fld),
+            ("bt4('%s'" % _tb) in APP_SRC and _bt_field_ok(_tb, _fld))
+
+    # 反向：bt4 的第三个参数不得再出现 'name'/'desc'（那会静默回落中文）
+    _bad_fld = []
+    for _m in re.finditer(r"bt4\('(\w+)',[^,]+,'(\w+)'", APP_SRC):
+        if _m.group(2) in ('name', 'desc') and _bt_field_ok(_m.group(1), 'n'):
+            _bad_fld.append(_m.group(0))
+    chk('bt4 不再用错字段名 name/desc（会静默回落中文）', not _bad_fld,
+        '；'.join(_bad_fld[:3]))
     chk('DNS 服务商卡片渲染后端 presets', 'presets.map(p =>' in wiz_body)
 
     print('\n=== 十九、断网风险：拨号按钮要二次确认 ===')
     dial_ui = APP_SRC[APP_SRC.index('function wizBindDial('):]
     dial_ui = dial_ui[:dial_ui.index('function wizOut(')]
     chk('拨号前弹确认框', 'modal(' in dial_ui)
-    chk('确认要输入指定文字', "!== '拨号'" in dial_ui)
+    # 2026-10-05：拨号确认框的「拨号」二字被包成 t('拨号')（i18n 补全），
+    # 原来查 `!== '拨号'` 的字面量形态失效。判据要跟代码形态一起走。
+    chk('确认要输入指定文字',
+        # ⚠️ 2026-10-07：翻译调用统一成 T('…')，判据两种形态都要认。
+        ("!== '拨号'" in dial_ui)
+        or re.search(r"!==\s*[tT]\('拨号'\)", dial_ui) is not None,
+        "两种形态都没找到：拨号确认框的必输文字")
     chk('明确告知会中断网络', '网络短暂中断' in dial_ui)
     chk('明确说保存不必点它', '不用点这个按钮' in dial_ui)
     chk('拨号带 confirm 字段', re.search(r"confirm:\s*true", dial_ui) is not None)
@@ -349,7 +406,9 @@ def main():
     chk('步骤条样式存在', '.wiz-steps{' in CSS_SRC)
     chk('步骤条窄屏改网格', '.wiz-steps{display:grid' in CSS_SRC)
     chk('DNS 卡片样式存在', '.wiz-dns{' in CSS_SRC)
-    chk('DNS 网格窄屏单列', '.wiz-dns-grid{grid-template-columns:1fr}' in CSS_SRC)
+    # 轨道用 minmax(0,1fr) 而非裸 1fr：1fr 的隐含 min-width:auto 会被
+    # 长英文标签（Local machine LAN Address）撑破，窄屏整页横向滚动。
+    chk('DNS 网格窄屏单列', '.wiz-dns-grid{grid-template-columns:minmax(0,1fr)}' in CSS_SRC)
     chk('步骤条可点（做了按钮不是指示器）', 'cursor:pointer' in CSS_SRC)
 
     print('\n========================================')

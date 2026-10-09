@@ -26,6 +26,10 @@ button.primary{background:var(--grad);border-color:transparent;color:#fff;font-w
 button.primary:hover{filter:brightness(1.06)}
 button.ghost{background:#fff}
 button.small{padding:5px 11px;font-size:13px}
+.filepick{display:inline-block;background:#fff;border:1px solid var(--line);border-radius:9px;
+  padding:5px 11px;font-size:13px;color:var(--txt);cursor:pointer;margin-top:6px;margin-right:8px}
+.filepick:hover{border-color:var(--pri);background:var(--pri-l)}
+#key-file-name{color:var(--txt3);font-size:12px;word-break:break-all}
 button.danger{color:var(--err);border-color:#f0c8c3}
 button.danger:hover{background:var(--err-l)}
 button:disabled{opacity:.5;cursor:not-allowed;transform:none}
@@ -163,32 +167,58 @@ main{flex:1;display:flex;flex-direction:column;min-width:0;position:relative}
 .g2{grid-template-columns:repeat(2,minmax(0,1fr))}
 .g3{grid-template-columns:repeat(3,minmax(0,1fr))}
 .g4{grid-template-columns:repeat(4,minmax(0,1fr))}
-@media(max-width:1080px){.g4{grid-template-columns:repeat(2,1fr)}.g3{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:1080px){.g4{grid-template-columns:repeat(2,minmax(0,1fr))}.g3{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:760px){
-  .g2,.g3,.g4{grid-template-columns:1fr}
+  .g2,.g3,.g4{grid-template-columns:minmax(0,1fr)}
   .sidebar{width:var(--side-c);flex-basis:var(--side-c)}
   .brand-txt,.nav-search,.ng-t,.ng-n,.ng-arrow,.nitem-t,.nitem-tag{display:none}
   .ng-head,.nitem{justify-content:center}
 }
-.kv{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px dashed var(--line2);font-size:13px}
+.kv{display:flex;justify-content:space-between;gap:2px 12px;flex-wrap:wrap;
+  padding:7px 0;border-bottom:1px dashed var(--line2);font-size:13px}
 .kv:last-child{border-bottom:none}
-.kv b{font-weight:500;color:var(--txt2);flex:0 0 auto}
-.kv span{text-align:right;word-break:break-all;font-variant-numeric:tabular-nums}
+/* ⚠️ 标签**不能**收缩（这里踩过两次坑，两个方向都错过）：
+   · `flex:0 0 auto` —— 英文长标签（Local machine LAN Address）撑破父级，
+     手机端整页横向滚动；
+   · `flex:0 1 auto; min-width:0` —— 反过来被压成一字一行的**竖排**，
+     实测 390px 下「Boot Mode」被压成 9px 宽 / 9 行（见 _dev/text-audit.sh）。
+   正解：标签不收缩 + 允许整行换行（上面的 flex-wrap:wrap）。
+   标签比整行还宽时由 max-width:100% + break-word 在**空格处**折行，
+   永远不会变成竖排。 */
+.kv b{font-weight:500;color:var(--txt2);flex:0 0 auto;max-width:100%;
+  overflow-wrap:break-word}
+.kv span{flex:1 1 auto;min-width:0;text-align:right;word-break:break-all;
+  font-variant-numeric:tabular-nums}
 .stat{background:#fff;border:1px solid var(--line);border-radius:var(--r);padding:14px 16px;
   box-shadow:var(--sh);position:relative;overflow:hidden}
 .stat::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--grad);opacity:.75}
 .stat .lbl{font-size:12px;color:var(--txt3);margin-bottom:6px}
 .stat .val{font-size:20px;font-weight:650;font-variant-numeric:tabular-nums;letter-spacing:-.2px}
 .stat .sub{font-size:11.5px;color:var(--txt3);margin-top:3px}
-.tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:5px;font-weight:500;vertical-align:middle}
+/* ⚠️ 徽标不能被压成一列一个字：它是 flex 项时会被挤到 25px 宽
+   （真机 800px 实测「虚拟磁盘」4 行 / 每行 1 字）。
+   用 keep-all 而不是 nowrap —— 中文标签不许按字断（保住「一个词」的下限），
+   英文长标签（"DPI Classification database:Not Installed"）仍要能在
+   空格处折行，否则 390px 下会把内容区顶出 13px。 */
+.tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:5px;font-weight:500;vertical-align:middle;
+  white-space:normal;word-break:keep-all;overflow-wrap:break-word}
 .tag.ok{background:var(--ok-l);color:var(--ok)}
 .tag.warn{background:var(--warn-l);color:var(--warn)}
 .tag.err{background:var(--err-l);color:var(--err)}
 .tag.info{background:var(--info-l);color:var(--info)}
 .tag.gray{background:#eef1f6;color:var(--txt2)}
 table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line2);vertical-align:top}
-th{font-weight:600;color:var(--txt2);font-size:12px;background:#fafbfe;position:sticky;top:0}
+/* ⚠️ `word-break:keep-all` 不是装饰，是这一版排版修复的关键：
+   默认 CJK 可以在任意两个字之间断行 → 单元格的 min-content 只有**一个字**宽，
+   浏览器在自动表格布局里会把这一列一路压到 ~25px，于是「虚拟磁盘」「修改时间」
+   这类短标签被压成一列一个字（真机 800px 实测 w=25 / 4 行）。
+   keep-all 让 CJK 只在词边界断行，列宽就有了下限；表头再 nowrap 兜一层。
+   表因此变宽由 .tw 的横向滚动兜住，不会顶破内容区。
+   （判据：_dev/t-layout.py；实测工具：_dev/live-text-audit.sh） */
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line2);
+  vertical-align:top;word-break:keep-all;overflow-wrap:break-word}
+th{font-weight:600;color:var(--txt2);font-size:12px;background:#fafbfe;position:sticky;top:0;
+  white-space:nowrap}
 tr:last-child td{border-bottom:none}
 tbody tr:hover{background:#fafcff}
 .mono{font-family:ui-monospace,Consolas,monospace;font-size:12.5px}
@@ -207,8 +237,17 @@ pre{background:#fbfcfe;border:1px solid var(--line);border-radius:9px;padding:12
 .row{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
 .row>*{flex:1 1 180px}
 .row .fixed{flex:0 0 auto}
-.switch{display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;color:var(--txt2);
+/* 表单行里的 label 同样不能被压成一列一个字：`flex:1` 的 label 在兄弟项
+   抢走空间后只剩 34px 宽（真机 800px 实测「其它域名（逗号分隔）」5 行）。
+   keep-all 给它一个「一个词」的下限，抢不过就整行换行（.row 本来就 wrap）。 */
+.row>label{word-break:keep-all}
+/* ⚠️ .switch 是「拨杆 + 名称 + 说明」的 inline-flex 一行。CJK 的 min-content
+   只有 **1 个字**，所以窄屏下名称会被后面的说明挤成细柱 —— 真机 390px 实测
+   「不主动获取（without-acquire）」被压成 66px / 3 行。
+   修法：允许整行换行 + 名称不可收缩（装不下时说明整段换到下一行）。 */
+.switch{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap;cursor:pointer;font-size:13px;color:var(--txt2);
   margin-bottom:12px;user-select:none}
+.switch b{flex:0 0 auto}
 .switch input{display:none}
 .switch i{width:38px;height:21px;border-radius:11px;background:#ccd5e3;position:relative;transition:.18s;flex:0 0 38px}
 .switch i::after{content:'';position:absolute;top:2px;left:2px;width:17px;height:17px;border-radius:50%;
@@ -239,14 +278,23 @@ pre{background:#fbfcfe;border:1px solid var(--line);border-radius:9px;padding:12
 .seg button{border:none;border-radius:0;padding:7px 14px;font-size:13px;background:#fff}
 .seg button+button{border-left:1px solid var(--line)}
 .seg button.on{background:var(--grad);color:#fff}
+/* ⚠️ 日志行必须允许换行，正文列不能用 flex:1 硬挤。
+   级别 46 + 时间 130 + 模块 76 + 间距 30 = 282px 是**固定**的；
+   原来 `.ms{flex:1}` 在窄屏下只能拿到剩下的 28px ——
+   实测 390px 视口下一条日志被折成 24 行、每行 3 个字，就是「竖着的字」。
+   改成 flex-basis 240px + flex-wrap：放不下时正文整行换到下一行（占满整宽），
+   任何宽度下都不会被挤成细柱。 */
 .logline{padding:5px 8px;border-bottom:1px solid var(--line2);font-size:12.5px;
-  font-family:ui-monospace,Consolas,monospace;display:flex;gap:10px}
+  font-family:ui-monospace,Consolas,monospace;display:flex;gap:10px;flex-wrap:wrap}
 .logline:hover{background:#fafbfe}
 .logline .lv{flex:0 0 46px;font-weight:600}
 .lv.info{color:var(--info)} .lv.warn{color:var(--warn)} .lv.error{color:var(--err)}
-.logline .ts{flex:0 0 130px;color:var(--txt3)}
+.logline .ts{flex:0 1 130px;min-width:0;color:var(--txt3)}
 .logline .mo{flex:0 0 76px;color:var(--txt2)}
-.logline .ms{flex:1;word-break:break-all}
+/* word-break 用 normal + overflow-wrap:break-word：长 token（MAC / IPv6）
+   放不下时仍会断开，但正常文本按词换行，比 break-all 好读得多。
+   注意别用 anywhere —— 它会把 min-content 变成 1 字符，又会退回竖排。 */
+.logline .ms{flex:1 1 240px;word-break:normal;overflow-wrap:break-word}
 
 /* ---------- 页脚（开源协议与作者） ---------- */
 .site-footer{margin:26px 4px 8px;padding:14px 4px 6px;border-top:1px solid var(--line);
@@ -256,8 +304,8 @@ pre{background:#fbfcfe;border:1px solid var(--line);border-radius:9px;padding:12
 .site-footer a:hover{text-decoration:underline}
 
 /* ---------- PPPoE 实时状态栏与日志 ---------- */
-.ppbar{display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:10px;
-  background:var(--line2);border:1px solid var(--line);font-size:13.5px}
+.ppbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 14px;
+  border-radius:10px;background:var(--line2);border:1px solid var(--line);font-size:13.5px}
 .pplog{margin-top:12px;height:230px;overflow:auto;border:1px solid var(--line);border-radius:10px;
   background:#0f172a;padding:8px 10px;font-family:ui-monospace,Consolas,monospace;font-size:12px}
 .ppline{padding:3px 0;color:#cdd9ea;border-bottom:1px solid rgba(255,255,255,.05);word-break:break-all}
@@ -444,8 +492,13 @@ svg[role=img]{display:block;margin:0 auto}
 .vlan-row > div{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 
 /* ---------- 依赖自检（新结构：dep-grid / dep-item） ---------- */
+/* ⚠️ .dep-grid 的 minmax(300px,1fr) + auto-fill 意味着**屏越宽、列数越多、
+   单张卡片越窄**（1920 下 5~7 列，每张只有 ~307px；而 800px 窗口只有 1 列、
+   卡片 560px）。所以这一块的排版问题必须在 1920/2560 下量，窄屏反而看不出来。 */
 .dep-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px;margin-top:10px}
-.dep-item{display:flex;align-items:flex-start;gap:11px;padding:11px 13px;border-radius:10px;
+/* flex-wrap:wrap 是必需的：卡片里除了「图标 + 正文」还有分组标签、必需/可选
+   标签、「安装」按钮，一行塞不下。不给 wrap，正文就会被挤成细柱。 */
+.dep-item{display:flex;align-items:flex-start;gap:11px;flex-wrap:wrap;padding:11px 13px;border-radius:10px;
   border:1px solid var(--line);background:#fbfcfe}
 .dep-item .dep-ico{flex:0 0 22px;width:22px;height:22px;border-radius:50%;display:flex;
   align-items:center;justify-content:center;font-size:12.5px;font-weight:700;color:#fff;margin-top:1px}
@@ -455,7 +508,19 @@ svg[role=img]{display:block;margin:0 auto}
 .dep-item.ok{border-color:#c9ecd8}
 .dep-item.err{border-color:#f7c9c4;background:#fff8f7}
 .dep-item.warn{border-color:#f5dfae;background:#fffcf4}
-.dep-item .dep-body{flex:1;min-width:0}
+/* ⚠️ 必须是 `flex:1 1 200px`（**带下限的 basis**），不能是 `flex:1`
+   （= 1 1 0%，下限为 0）。真机 1908px 实测（英文依赖自检页，2026-10-10）：
+   卡片 307px，标签 + 按钮吃掉 ~190px，`flex:1` 的正文只剩 **27px**，
+   描述被折成 23 行、每行 5 个字符 —— 用户看到的就是「字是竖着的」。
+   给 basis 一个 200px 下限后：装不下时标签/按钮整行换到下一行，
+   正文拿到 246px / 5 行。
+   ⚠️ app.js 里有 6 处内联 `style="flex:1"` 覆盖（内联优先级更高），已一并改。 */
+.dep-item .dep-body{flex:1 1 200px;min-width:0}
+/* ⚠️ 告警规则卡（#151）外层的 .dep-item 是「图标 + 正文」的**横向** flex 容器，
+   但模板里直接塞了 .row + <p> 两个块 → 它们被当成并排的 flex 项，.row 被压到
+   26px、规则名一字一行（真机 390px 实测「外网连接中断」w=26 / 6 行）。
+   这里让外层退回块级，两个块正常上下堆叠、各占满宽。 */
+#al-rules>.dep-item{display:block}
 .dep-item .dep-body b{font-size:13.5px}
 .dep-item .dep-where{font-size:11.5px;color:var(--txt3);margin-top:3px;word-break:break-all}
 /* 分组过滤按钮的选中态：没有它用户点「外置存储」看不出到底选中了哪个 */
@@ -529,8 +594,19 @@ svg[role=img]{display:block;margin:0 auto}
 .fm-name{display:flex;align-items:center;gap:7px;min-width:0}
 .fm-open{cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .fm-open:hover{color:var(--pri);text-decoration:underline}
-.fm-acts{display:flex;gap:5px;flex-wrap:wrap}
+/* ⚠️ flex 必须放在**内层 div** 上，不能放在 td 上（2026-10-05 修）。
+   td 变 flex 容器后会脱离表格列宽计算：表头「操作」列按 <th> 内容定宽，
+   数据行却按 4 个按钮的宽度撑开 —— 两边对不齐，标题与按钮组错位。
+   现在 td 只负责列宽对齐，flex 交给 .fm-acts-in。 */
+.fm-acts{white-space:nowrap;vertical-align:top}
+.fm-acts-in{display:flex;gap:5px;flex-wrap:wrap}
 .fm-acts button{padding:3px 8px;font-size:11.5px;border-radius:7px}
+/* 各列固定宽度：表头与数据行共用，保证「名称/大小/修改时间/权限/操作」纵向对齐 */
+.fm-chk{width:34px}
+.fm-c-size{width:88px}
+.fm-c-time{width:132px}
+.fm-c-mode{width:104px}
+.fm-c-act{width:250px}
 .fm-chk{width:30px;text-align:center}
 .up-name{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .up-st{flex:0 0 190px;text-align:right}
@@ -599,12 +675,16 @@ svg[role=img]{display:block;margin:0 auto}
 
 /* ---------- Docker / Docker Compose 面板（#10） ---------- */
 .dk-table{display:flex;flex-direction:column;gap:0}
-.dk-thead,.dk-trow{display:grid;grid-template-columns:1.6fr .9fr 1.1fr 1.1fr auto;
+.dk-thead,.dk-trow{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,.9fr) minmax(0,1.1fr) minmax(0,1.1fr) auto;
   gap:10px;align-items:center;padding:9px 10px;border-bottom:1px solid var(--line2);font-size:12.5px}
 .dk-thead{color:var(--txt3);font-size:11.5px;font-weight:600;border-bottom:1px solid var(--line);
   background:var(--panel2);border-radius:8px 8px 0 0}
 .dk-trow:last-child{border-bottom:none}
 .dk-trow:hover{background:#fbfcfe}
+/* 单元格内容要能断：长设备名（HP_OfficeJet_Pro_7740_series）是不可断的
+   Latin token，不给 break-word 就会撑出 300+px，把整块内容顶出内容区
+   （真机 390px 实测 .mono 内容 487px / 盒子 148px）。 */
+.dk-trow>*{min-width:0;overflow-wrap:break-word}
 .dk-crow{align-items:start}
 .dk-metric{display:flex;flex-direction:column;gap:2px}
 .dk-acts{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}
@@ -616,7 +696,7 @@ svg[role=img]{display:block;margin:0 auto}
 #dk-st-yaml,#dk-cv-in{width:100%;box-sizing:border-box}
 #dk-cv-msg p{margin:6px 0}
 @media (max-width:960px){
-  .dk-thead,.dk-trow{grid-template-columns:1fr 1fr;}
+  .dk-thead,.dk-trow{grid-template-columns:minmax(0,1fr) minmax(0,1fr);}
   .dk-thead{display:none}
   .dk-acts{grid-column:1/-1}
 }
@@ -659,7 +739,7 @@ svg[role=img]{display:block;margin:0 auto}
 .tm-card-acts button{padding:4px 11px;font-size:12px}
 /* 设计器双栏 */
 .tm-split{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;align-items:start}
-@media(max-width:1080px){.tm-split{grid-template-columns:1fr}}
+@media(max-width:1080px){.tm-split{grid-template-columns:minmax(0,1fr)}}
 .tm-frame{width:100%;height:460px;border:1px solid var(--line);border-radius:10px;
   background:var(--panel2);display:block}
 /* 变量行 */
@@ -697,7 +777,7 @@ svg[role=img]{display:block;margin:0 auto}
 .ul-chip b{font-weight:600;color:var(--txt)}
 .ul-table{display:flex;flex-direction:column}
 .ul-thead,.ul-trow{display:grid;
-  grid-template-columns:128px 104px 74px 92px 200px 1fr;
+  grid-template-columns:128px 104px 74px 92px 200px minmax(0,1fr);
   gap:10px;align-items:start;padding:8px 10px;border-bottom:1px solid var(--line2);
   font-size:12.5px}
 .ul-thead{color:var(--txt3);font-size:11.5px;font-weight:600;
@@ -706,6 +786,10 @@ svg[role=img]{display:block;margin:0 auto}
 .ul-trow{cursor:pointer;transition:background .12s}
 .ul-trow:hover{background:#fbfcfe}
 .ul-trow:last-child{border-bottom:none}
+/* 窄屏下 .ul-trow 折成两列，单元格只有 ~150px；里面的 MAC / IPv6 / 长主机名
+   是不可断的 Latin token，不给 break-word 就会把内容顶出内容区
+   （真机 390px 实测 #view 横向溢出 12px，来源是 .ul-trow 里的 197px 长串）。 */
+.ul-trow>*{min-width:0;overflow-wrap:break-word}
 .ul-ico{display:inline-block;width:16px;color:var(--txt3)}
 #ul-out p{margin:8px 0 0}
 
@@ -739,16 +823,16 @@ svg[role=img]{display:block;margin:0 auto}
 
 @media (max-width:760px){
   /* 窄屏下步骤条改成两列网格，横向排会挤出屏幕并触发整页横向滚动 */
-  .wiz-steps{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .wiz-steps{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px}
   .wiz-arrow{display:none}
   .wiz-step{width:100%;justify-content:flex-start;padding:10px}
   .wiz-step-n{font-size:12px}
-  .wiz-dns-grid{grid-template-columns:1fr}
+  .wiz-dns-grid{grid-template-columns:minmax(0,1fr)}
 }
 
 @media (max-width:1080px){
   .ul-thead{display:none}
-  .ul-trow{grid-template-columns:1fr 1fr;gap:4px 10px}
+  .ul-trow{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:4px 10px}
 }
 
 /* ==========================================================================
@@ -800,10 +884,14 @@ svg[role=img]{display:block;margin:0 auto}
   .card{padding:14px 14px;margin-bottom:12px;border-radius:12px}
   .card .desc{margin:0 0 12px}
 
-  /* ---- 4. 表单：单列堆叠，输入框 16px 防止 iOS 自动放大 ---- */
+  /* ---- 4. 表单：单列堆叠，输入框 16px 防止 iOS 自动放大 ----
+     ⚠️ 必须 !important：视图里有几十处 `style="flex:0 0 110px"` 这类**内联**
+     固定宽度（协议/端口/时间范围等），内联样式优先级高于样式表，
+     不压过它的话手机上输入框仍是固定宽度左对齐 —— 右边留一大片空白，
+     看着就是「文字和控件都错位了」。 */
   .row{gap:8px}
-  .row>*{flex:1 1 100%;min-width:0}
-  .row .fixed{flex:0 0 auto}
+  .row>*{flex:1 1 100% !important;min-width:0}
+  .row .fixed{flex:0 0 auto !important}
   input,select,textarea{font-size:16px}
   input,select,textarea,button{max-width:100%}
   label{display:block}
@@ -842,3 +930,267 @@ svg[role=img]{display:block;margin:0 auto}
   .login-box h1{font-size:23px}
   .login-box button{min-height:46px}
 }
+
+/* ---- 网卡「当前角色」联动标签（1.0.10）----
+   跟在「备注」输入框下面，让用户一眼看到这张卡当前被分成了什么角色，
+   不用横向去找右侧的下拉框。放在 app.css 而非 update.css ——
+   它属于网卡页，不属于版本检测模块。 */
+.role-live { margin-top:5px; font-size:12px; color:var(--txt3);
+             display:flex; align-items:center; gap:6px; line-height:1.6; }
+.role-live .tag { font-size:11px; padding:1px 8px; border-radius:99px; }
+
+/* ---- 网卡 ethtool 详细计数（1.0.10）----
+   掉包/错误/冲突这类计数非 0 才标红 —— 大部分时候全是 0，
+   红字只出现在真的有问题时。 */
+.eth-box { margin-top:10px; padding:11px 13px; border:1px solid var(--line);
+           border-radius:9px; background:rgba(0,0,0,.018); }
+.eth-box.eth-off { display:flex; align-items:center; gap:9px;
+                   flex-wrap:wrap; background:transparent; }
+.eth-reason { font-size:12px; color:var(--txt3); }
+.eth-head { display:flex; align-items:center; gap:7px; flex-wrap:wrap;
+            margin-bottom:9px; }
+.eth-upd { margin-left:auto; font-size:11px; color:var(--txt3);
+           font-family:var(--mono,ui-monospace,monospace); }
+.eth-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(168px,1fr));
+            gap:2px 14px; }
+.eth-row { display:flex; align-items:baseline; gap:8px;
+           font-size:12px; line-height:1.9; }
+.eth-row.eth-warn .eth-k { color:var(--txt2); }
+.eth-k { color:var(--txt3); flex:1 1 0; min-width:0; }
+.eth-v { color:var(--txt2); font-size:12px; }
+.eth-v.cnt-bad { color:var(--err); font-weight:600; }
+@media (max-width:640px) {
+  .eth-grid { grid-template-columns:minmax(0,1fr); }
+  .eth-upd { margin-left:0; }
+}
+
+/* ---- 上游链路卡片（1.0.10）---- */
+.up-card { margin-bottom:16px; }
+.up-card h3 { display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
+.up-row { display:flex; align-items:center; gap:9px; flex-wrap:wrap;
+          font-size:12.5px; color:var(--txt3); }
+.up-card code { background:rgba(0,0,0,.05); padding:1px 5px; border-radius:4px;
+                font-size:12px; }
+
+/* ---- 网络明细：邻居 / 路由 / 规则表（1.0.10）----
+   表格用 .tbl（项目已有样式）；这里只补这块特有的：
+   ① 默认路由行加重 —— 它最重要，不该和普通路由一样看待
+   ② 长 MAC / IPv6 地址在窄屏下要能换行，不能撑破布局 */
+#netdetail-box .tbl { width:100%; }
+#netdetail-box tr.row-def td { background:rgba(16,185,129,.06); }
+#netdetail-box .mono { font-size:12px; word-break:break-all; }
+#netdetail-box .tag { white-space:nowrap; }
+@media (max-width:720px) {
+  #netdetail-box .tbl { display:block; overflow-x:auto; white-space:nowrap; }
+}
+
+/* ---- 实时柱状流动图（1.0.10）---- */
+.rt-h3t { font-weight:400; font-size:13px; color:var(--txt3); margin-left:8px; }
+#realtime-box h3 { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.rt-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(268px,1fr));
+           gap:16px; }
+.rt-item { min-width:0; }
+.rt-t { font-size:13px; font-weight:600; margin-bottom:6px; }
+.rt-u { font-size:11.5px; font-weight:400; color:var(--txt3); margin-left:5px; }
+#realtime-box canvas { display:block; width:100%; height:74px;
+                       border:1px solid var(--line); border-radius:7px;
+                       background:rgba(0,0,0,.012); }
+.rt-legend { display:flex; gap:12px; flex-wrap:wrap; margin:7px 0 4px; }
+.rt-d { font-size:11.5px; color:var(--txt3); display:inline-flex;
+        align-items:center; gap:5px; }
+.rt-d i { width:9px; height:9px; border-radius:2px; display:inline-block; }
+.rt-kv { display:flex; gap:8px; font-size:12px; line-height:1.9; }
+.rt-kv b { color:var(--txt3); font-weight:400; min-width:56px; }
+@media (max-width:640px) {
+  .rt-grid { grid-template-columns:minmax(0,1fr); }
+}
+
+/* ==========================================================================
+   模块健康总览（#5）
+   灯的四档语义固定：绿=正常 / 黄=留意 / 红=异常 / 灰=没启用（不是故障）。
+   颜色只用作**语义信号**，卡片底色与文字仍然全部走主题变量，
+   这样电光蓝 / 藏青色等主题切换时不会出现「一块不跟着变的白板」。
+   ========================================================================== */
+.st-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(272px,1fr));gap:12px}
+.st-card{background:var(--panel);border:1px solid var(--line);border-left-width:3px;
+  border-radius:var(--r);padding:12px 14px;box-shadow:var(--sh);
+  display:flex;flex-direction:column;gap:9px;min-width:0;transition:.15s}
+.st-card:hover{box-shadow:0 3px 12px rgba(18,28,55,.09)}
+.st-card.lv-ok{border-left-color:var(--ok)}
+.st-card.lv-warn{border-left-color:var(--warn)}
+.st-card.lv-err{border-left-color:var(--err)}
+.st-card.lv-off,.st-card.lv-na{border-left-color:#c3ccdb}
+.st-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+.st-name{font-size:13.5px;font-weight:650;min-width:0;overflow-wrap:break-word}
+.st-code{font-size:11.5px;color:var(--txt3);min-width:0;overflow-wrap:break-word}
+/* 状态灯：外圈用同色低透明描边，让小圆点在浅底上也有体积感 */
+.st-dot{width:9px;height:9px;flex:0 0 9px;border-radius:50%;background:#c3ccdb}
+.st-dot.lv-ok,.st-card.lv-ok .st-dot{background:var(--ok);box-shadow:0 0 0 3px rgba(18,129,63,.16)}
+.st-dot.lv-warn,.st-card.lv-warn .st-dot{background:var(--warn);box-shadow:0 0 0 3px rgba(154,103,0,.16)}
+.st-dot.lv-err,.st-card.lv-err .st-dot{background:var(--err);box-shadow:0 0 0 3px rgba(192,57,43,.16)}
+.st-dot.lv-off,.st-dot.lv-na,.st-card.lv-off .st-dot,.st-card.lv-na .st-dot{background:#c3ccdb}
+/* 异常项轻微呼吸，让「红」在满屏卡片里能被第一眼抓到 */
+.st-card.lv-err .st-dot{animation:stpulse 1.9s ease-in-out infinite}
+@keyframes stpulse{0%,100%{box-shadow:0 0 0 3px rgba(192,57,43,.16)}
+  50%{box-shadow:0 0 0 7px rgba(192,57,43,.04)}}
+.st-metrics{display:flex;flex-wrap:wrap;gap:5px;min-width:0}
+.st-chip{display:inline-flex;align-items:baseline;gap:5px;font-size:11.5px;padding:2px 8px;
+  border-radius:6px;background:rgba(0,0,0,.035);max-width:100%}
+.st-chip i{color:var(--txt3);font-style:normal;white-space:nowrap}
+.st-chip b{font-weight:600;font-variant-numeric:tabular-nums;overflow-wrap:break-word}
+.st-foot{margin-top:auto}
+.st-summary .st-sum-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.st-summary .st-when{margin-left:auto;font-size:12px;color:var(--txt3);
+  font-variant-numeric:tabular-nums}
+@media (max-width:520px){
+  .st-summary .st-when{margin-left:0}
+  .st-grid{grid-template-columns:minmax(0,1fr)}
+}
+
+/* ⓘ 提示图标。
+   ⚠️ 提示语**不用** CSS ::after 气泡。绝对定位的伪元素会参与滚动容器的
+   scrollable overflow —— 实测在 health 页把内容区撑出 72px（手机）/106px
+   （桌面）的横向滚动条，用户能往右拖出一片空白。改用两条腿：
+     · title 属性 → 桌面悬停出原生气泡，零布局影响；
+     · 点一下 ⓘ → 展开卡片内的 .st-hint 行内说明（手机上也能读全）。
+   注意 title 是浏览器原生气泡，样式不可控但永远不会破坏布局。 */
+.st-info{flex:0 0 17px;width:17px;height:17px;padding:0;border-radius:50%;
+  border:1px solid var(--line);background:var(--line2);color:var(--txt3);
+  font-size:11px;font-weight:700;line-height:1;cursor:pointer;
+  display:inline-flex;align-items:center;justify-content:center}
+.st-info:hover,.st-info:focus-visible{border-color:var(--pri);color:var(--pri);background:var(--pri-l)}
+.st-info[aria-expanded="true"]{border-color:var(--pri);color:var(--pri);background:var(--pri-l)}
+/* 行内说明：点 ⓘ 展开，占满卡片宽度，不产生任何浮动层 */
+.st-hint{font-size:12px;line-height:1.7;color:var(--txt2);background:var(--line2);
+  border-left:2px solid var(--pri);border-radius:0 7px 7px 0;padding:8px 11px;
+  overflow-wrap:break-word}
+.st-hint[hidden]{display:none}
+
+/* 顶栏模块健康灯：跨页面常驻，点一下进健康总览 */
+.tb-health{position:relative}
+.tb-health .tb-h-dot{display:block;width:11px;height:11px;border-radius:50%;background:#c3ccdb}
+.tb-health.lv-ok .tb-h-dot{background:var(--ok);box-shadow:0 0 0 3px rgba(18,129,63,.16)}
+.tb-health.lv-warn .tb-h-dot{background:var(--warn);box-shadow:0 0 0 3px rgba(154,103,0,.16)}
+.tb-health.lv-err .tb-h-dot{background:var(--err);box-shadow:0 0 0 3px rgba(192,57,43,.18);
+  animation:stpulse 1.9s ease-in-out infinite}
+.tb-health.lv-off .tb-h-dot,.tb-health.lv-na .tb-h-dot{background:#c3ccdb}
+
+/* ==========================================================================
+   全局视觉精修（#2）
+   原则：**只动结构与节奏，不动配色体系**。
+     · 新颜色一律走主题变量（--pri/--ok/--line…），否则电光蓝 / 藏青色主题下
+       会冒出一块「不跟着变」的固定色；
+     · 不改 --r / --sh 这些既有令牌的取值（全站都在用，改了等于全站重排），
+       只新增细分令牌给新规则用；
+     · 全部规则追加在文件末尾 —— 依赖 CSS 层叠来覆盖，不动上面的既有声明，
+       这样任何一条出问题都能单独摘掉，不会连坐。
+   ========================================================================== */
+
+:root{
+  /* 间距节奏：4 的倍数。新写组件优先用这三档，避免出现 7px / 13px 这类随手值 */
+  --sp1:6px; --sp2:12px; --sp3:18px;
+  /* 圆角细分：小控件 / 卡片 / 大容器 */
+  --r-sm:9px; --r-lg:16px;
+  /* 统一过渡：所有 hover 反馈用同一条曲线，避免有的 .15s 有的 .3s 显得散 */
+  --tr:.16s ease;
+  --sh-hov:0 4px 16px rgba(18,28,55,.10);
+}
+
+/* ---------- 1. 键盘可达性：焦点环 ---------- */
+/* 鼠标点击不显示、键盘 Tab 才显示。项目里只有部分按钮写了 focus-visible，
+   补一条全局兜底 —— 纯键盘用户靠它认路。 */
+button:focus-visible,
+a:focus-visible,
+summary:focus-visible,
+[tabindex]:focus-visible,
+select:focus-visible,
+input[type=checkbox]:focus-visible,
+input[type=radio]:focus-visible{
+  outline:2px solid var(--pri);outline-offset:2px;
+}
+input:focus-visible,textarea:focus-visible{outline:none}
+
+/* ---------- 2. 动效尊重系统偏好 ---------- */
+/* 前庭功能敏感的用户会因动画不适；系统开了「减少动态效果」就全部停掉。
+   注意：不能简单写 *{animation:none} —— 会把加载态的旋转也停掉，
+   那些是**功能性**动画，停了用户就不知道还在跑。所以只关装饰性动效。 */
+@media (prefers-reduced-motion: reduce){
+  .st-card.lv-err .st-dot,.tb-health.lv-err .tb-h-dot,.gauge-warn{animation:none}
+  *{transition-duration:.01ms !important}
+}
+
+/* ---------- 3. 文字选中与滚动条 ---------- */
+::selection{background:var(--pri-l);color:var(--txt)}
+/* 细滚动条：默认的系统滚动条在深色主题下是一条刺眼的白带 */
+*{scrollbar-width:thin;scrollbar-color:#c3ccdb transparent}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#c3ccdb;border-radius:5px;
+  border:2px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-thumb:hover{background:#a9b6cc;background-clip:content-box}
+/* 深色底容器（终端 / 代码块）里换深色滑块 */
+.pplog::-webkit-scrollbar-thumb,.term-body::-webkit-scrollbar-thumb,
+.term-pre::-webkit-scrollbar-thumb,.nat-detail::-webkit-scrollbar-thumb{background:#3a4a66}
+.pplog,.term-pre{scrollbar-color:#3a4a66 transparent}
+
+/* ---------- 4. 卡片标题：左侧主色小竖条 ---------- */
+/* 一屏里卡片多，标题纯靠字号区分层级不够；加一条 3px 主色条后
+   「这是第几块」一眼可辨。绝对定位所以不参与 flex 布局，不会挤动标题里的徽标。 */
+/* ⚠️ 竖条用 left:-12px 挂在卡片的内边距里，**不给 h3 加 padding-left**。
+   加 padding-left 会把标题文字整体右移 11px，而下面的 .desc / 表格仍在 0 位，
+   一屏卡片读起来就是「标题歪了」（实测被 _dev/text-audit.sh 的 offset 判据抓到）。 */
+.card>h3{position:relative}
+.card>h3::before{content:'';position:absolute;left:-12px;top:2px;bottom:2px;width:3px;
+  border-radius:2px;background:var(--pri);opacity:.8}
+/* 报错卡片的标题条跟着变红，避免「红标题配蓝竖条」的割裂 */
+.card[style*="border-color:var(--err)"]>h3::before{background:var(--err)}
+
+/* ---------- 5. 表格：斑马纹 + 表头浮起 + 悬停主色提示 ---------- */
+tbody tr:nth-child(even){background:rgba(0,0,0,.014)}
+tbody tr:hover{background:var(--pri-l)}
+th{box-shadow:inset 0 -1px 0 var(--line)}
+/* 首列不加粗但加深一点，长表格里横向找行更容易 */
+tbody td:first-child{color:var(--txt)}
+
+/* ---------- 6. 表单控件：统一手感 ---------- */
+input:hover:not(:disabled),select:hover:not(:disabled),textarea:hover:not(:disabled){
+  border-color:#c3cfe3}
+input:disabled,select:disabled,textarea:disabled{background:#f5f7fb;color:var(--txt3);
+  cursor:not-allowed}
+/* 多选框 / 单选框跟随主题主色（默认是系统蓝，与主题不搭） */
+input[type=checkbox],input[type=radio]{accent-color:var(--pri);width:auto}
+button{transition:var(--tr)}
+button:not(:disabled):hover{transform:translateY(-1px)}
+button:not(:disabled):active{transform:translateY(1px)}
+/* small 按钮与 icon-btn 不参与位移，避免密集工具条里整体抖动 */
+button.small:not(:disabled):hover,button.icon-btn:not(:disabled):hover,
+.seg button:not(:disabled):hover,.lang-tabs button:not(:disabled):hover{transform:none}
+
+/* ---------- 7. 可点击卡片：悬停抬升 ---------- */
+.tm-card:hover,.st-card:hover{box-shadow:var(--sh-hov)}
+
+/* ---------- 8. 空状态：统一「这里什么都没有」的观感 ---------- */
+.empty-state{padding:34px 18px;text-align:center;color:var(--txt3);font-size:13px;
+  line-height:1.8;border:1px dashed var(--line);border-radius:var(--r);
+  background:rgba(0,0,0,.012)}
+.empty-state b{display:block;color:var(--txt2);font-size:13.5px;margin-bottom:4px}
+
+/* ---------- 9. 徽标统一 ---------- */
+/* .tag-ok / .tag-warn 是历史遗留的独立类，与 .tag.ok / .tag.warn 重复。
+   这里补齐它们缺的垂直对齐与圆角，避免同一行里两种徽标高度不一致。 */
+.tag-ok,.tag-warn{vertical-align:middle;line-height:1.6}
+.tag.pri{background:var(--pri-l);color:var(--pri)}
+
+/* ---------- 10. 分区小标题（.sec-t）与分隔线（.hr） ---------- */
+.sec-t{font-size:12px;font-weight:600;color:var(--pri);margin:2px 0 9px;
+  padding-bottom:5px;border-bottom:1px dashed var(--line2)}
+.hr{height:1px;background:var(--line2);border:none;margin:14px 0}
+
+/* 本页模块状态灯（#5）：贴在页面标题右边，只在有对应模块的页面出现 */
+.page-health{display:inline-flex;align-items:center;gap:7px;flex:0 0 auto;
+  padding:3px 10px;border-radius:20px;font-size:12px;color:var(--txt2);
+  background:rgba(0,0,0,.035);cursor:pointer;transition:var(--tr)}
+.page-health[hidden]{display:none}
+.page-health:hover{background:var(--pri-l);color:var(--pri)}
+.page-health .ph-txt{white-space:nowrap}
+@media (max-width:520px){.page-health .ph-txt{display:none}}

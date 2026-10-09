@@ -97,8 +97,23 @@ def grab(fn_name):
 
 
 def grab_array(name):
-    """抽取 `const NAME = [...];` 字面量（方括号配平）"""
-    i = app_js.index('const %s = [' % name)
+    """抽取 `const NAME = [...];` 字面量（方括号配平）。
+
+    ⚠️ 顶层常量改**惰性函数**之后（`const TM_VARS = () => ([...])`），
+       只认 `const NAME = [` 会直接抛 ValueError —— 不是代码错了，
+       是抽取器没跟上。两种写法都要支持。
+    """
+    pat = 'const %s = [' % name
+    lazy = False
+    if pat in app_js:
+        i = app_js.index(pat)
+    else:
+        pat2 = 'const %s = () => ([' % name
+        if pat2 in app_js:
+            i = app_js.index(pat2)
+            lazy = True
+        else:
+            raise RuntimeError('未找到数组声明：%s（试过 %r 与 %r）' % (name, pat, pat2))
     j = app_js.index('[', i)
     depth = 0
     for k in range(j, len(app_js)):
@@ -107,12 +122,25 @@ def grab_array(name):
         elif app_js[k] == ']':
             depth -= 1
             if depth == 0:
-                return app_js[i:k + 1] + ';'
+                # 惰性写法是 `() => ([ ... ])` —— 方括号后面还有个 `)`，
+                # 只补 `;` 会拼成 `() => ([...];` → SyntaxError。
+                return app_js[i:k + 1] + (');' if lazy else ';')
     raise RuntimeError('未找到数组结尾：' + name)
 
 
 harness = ("""
 'use strict';
+// ⚠️ 必须提供 t() 恒等桩 —— 2026-10-05 i18n 补全后，TM_VARS / TM_NAMED
+//    里的中文标签被包成 t('…')，而这份 harness 是把 app.js 的字面量
+//    原样贴进 Node 求值的，不给桩就是 ReferenceError: t is not defined。
+//    用恒等桩（t(k) => k）而不是查真字典：这份判据只验 CSS 校验逻辑，
+//    关心的是**变量名**（x[0]），与显示文案无关。
+const t = (k) => k;
+// ⚠️ T 是同一个翻译函数的**大写别名**（app.js 顶部：t 会被形参遮蔽时用 T）。
+//    只桩 t 不桩 T 的话，贴进来的函数里一调 T() 就 ReferenceError
+//    （2026-10-08：TM_VARS 改惰性后 tmCheckValue 里的 T 暴露了这个问题）。
+const T = t;
+const i18n = { getLang: () => 'zh-CN' };
 // 直接用 app.js 自己的 TM_VARS / TM_NAMED 字面量（数组-of-数组形态），
 // 避免因桩写错形态而误判：TM_VARS 元素的 x[0] 才是变量名。
 @@TMVARSLIT@@

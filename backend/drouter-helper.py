@@ -224,12 +224,1070 @@ def theme_to_css_cached(t):
 
 # ------------------------------------------------------------------ 基础工具
 
-def ok(data=None, msg='操作成功', code='OK'):
-    return {'ok': True, 'code': code, 'msg_cn': msg, 'data': data}
+# ⚠️ 语言协商（1.0.10 起）
+#
+# 前端每次调 API 都会带 `X-Lang: en-US` 或 `zh-CN`（由 i18n.js 自动加）。
+# 后端据此决定 msg_en 是真英文还是回落中文。
+# ⚠️ 为什么不用「默认英文、缺词回落中文」：
+#    大部分老代码没传 en（723 个 ok()/fail() 调用里只有一部分会补），
+#    若默认英文，界面会**中英混杂** —— 那比全中文更糟。
+#    所以默认中文：传了 en 且有值才用英文，没传就显示中文（与之前一致）。
+_DEFAULT_LANG = 'zh-CN'
+_cur_lang = [_DEFAULT_LANG]
 
 
-def fail(msg, code='ERR', data=None):
-    return {'ok': False, 'code': code, 'msg_cn': msg, 'data': data}
+def set_lang(lang):
+    """设置本进程的语言。由 web 层在收到 X-Lang 时调用。"""
+    _cur_lang[0] = 'en-US' if str(lang or '').lower().startswith('en') else 'zh-CN'
+    return _cur_lang[0]
+
+
+def cur_lang():
+    return _cur_lang[0]
+
+
+# ⚠️ 消息英文对照表（1.0.10 起）
+#
+# 键是**中文原文**（不是 key 名）—— ok()/fail() 拿到的是最终文案，
+# 只有拿原文才查得到。
+#
+# 为什么用「表 + 自动查表」而不是给每个调用点加 en= 参数：
+#   700+ 个调用点逐个加参数，漏一处就是一处中英混杂，review 也看不出来；
+#   而**以后新写的 ok()/fail() 只要文案在表里就自动有英文**，
+#   不需要记得再补一遍参数。en= 参数仍保留，作为个别覆盖的逃生口。
+#
+# 两级查找（缺一不可）：
+#   1) 精确键 —— msg 是字面量中文（ok(None, """设置已保存""")）
+#   2) 模板正则 —— msg 是 """'未知操作：%s' % op""" 渲染后的**结果**，
+#      键里不可能有，改用 _MSG_RX 按模板形状匹配并回填捕获组。
+    #      正则只收字面量 >= 4 字符的模板：%s；%s、%s 已%s 这类太短，
+#      会把无关消息误匹配走 —— 那比不翻译更糟。
+#
+# 表数据源：_dev/msg-en.py 与 _dev/msg-en2.py
+#          （改文案请改那里，再跑 _dev/apply-msg-en.py）
+# 维护规则：占位符个数必须与中文原文一致 ——
+#          本脚本第 1 步就会校验，_dev/t-msg-en.py 里也有判据钉住
+MSG_EN = {
+    '%s 不是合法的 IPv4 地址': '%s is not a valid IPv4 address',
+    '%s 不是合法的 IPv4 地址：%s': '%s is not a valid IPv4 address: %s',
+    '%s 失败：%s': '%s failed: %s',
+    '%s 已%s': '%s has been %s',
+    '%s 格式不正确': '%s is not in the correct format',
+    '%s 格式不正确，应为 HH:MM': '%s is not in the correct format, expected HH:MM',
+    '%s 的 %s 用量：%s': '%s usage of %s: %s',
+    '%s 的唤醒功能已%s': 'The wake-on-lan function of %s has been %s',
+    '%s 的小时或分钟超出范围': 'The hour or minute of %s is out of range',
+    '%s 的设置已保存（该模块没有独立配置文件，其内容会作为上下文随防火墙 / DHCP 等模块一起生效）': '%s settings saved (this module has no configuration file of its own; its content takes effect as context together with modules such as firewall and DHCP)',
+    '%s 的阈值必须是数字': 'The threshold of %s must be a number',
+    '%s 统计：%s 台设备，合计 %s': '%s statistics: %s device(s), %s in total',
+    '%s 语法检查通过（仅预检，未写入磁盘、未启用服务）': '%s passed the syntax check (pre-check only; nothing written to disk, no service enabled)',
+    '%s 还没有任何流量统计。请确认统一日志与本功能都已启用，并且已经过了一个聚合周期。': '%s has no traffic statistics yet. Make sure unified logging and this feature are both enabled and that an aggregation period has passed.',
+    '%s 配置已保存。该服务当前处于停止状态，已跳过启动以避免影响现有网络；确认可以启用时请使用「启用服务」按钮。': '%s configuration saved. The service is currently stopped and was not started, to avoid affecting the existing network; use the "Enable service" button when you are ready.',
+    '%s 配置已保存到磁盘%s': '%s configuration saved to disk%s',
+    '%s 配置已应用%s': '%s configuration applied%s',
+    '%s 重载失败，已自动回滚配置：%s': 'Failed to reload %s; the configuration has been rolled back automatically: %s',
+    '%s:%s —— %s': '%s:%s — %s',
+    '%s:%s —— %s %s': '%s:%s — %s %s',
+    '%s：%s': '%s: %s',
+    '%s；%s': '%s; %s',
+    '/etc/fstab 里已存在该设备的条目': 'An entry for this device already exists in /etc/fstab',
+    '/etc/fstab 里没有该设备的条目': 'No entry for this device exists in /etc/fstab',
+    'BAD_OP': 'BAD_OP',
+    'BAD_PROVIDER': 'BAD_PROVIDER',
+    'Bark 拒绝：%s': 'Bark refused: %s',
+    'CA 生成失败：%s': 'Failed to generate the CA: %s',
+    'CA「%s」已创建，有效期 %s 天。可以用它给管理后台签服务器证书了。': 'CA "%s" created, valid for %s days. You can now use it to sign a server certificate for the admin panel.',
+    'CSR 已生成。把它交给证书机构，签回来的证书在下面「导入」里选「补全这张请求」即可。': 'CSR generated. Hand it to your certificate authority, then import the signed certificate below using "Complete this request".',
+    'CSR 生成失败：%s': 'Failed to generate the CSR: %s',
+    'CUPS 没有安装。请到「系统 → 依赖自检与安装」安装后再来配置，或在终端执行 apt-get install -y %s': 'CUPS is not installed. Install it via "System → Dependency Check & Install" before configuring, or run apt-get install -y %s in the terminal',
+    'CUPS 没有安装，无法管理队列': 'CUPS is not installed, so print queues cannot be managed',
+    'DDNS 更新成功：%s → %s（%s）': 'DDNS updated: %s → %s (%s)',
+    'DDNS_UPDATE_FAILED': 'DDNS_UPDATE_FAILED',
+    'DDNS_UPDATE_PARTIAL': 'DDNS_UPDATE_PARTIAL',
+    'DNS 地址「%s」不是合法的 IP（多个地址之间用英文逗号分隔）': 'The DNS address "%s" is not a valid IP (separate multiple addresses with commas)',
+    'DNS 来源只能是「仅运营商」「仅自定义」「两者合并」之一': 'The DNS source must be one of "ISP only", "Custom only", or "Both"',
+    'DNS 解析完成': 'DNS resolution finished',
+    'Docker 已重启，新配置已生效（当前状态：%s）': 'Docker has been restarted and the new configuration is in effect (current state: %s)',
+    'IP 地址格式不正确': 'Incorrect IP address format',
+    'IPv%s 的 MSS 数值不合法（576–9000）': 'The MSS value for IPv%s is invalid (576-9000)',
+    'IPv6 前缀格式不对。形如 2408:8207:1234:5678::/64。': 'Incorrect IPv6 prefix format, e.g. 2408:8207:1234:5678::/64.',
+    'LAN 网卡名不合法': 'Invalid LAN interface name',
+    'MAC 地址不合法：%s': 'Invalid MAC address: %s',
+    'MAC 地址格式不正确': 'Incorrect MAC address format',
+    'MTR 测试完成': 'MTR test finished',
+    'MTU 测试完成': 'MTU test finished',
+    'NAT 检测完成：%s': 'NAT detection finished: %s',
+    'NO_DOMAIN': 'NO_DOMAIN',
+    'NO_PUBLIC_IP': 'NO_PUBLIC_IP',
+    'OpenSOHO %s后没跑起来：%s': 'OpenSOHO did not come up after being %s: %s',
+    'OpenSOHO 尚未安装': 'OpenSOHO is not installed yet',
+    'OpenSOHO 尚未安装，请先安装再改设置': 'OpenSOHO is not installed yet; install it before changing settings',
+    'OpenSOHO 已%s': 'OpenSOHO has been %s',
+    'OpenSOHO 已安装但启动失败：%s': 'OpenSOHO is installed but failed to start: %s',
+    'OpenSOHO 已安装但没跑起来：%s': 'OpenSOHO is installed but is not running: %s',
+    'OpenSOHO 现在连不上（%s）。先把它启动起来再读取。': 'OpenSOHO is not reachable right now (%s). Start it before reading.',
+    'PPPoE %s 指令已执行': 'The PPPoE %s command has been executed',
+    'PPPoE 拨号必须填宽带密码': 'PPPoE dialing requires a broadband password',
+    'PPPoE 拨号必须填宽带账号': 'PPPoE dialing requires a broadband account',
+    'Ping 测试完成': 'Ping test finished',
+    'QoS 已停用，但状态回写失败：%s': 'QoS disabled, but writing back the status failed: %s',
+    'QoS 已关闭：CAKE / HTB 规则已全部移除，转发恢复默认': 'QoS is off: all CAKE / HTB rules were removed; forwarding is back to the default',
+    'QoS 已启用：%s。CAKE 已在 WAN 与 %s 上接管排队。': 'QoS enabled: %s. CAKE now handles queueing on the WAN and %s.',
+    'QoS 已应用，但状态回写失败：%s': 'QoS applied, but writing back the status failed: %s',
+    'QoS 规则加载校验未通过：%s': 'QoS rule load validation failed: %s',
+    'QoS 规则语法检查未通过：%s': 'QoS rule syntax check failed: %s',
+    'QoS 配置已保存并生成规则（尚未生效，需点击「启用」）': 'QoS configuration saved and rules generated (not yet in effect; click "Enable")',
+    'RDNSS（%s）不是合法的 IPv6 地址': 'RDNSS (%s) is not a valid IPv6 address',
+    'SNMP 团体名不能为空、不能含空格或 # 号，且不超过 64 个字符': 'The SNMP community name must not be empty, must not contain spaces or "#", and must be at most 64 characters',
+    'SNMP 监听地址不合法（填 IP 或留空表示监听全部地址）': 'Invalid SNMP listen address (enter an IP, or leave empty to listen on all addresses)',
+    'SNMP 端口取值不合法': 'Invalid SNMP port value',
+    'UPnP 映射表已读取': 'UPnP mapping table loaded',
+    'VLAN %s 的静态地址格式应为 192.168.1.2/24': 'The static address for VLAN %s should be in the form 192.168.1.2/24',
+    'VLAN ID 必须在 1-4094 之间（收到 %s）': 'The VLAN ID must be between 1 and 4094 (received %s)',
+    'VLAN ID 必须是数字': 'VLAN ID must be a number',
+    'WAN 物理网卡 %s 不存在，请先在「WAN 口」里配置': 'WAN physical interface %s does not exist; configure it in "WAN Port" first',
+    'WAN 物理网卡名称不合法：%s': 'Invalid WAN physical interface name: %s',
+    'WAN 网卡 %s 不存在，请先在「WAN 口」里配置': 'WAN interface %s does not exist; configure it in "WAN Port" first',
+    'WAN 网卡名不合法': 'Invalid WAN interface name',
+    'Web 管理端口已改为 %s，请用新地址访问：https://<本机IP>:%s/': 'The web admin port is now %s; visit the new address: https://<this-host-IP>:%s/',
+    'Webhook 地址必须以 http:// 或 https:// 开头': 'The webhook URL must start with http:// or https://',
+    'WireGuard 内核模块未加载，且自动加载失败：%s。可点上方「一键修复」重试。': 'The WireGuard kernel module is not loaded and auto-loading failed: %s. You can click "One-click fix" above to retry.',
+    'WireGuard 已停止': 'WireGuard stopped',
+    'WireGuard 已启动，监听 UDP %s': 'WireGuard started, listening on UDP %s',
+    'WireGuard 环境正常（模块已加载、工具已安装、开机自动加载已配置）': 'WireGuard environment is ready (module loaded, tools installed, auto-load on boot configured)',
+    'WireGuard 环境正常，但写 %s 失败：%s': 'The WireGuard environment is ready, but writing %s failed: %s',
+    'WireGuard 环境正常，已补上开机自动加载配置': 'WireGuard environment is ready; the boot auto-load configuration has been added',
+    'WireGuard 配置与全部客户端已删除': 'WireGuard configuration and all clients deleted',
+    'compose %s 失败：%s': 'compose %s failed: %s',
+    'compose 内容不能为空': 'The compose content must not be empty',
+    'iperf3 吞吐测试完成': 'iperf3 throughput test finished',
+    'iperf3 服务端已启动（一次性）': 'iperf3 server started (one-shot)',
+    'landscape-router 已停止（文件保留，可恢复）': 'landscape-router stopped (files kept and can be restored)',
+    'landscape-router 已彻底删除，备份保留在：%s': 'landscape-router has been completely removed; the backup is kept at: %s',
+    'miniupnpd 未安装，请先在「依赖自检」页安装': 'miniupnpd is not installed; install it from the "Dependency Check" page first',
+    'nftables 规则未生效，请查看下方日志': 'The nftables rules did not take effect; see the log below',
+    '「%s」必须大于 0': '"%s" must be greater than 0',
+    '「%s」必须是正整数': '"%s" must be a positive integer',
+    '上传数据解码失败': 'Failed to decode uploaded data',
+    '上次 NAT 检测结果': 'Last NAT detection result',
+    '下发给客户端的 DNS（%s）不是合法地址': 'The DNS pushed to clients (%s) is not a valid address',
+    '下载失败：%s': 'Download failed: %s',
+    '不允许操作的服务：%s': 'Service not allowed: %s',
+    '不允许的操作：%s': 'Operation not allowed: %s',
+    '不支持以 %s 身份开启终端（可选：root / ajeef / drouter）': 'Cannot open a terminal as %s (options: root / ajeef / drouter)',
+    '不支持的 %s': 'Unsupported %s',
+    '不支持的 AC/AP 操作：%s': 'Unsupported AC/AP action: %s',
+    '不支持的 CAKE 模式：%s': 'Unsupported CAKE mode: %s',
+    '不支持的 CPU 架构（OpenSOHO 只发布 amd64 与 arm64）': 'Unsupported CPU architecture (OpenSOHO publishes amd64 and arm64 only)',
+    '不支持的 Docker 操作：%s': 'Unsupported Docker action: %s',
+    '不支持的优先级预设：%s': 'Unsupported priority preset: %s',
+    '不支持的包管理操作：%s': 'Unsupported package management action: %s',
+    '不支持的多拨策略：%s': 'Unsupported multi-dial strategy: %s',
+    '不支持的引擎配置操作：%s': 'Unsupported engine configuration action: %s',
+    '不支持的打印服务操作：%s': 'Unsupported print service action: %s',
+    '不支持的拨号操作': 'Unsupported dial action',
+    '不支持的操作：%s': 'Unsupported action: %s',
+    '不支持的文件系统：%s': 'Unsupported file system: %s',
+    '不支持的日志操作：%s': 'Unsupported log action: %s',
+    '不支持的服务操作：%s': 'Unsupported service action: %s',
+    '不支持的测试类型：%s': 'Unsupported test type: %s',
+    '不支持的清理类型：%s': 'Unsupported cleanup type: %s',
+    '不支持的用户操作：%s': 'Unsupported user action: %s',
+    '不支持的电源操作：%s': 'Unsupported power action: %s',
+    '不支持的证书操作：%s': 'Unsupported certificate action: %s',
+    '不支持的诊断工具：%s': 'Unsupported diagnostic tool: %s',
+    '不支持的队列操作：%s': 'Unsupported queue action: %s',
+    '不是目录：%s': 'Not a directory: %s',
+    '主机名不合法': 'Invalid hostname',
+    '主题 id 不合法（只能是小写字母、数字与 -）': 'Invalid theme id (only lowercase letters, digits and "-" are allowed)',
+    '主题「%s」已保存（尚未应用）': 'Theme "%s" saved (not applied yet)',
+    '主题「%s」已删除': 'Theme "%s" deleted',
+    '主题「%s」已损坏，拒绝应用：%s': 'Theme "%s" is corrupted; applying it has been refused: %s',
+    '主题「%s」校验未通过，已拒绝应用：%s': 'Theme "%s" failed validation; applying it has been refused: %s',
+    '主题不存在：%s': 'Theme does not exist: %s',
+    '主题包「%s」导入成功，可在列表中点击「应用」': 'Theme package "%s" imported; click "Apply" in the list',
+    '主题包已生成（%s KB）': 'Theme package generated (%s KB)',
+    '主题校验通过：%s 个变量，%s模式': 'Theme validation passed: %s variables, %s mode',
+    '互联网测速失败：%s': 'Internet speed test failed: %s',
+    '互联网测速完成：约 %s Mbps': 'Internet speed test finished: about %s Mbps',
+    '任务 %s 已取消': 'Job %s cancelled',
+    '任务号不合法（格式：队列名-任务号）': 'Invalid job number (format: queue-job)',
+    '会话 #%s %s 失败：%s': 'Session #%s failed to %s: %s',
+    '会话 #%s 不存在': 'Session #%s does not exist',
+    '会话 #%s 已%s': 'Session #%s has been %s',
+    '会话序号不合法': 'Invalid session index',
+    '会话数量最多 8 条（更多会话不会带来收益，反而增加运营商封禁风险）': 'At most 8 sessions (more sessions bring no benefit and increase the risk of ISP blocking)',
+    '体检完成': 'Health check finished',
+    '修复完成：%s': 'Fix finished: %s',
+    '修复未完全成功（当前：%s）。%s': 'The fix did not fully succeed (current: %s). %s',
+    '修改密码失败：%s': 'Failed to change the password: %s',
+    '停止失败：%s': 'Failed to stop: %s',
+    '允许全部流量经过本机需要显式确认': 'Allowing all traffic through this host requires explicit confirmation',
+    '允许全部流量经过本机（Exit Node）会把家里的所有上网流量都从家里出去，请勾选确认后重试': 'Allowing all traffic through this host (Exit Node) sends all household traffic out through this host; tick the confirmation and retry',
+    '入向实测启动失败：既没有可用的 tcpdump，也开不了临时监听端口': 'Inbound test could not start: no usable tcpdump, and the temporary listen port could not be opened',
+    '全部通道推送失败：%s': 'All channels failed to push: %s',
+    '公钥已删除': 'Public key deleted',
+    '公钥格式不正确。请上传 .pub 公钥文件内容（以 ssh-rsa / ssh-ed25519 等开头）。注意：私钥（如 -----BEGIN OPENSSH PRIVATE KEY-----）不应上传到服务器。': 'Incorrect public key format. Upload the contents of a .pub public key file (starting with ssh-rsa / ssh-ed25519, etc.). Note that private keys (e.g. -----BEGIN OPENSSH PRIVATE KEY-----) should not be uploaded to the server.',
+    '共享密钥已重新生成。已注册的 AP 需要用新密钥重新注册一次。': 'The shared secret has been regenerated. Registered APs must re-register with the new secret.',
+    '关闭构建保护模式需要显式确认（confirm=true）': 'Turning off build protection mode requires explicit confirmation (confirm=true)',
+    '内容包含非法字符（NUL）': 'Content contains an illegal character (NUL)',
+    '内容里没有找到 services 段，请确认这是合法的 compose 文件': 'No "services" section found in the content; make sure this is a valid compose file',
+    '内核模块已就绪，但安装 wireguard-tools 失败：%s': 'The kernel module is ready, but installing wireguard-tools failed: %s',
+    '内核模块未加载，需要先安装 wireguard-tools': 'The kernel module is not loaded; wireguard-tools must be installed first',
+    '内置主题「%s」不可覆盖，请另存为新主题': 'The built-in theme "%s" cannot be overwritten; save it as a new theme instead',
+    '内置主题不可删除': 'Built-in themes cannot be deleted',
+    '内置默认主题缺失': 'The built-in default theme is missing',
+    '写入 %s 失败：%s': 'Failed to write %s: %s',
+    '写入 /etc/fstab 失败：%s': 'Failed to write /etc/fstab: %s',
+    '写入失败：%s': 'Failed to write: %s',
+    '写入快照保护状态失败：%s': 'Failed to write the snapshot protection state: %s',
+    '写入快照备注失败：%s': 'Failed to write the snapshot note: %s',
+    '写入租约文件失败：%s': 'Failed to write the lease file: %s',
+    '准备下载文件失败：%s': 'Failed to prepare the download file: %s',
+    '准备数据目录失败：%s': 'Failed to prepare the data directory: %s',
+    '创建下行整形设备 %s 失败：%s': 'Failed to create the downlink shaping device %s: %s',
+    '创建下载目录失败：%s': 'Failed to create the download directory: %s',
+    '创建备份目录失败：%s': 'Failed to create the backup directory: %s',
+    '创建失败：%s': 'Creation failed: %s',
+    '创建挂载点失败：%s': 'Failed to create the mount point: %s',
+    '创建用户失败：%s': 'Failed to create the user: %s',
+    '创建目录失败：%s': 'Failed to create the directory: %s',
+    '删除备份包失败：%s': 'Failed to delete the backup package: %s',
+    '删除失败：%s': 'Deletion failed: %s',
+    '删除操作需要显式确认': 'Deleting requires explicit confirmation',
+    '删除用户失败：%s': 'Failed to delete the user: %s',
+    '删除队列失败：%s': 'Failed to delete the queue: %s',
+    '加载 wireguard 内核模块失败：%s': 'Failed to load the wireguard kernel module: %s',
+    '加载加速规则失败：%s': 'Failed to load the acceleration rules: %s',
+    '加速规则语法检查未通过：%s': 'Acceleration rule syntax check failed: %s',
+    '升级失败：%s': 'Upgrade failed: %s',
+    '单文件超过 256MB，请使用 SFTP/SCP': 'Single file exceeds 256 MB, please use SFTP/SCP',
+    '单次输入过长': 'Input is too long',
+    '卸载失败：%s': 'Failed to unmount: %s',
+    '卸载失败：%s。可能仍有进程在访问该目录，可用 <span class="mono">lsof +D 挂载点</span> 或 <span class="mono">fuser -m 挂载点</span> 查占用。': 'Failed to unmount: %s. Some process may still be using that directory; check with <span class="mono">lsof +D &lt;mountpoint&gt;</span> or <span class="mono">fuser -m &lt;mountpoint&gt;</span>.',
+    '参数 %s 取值不合法': 'Invalid value for parameter %s',
+    '参数不是合法 JSON': 'Parameters are not valid JSON',
+    '取消任务失败：%s': 'Failed to cancel the job: %s',
+    '受保护的系统账号，禁止删除：%s（UID %d）': 'Protected system account, deletion is forbidden: %s (UID %d)',
+    '只支持 http / https 地址，当前是 %s': 'Only http / https addresses are supported; this one is %s',
+    '只有服务器证书能部署给管理后台（当前是%s）': 'Only server certificates can be deployed to the admin panel (currently %s)',
+    '同名文件或目录已存在': 'A file or directory with the same name already exists',
+    '名字不合法': 'Invalid name',
+    '名称非法': 'Invalid name',
+    '启用 QoS 会改变流量转发行为，请勾选确认后再执行': 'Enabling QoS changes traffic forwarding behaviour; tick the confirmation before proceeding',
+    '告警历史与冷却状态已清空': 'Alert history and cooldown state cleared',
+    '告警未启用，本次只做探测不做推送': 'Alerts are disabled; this run only probes and does not push',
+    '告警设置已保存': 'Alert settings saved',
+    '回收租约需要正确的 MAC 地址（aa:bb:cc:dd:ee:ff）': 'Reclaiming the lease requires a valid MAC address (aa:bb:cc:dd:ee:ff)',
+    '地址格式不正确': 'Incorrect address format',
+    '地址池已用尽，请扩大地址池或先删除不用的客户端': 'The address pool is exhausted; enlarge the pool or remove unused clients first',
+    '地址池（%s–%s）和本机 LAN 地址（%s）不在同一个网段。地址池前三段必须和本机一致。': "The address pool (%s-%s) and this host's LAN address (%s) are not in the same subnet. The first three octets of the pool must match the host.",
+    '地址池（%s–%s）把本机自己的地址（%s）也包括进去了，这样会自己和自己抢 IP。请把池子的起点往后挪，比如从 %s.100 开始。': "The address pool (%s-%s) also contains this host's own address (%s), so the host would compete with itself for an IP. Move the start of the pool later, for example to %s.100.",
+    '地址获取方式不合法：%s': 'Invalid address acquisition method: %s',
+    '域名不能包含逗号、等号、分号，长度不超过 64 个字符': 'The domain name must not contain commas, equals signs or semicolons, and must be at most 64 characters',
+    '备份 %s 不存在': 'Backup %s does not exist',
+    '备份包不存在': 'Backup package does not exist',
+    '备份包内容已校验': 'Backup package contents verified',
+    '备份包名不合法': 'Invalid backup package name',
+    '备份包已准备下载': 'Backup package ready for download',
+    '备份包已删除': 'Backup package deleted',
+    '备份包格式版本 %s 高于本机支持的 %s，请先升级 drouter': 'Backup package format version %s is newer than the supported %s; please upgrade drouter first',
+    '备份包清单异常巨大，已拒绝解析': 'The backup manifest is implausibly large; parsing has been refused',
+    '备份包清单格式不正确': 'Incorrect backup manifest format',
+    '备份包清单解析失败：%s': 'Failed to parse the backup manifest: %s',
+    '备份包解出后超过上限（%s 个文件 / %s MB），疑似异常包已拒绝': 'The backup package exceeds the limit after extraction (%s files / %s MB); it looks abnormal and has been refused',
+    '备份文件名不合法': 'Invalid backup file name',
+    '备份设置已保存': 'Backup settings saved',
+    '存在重复的 VLAN 接口：%s': 'Duplicate VLAN interface: %s',
+    '安全关机指令已下发': 'Safe shutdown command has been issued',
+    '安全确认未通过：请手动输入设备名 %s 以确认格式化。': 'Safety confirmation failed: please type the device name %s to confirm formatting.',
+    '安全重启指令已下发，系统将在数秒内重启': 'Safe reboot command has been issued; the system will reboot in a few seconds',
+    '安装失败：%s': 'Installation failed: %s',
+    '安装完成：%s 项已就绪%s': 'Installation finished: %s item(s) ready%s',
+    '安装超时（超过 15 分钟）。请检查网络或换用镜像源后重试。': 'Installation timed out (over 15 minutes). Check the network or try a different mirror.',
+    '安装过程返回错误码 %s，部分依赖可能未装成功。%s': 'The installation returned error code %s, so some dependencies may not have installed. %s',
+    '客户端「%s」已删除': 'Client "%s" deleted',
+    '客户端不存在': 'Client does not exist',
+    '客户端不存在：%s': 'Client does not exist: %s',
+    '客户端已%s': 'The client has been %s',
+    '客户端已创建，私钥与配置文件只显示这一次，请立即下载保存': 'Client created. The private key and config file are shown only once; download and save them now',
+    '容器 %s %s': 'Container %s %s',
+    '容器 ID / 名称不合法': 'Invalid container ID or name',
+    '宽带账号不能包含空格或 , = # " \' \\ 这些字符': 'The broadband account must not contain spaces or the characters , = # " \' \\',
+    '密码长度至少 6 位': 'The password must be at least 6 characters',
+    '对方拒绝：%s': 'The peer refused: %s',
+    '对方返回 HTTP %s：%s': 'The peer returned HTTP %s: %s',
+    '导入类型必须是 ca 或 server': 'The import type must be ca or server',
+    '导出备份包失败：%s': 'Failed to export the backup package: %s',
+    '导出失败：%s': 'Export failed: %s',
+    '尚未保存任何拨号会话，请先保存配置': 'No dial session has been saved yet, please save the configuration first',
+    '尚未配置 WAN 网卡，请先保存 QoS 配置': 'The WAN interface is not configured yet, please save the QoS configuration first',
+    '已上传 %s': 'Uploaded %s',
+    '已从 %s 还原并重启 CUPS': 'Restored from %s and restarted CUPS',
+    '已从 %s 还原（当前文件也另存了一份备份）': 'Restored from %s (the current file was also backed up separately)',
+    '已从租约文件删除 %s 的记录，但本机没有 dhcp_release 工具 —— dnsmasq 内存里的租约还在，客户端续租时可能拿回同一个地址。要彻底回收请安装 dnsmasq-utils 或重启 dnsmasq。': "The record for %s has been removed from the lease file, but this host has no dhcp_release tool - the lease is still in dnsmasq's memory, so the client may get the same address again when it renews. To reclaim it fully, install dnsmasq-utils or restart dnsmasq.",
+    '已保存 %s 个 VLAN': 'Saved %s VLAN(s)',
+    '已保存 %s 个会话（尚未连接，需点击「应用并连接」）': 'Saved %s session(s) (not connected yet; click "Apply and connect")',
+    '已保存 %s 台唤醒设备': 'Saved %s wake-on-lan device(s)',
+    '已关闭构建保护模式。此后「应用」操作将真正生效。': 'Build protection mode is now off. "Apply" actions will now take effect for real.',
+    '已列出可用的 Endpoint 候选': 'Available endpoint candidates listed',
+    '已列出备份包': 'Backup packages listed',
+    '已创建目录 %s': 'Directory %s created',
+    '已创建配置快照：%s%s': 'Configuration snapshot created: %s%s',
+    '已删除 VLAN 接口 %s': 'VLAN interface %s deleted',
+    '已删除「%s」': 'Deleted "%s"',
+    '已删除快照 %s': 'Snapshot %s deleted',
+    '已加入开机自动挂载：%s → %s（已加 nofail，拔盘不会卡开机）': 'Added to the boot auto-mount list: %s → %s (nofail added, so removing the drive will not block boot)',
+    '已卸载 /dev/%s': '/dev/%s unmounted',
+    '已向 %s 发送唤醒魔术包（广播地址：%s）': 'A wake-on-lan magic packet was sent to %s (broadcast address: %s)',
+    '已回收 %s：dnsmasq 已从租约表删除该地址（客户端需重新获取）': 'Reclaimed %s: dnsmasq has removed that address from the lease table (the client must obtain a new one)',
+    '已导入%s「%s」%s': 'Imported %s "%s"%s',
+    '已导出 %s 条记录（CSV）': 'Exported %s records (CSV)',
+    '已导出 %s 条记录（JSONL）': 'Exported %s records (JSONL)',
+    '已应用主题「%s」，刷新页面即可看到效果': 'Theme "%s" applied; refresh the page to see it',
+    '已建立 dhcp-release 兜底：%s': 'A dhcp-release fallback has been set up: %s',
+    '已建立连接将走快速转发路径': 'Established connections take the fast forwarding path',
+    '已开启构建保护模式。所有「应用」操作只会写盘，不会生效。': 'Build protection mode is now on. All "apply" actions only write to disk and do not take effect.',
+    '已归档 %s 条日志': 'Archived %s log entries',
+    '已恢复为默认主题「Drouter 经典蓝」': 'Restored to the default theme "Drouter Classic Blue"',
+    '已打包 %s 个文件': 'Packaged %s files',
+    '已执行清理：%s': 'Cleanup performed: %s',
+    '已把 %s 转为静态绑定（%s）': '%s has been converted to a static binding (%s)',
+    '已把 /dev/%s 挂载到 %s': '/dev/%s mounted at %s',
+    '已把 /dev/%s 格式化为 %s。注意：原数据已全部清除且不可恢复。': '/dev/%s formatted as %s. Note that all previous data has been erased and cannot be recovered.',
+    '已按主色 %s 生成%s配色': 'Generated a %s colour scheme from the primary colour %s',
+    '已断开全部多拨会话，出网恢复为单一默认路由': 'All multi-dial sessions disconnected; routing is back to a single default route',
+    '已清理 %s 个备份包': 'Cleaned up %s backup packages',
+    '已清理 %s 份过期快照': 'Cleaned up %s expired snapshots',
+    '已清理 %s 条超期记录（保留 %s 条）': 'Cleaned up %s expired records (%s kept)',
+    '已生成 %s 方式的操作步骤（可复制到 Web 终端执行）': 'Generated %s-mode operation steps (you can copy them into the web terminal)',
+    '已生成一个新的私有 IPv6 段': 'A new private IPv6 prefix has been generated',
+    '已生成迁移预览（未写入磁盘，未停 NetworkManager）': 'Migration preview generated (nothing written to disk, NetworkManager not stopped)',
+    '已生效。Web 服务刚刚重启，请重新登录；新证书剩余 %s 天。': 'In effect. The web service has just restarted; please sign in again. The new certificate has %s days left.',
+    '已禁止 landscape-router 开机自启（服务仍在运行）': 'landscape-router has been disabled from starting on boot (the service is still running)',
+    '已移入回收站 %s 项%s': 'Moved %s items to the trash%s',
+    '已移除该设备的开机自动挂载': 'The auto-mount-on-boot entry for this device has been removed',
+    '已立即执行一次自动快照：%s': 'An automatic snapshot was just taken: %s',
+    '已聚合 %s 个统计桶（%s MB）': 'Aggregated %s statistics buckets (%s MB)',
+    '已读取': 'Loaded',
+    '已读取 Docker 引擎配置': 'Docker engine configuration loaded',
+    '已读取 VPN 状态': 'VPN status loaded',
+    '已读取会话 #%s 的日志': 'Log of session #%s loaded',
+    '已读取内核与转发状态': 'Kernel and forwarding status loaded',
+    '已读取告警历史': 'Alert history loaded',
+    '已读取告警设置': 'Alert settings loaded',
+    '已读取备份状态': 'Backup status loaded',
+    '已读取打印服务状态': 'Print service status loaded',
+    '已读取用量统计设置': 'Usage statistics settings loaded',
+    '已迁移到 systemd-networkd 并重启网络服务；如失联请在 PVE 控制台执行回滚：%s': 'Migrated to systemd-networkd and restarted the network service; if you lose access, run this rollback in the PVE console: %s',
+    '已还原 %s 个文件，请到相关页面确认后点一次「保存并应用」': 'Restored %s files; confirm on the relevant pages and click "Save and Apply" once',
+    '已送达 %s 个通道': 'Delivered to %s channel(s)',
+    '已重命名': 'Renamed',
+    '带宽必须是数字（单位 Mbit/s）': 'Bandwidth must be a number (in Mbit/s)',
+    '广播地址不合法：%s': 'Invalid broadcast address: %s',
+    '应用 QoS 规则失败：%s': 'Failed to apply the QoS rules: %s',
+    '应用多拨会改变出网路由，请勾选确认后再执行': 'Applying multi-dial changes the egress routing; tick the confirmation before proceeding',
+    '强制重启失败：%s': 'Forced reboot failed: %s',
+    '强制重启已触发': 'Forced reboot triggered',
+    '当前 %s 个打印任务': '%s print job(s) currently',
+    '当前内核未提供 nftables flowtable 支持，无法开启软加速。请确认内核版本 ≥ 4.16 且已加载 nf_flow_table 模块。': 'The current kernel does not provide nftables flowtable support, so software acceleration cannot be enabled. Make sure the kernel is >= 4.16 and the nf_flow_table module is loaded.',
+    '当前处于【构建保护模式】，已拒绝重启 Docker': 'Currently in [build protection mode]; restarting Docker has been refused',
+    '当前处于【构建保护模式】，已阻止「回滚并生效」。如需在保护模式下还原配置，请先关闭保护模式，或改用不重启服务的回滚（不带 reload 参数）。': 'Currently in [build protection mode]; "roll back and apply" has been blocked. To restore the configuration under protection, first turn protection off, or use the rollback that does not restart services (without the reload parameter).',
+    '当前处于【构建保护模式】，已阻止启动 %s。该服务会占用 53/67 端口或改变网络，可能影响现有局域网。': 'Currently in [build protection mode]; starting %s has been blocked. The service would occupy ports 53/67 or change the network, which may affect the running LAN.',
+    '当前处于【构建保护模式】，已阻止启动 OpenSOHO。它需要监听端口对外提供服务，请在「系统设置 → 构建保护模式」中关闭保护后再试。': 'Currently in [build protection mode]; starting OpenSOHO has been blocked. It needs to listen on a port to serve traffic, so turn protection off in "System Settings → Build Protection Mode" first.',
+    '当前处于【构建保护模式】，已阻止网络切换类操作。': 'Currently in [build protection mode]; network switching operations have been blocked.',
+    '当前处于【构建保护模式】，已阻止自动升级（可在关闭保护后手动升级）。': 'Currently in [build protection mode]; automatic upgrade has been blocked (you can upgrade manually after turning protection off).',
+    '当前处于【构建保护模式】，已阻止配置生效。此模式用于确保构建过程不影响正在运行的局域网。如确需让配置生效，请先在「系统设置 → 构建保护模式」中关闭保护。': 'Currently in [build protection mode]; applying the configuration has been blocked. This mode keeps the running LAN unaffected while building. To apply the configuration, first turn protection off in "System Settings → Build Protection Mode".',
+    '当前处于【构建保护模式】，已阻止重启/关机。': 'Currently in [build protection mode]; restart/shutdown has been blocked.',
+    '待安装的软件包在当前 apt 源里都找不到：%s。请先执行 apt-get update，或换用国内镜像源后重试。': 'None of the packages to install were found in the current apt sources: %s. Run apt-get update first, or switch to a mirror in China and retry.',
+    '快照不存在：%s': 'Snapshot does not exist: %s',
+    '快照已打包（%s KB）': 'Snapshot packaged (%s KB)',
+    '快照标识格式不正确': 'Incorrect snapshot identifier format',
+    '快照目录不存在，无需清理': 'The snapshot directory does not exist, nothing to clean',
+    '快照编号不合法：%s': 'Invalid snapshot number: %s',
+    '快照编号格式不正确': 'Incorrect snapshot number format',
+    '快照路径不可用：%s': 'Snapshot path is not usable: %s',
+    '快照路径只允许位于 %s 之下，避免误写系统关键目录': 'The snapshot path is only allowed under %s, to avoid writing into critical system directories',
+    '快照路径必须是绝对路径，例如 /opt/drouter/snapshots': 'The snapshot path must be absolute, e.g. /opt/drouter/snapshots',
+    '打包失败': 'Packaging failed',
+    '打包失败：%s': 'Packaging failed: %s',
+    '打包快照失败：%s': 'Failed to package the snapshot: %s',
+    '打开备份包失败（文件可能已损坏）：%s': 'Failed to open the backup package (the file may be corrupted): %s',
+    '扫描完成': 'Scan finished',
+    '找不到设备：%s': 'Device not found: %s',
+    '找不到这条记录': 'Record not found',
+    '找不到这条证书记录': 'Certificate record not found',
+    '抓包完成（最多 %s 个包）': 'Packet capture finished (up to %s packets)',
+    '拒绝格式化：/dev/%s 属于系统盘（承载 %s），格式化会导致系统无法启动。': 'Formatting refused: /dev/%s is the system disk (holding %s); formatting it would make the system unbootable.',
+    '拒绝格式化：/dev/%s 当前挂载在 %s，请先卸载。': 'Formatting refused: /dev/%s is currently mounted at %s; unmount it first.',
+    '拒绝格式化：/dev/%s 是整块盘且已含 %s 个分区（%s）。请改为格式化其中的具体分区，以免误删整盘数据。': 'Formatting refused: /dev/%s is a whole disk already containing %s partitions (%s). Format a specific partition instead, to avoid erasing the whole disk.',
+    '拒绝重命名系统关键目录': 'Renaming a critical system directory is refused',
+    '拨号会短暂中断现有网络，需要显式确认': 'Dialing will briefly interrupt the current network; explicit confirmation required',
+    '拨号动作只能是 connect 或 disconnect': 'The dial action must be connect or disconnect',
+    '拿不到出口 IPv4 地址，无法做入向实测': 'Cannot obtain the egress IPv4 address, so the inbound test cannot run',
+    '挂载失败：%s': 'Mount failed: %s',
+    '挂载点不合法：%s': 'Invalid mount point: %s',
+    '按 IP 限速最多 64 条': 'At most 64 per-IP rate limit rules',
+    '换上后 %s 端口没能握手成功（%s），已自动还原原来的证书。原来的证书仍在，页面不受影响。': 'After switching, the TLS handshake on port %s did not succeed (%s), so the original certificate was automatically restored. The original certificate is still in place and the panel is unaffected.',
+    '接口名不合法：%s（应形如 ens19.85）': 'Invalid interface name: %s (expected a form like ens19.85)',
+    '推送成功': 'Push succeeded',
+    '推送请求失败：%s': 'The push request failed: %s',
+    '掩码长度必须是 1-32': 'Prefix length must be between 1 and 32',
+    '操作失败：%s': 'Operation failed: %s',
+    '操作成功': 'Operation succeeded',
+    '收件人地址格式不正确': 'Incorrect recipient address format',
+    '救援通道已关闭（虚拟地址已回收）': 'The rescue tunnel is closed (the virtual address was reclaimed)',
+    '救援通道已开启，可通过 http://%s:%s/ 访问（插任一口皆可）。请记下访问令牌 %s —— 页面上的还原操作需要它，同网段其它机器无法凭猜测还原你的配置': 'The rescue tunnel is open; visit http://%s:%s/ (any network port works). Note the access token %s - the restore action on the page needs it, and other machines on the same network cannot restore your configuration by guessing.',
+    '救援通道自检：虚拟口 %s，端口 %s %s': 'Rescue tunnel self-check: virtual interface %s, port %s %s',
+    '文件不存在或无法访问': 'File does not exist or is not accessible',
+    '文件不存在：%s': 'File does not exist: %s',
+    '文件内容不是合法的 Base64，可能上传中断，请重试': 'File content is not valid Base64; the upload may have been interrupted, please retry',
+    '文件名非法': 'Invalid file name',
+    '文件系统类型不合法：%s': 'Invalid file system type: %s',
+    '文件超过 20MB：Web 下载通道单条响应上限 32MB，请用 SFTP/SCP 传输，或先在文件管理里打包分卷': 'File exceeds 20 MB: the web download channel caps a single response at 32 MB, please transfer via SFTP/SCP, or split it into volumes in the file manager first',
+    '无法生成客户端密钥（wg 命令不可用）': 'Cannot generate a client key (the wg command is unavailable)',
+    '日志归档已清空': 'Log archive cleared',
+    '时间组「%s」%s': 'Time group "%s" %s',
+    '暂无安装日志': 'No installation log yet',
+    '暂无更新日志': 'No update log yet',
+    '暂时没有可用的镜像源，请先在「依赖自检」页配置': 'No mirror is currently available; configure one in the "Dependency Check" page first',
+    '更新完成：成功 %s 项，失败 %s 项（可使用前缀 %s）': 'Update finished: %s succeeded, %s failed (usable prefix: %s)',
+    '有通道发送失败，请检查下方明细': 'Some channels failed to send; check the details below',
+    '服务 %s %s 失败：%s': 'Service %s failed to %s: %s',
+    '服务 %s 已%s': 'Service %s has been %s',
+    '服务启动失败：%s': 'Failed to start the service: %s',
+    '服务器证书「%s」已签发（%s 天）。要去「部署给管理后台」才会真正生效。': 'Server certificate "%s" issued (%s days). It only takes effect after "Deploy to the admin panel".',
+    '服务端密钥尚未生成，请先点「应用」': 'The server key has not been generated yet; click "Apply" first',
+    '未填写 SMTP 服务器地址': 'The SMTP server address is not filled in',
+    '未找到 docker compose（v2）或 docker-compose（v1），请先安装': 'Neither docker compose (v2) nor docker-compose (v1) was found; please install it first',
+    '未找到备份，已取消删除（请先备份 /root/.landscape-router）': 'No backup found, deletion cancelled (back up /root/.landscape-router first)',
+    '未指定要预览的模块': 'No module was specified for preview',
+    '未知主题操作：%s': 'Unknown theme action: %s',
+    '未知操作：%s': 'Unknown action: %s',
+    '未知文件操作：%s': 'Unknown file action: %s',
+    '未知的 VPN 操作：%s': 'Unknown VPN action: %s',
+    '未知的共享类型：%s': 'Unknown share type: %s',
+    '未知的内核选项操作：%s': 'Unknown kernel option action: %s',
+    '未知的向导步骤：%s（只能是 wan / lan / dns / v6）': 'Unknown wizard step: %s (only wan / lan / dns / v6 are allowed)',
+    '未知的告警操作：%s': 'Unknown alert action: %s',
+    '未知的备份操作：%s': 'Unknown backup action: %s',
+    '未知的新手向导操作：%s': 'Unknown wizard action: %s',
+    '未知的模块：%s': 'Unknown module: %s',
+    '未知的清理操作：%s': 'Unknown cleanup action: %s',
+    '未知的通知通道类型：%s': 'Unknown notification channel type: %s',
+    '未知的配额操作：%s': 'Unknown quota action: %s',
+    '未知的镜像源：%s': 'Unknown mirror: %s',
+    '未知终端操作：%s': 'Unknown terminal action: %s',
+    '未知阶段：%s': 'Unknown stage: %s',
+    '未选择任何文件': 'No file was selected',
+    '本机内核 %s 里没有 wireguard 模块，无法通过安装修复。': 'This kernel (%s) has no wireguard module, so installing packages cannot fix it.',
+    '本机内核 %s 里没有 wireguard 模块，无法通过安装修复。精简容器镜像和自编内核会裁掉它；Debian 官方内核与 PVE/KVM 虚拟机都自带。': 'This kernel (%s) has no wireguard module, so installing packages cannot fix it. Minimal container images and custom kernels strip it out; Debian official kernels and PVE/KVM virtual machines ship with it.',
+    '本机内核里没有 WireGuard 模块（内核 %s），无法启动。': 'This kernel has no WireGuard module (kernel %s), so it cannot be started.',
+    '本机找不到 wireguard 模块文件（%s）': 'No wireguard module file found on this host (%s)',
+    '本机找不到文件：%s': 'File not found on this host: %s',
+    '本次新增 %s 条日志，其中没有可统计的流量': '%s new log entries this round, none of which contain countable traffic',
+    '构建保护模式已开启，禁止执行下载/构建类动作。': 'Build protection mode is on; download/build actions are forbidden.',
+    '构建保护模式已开启，禁止执行会改变网络的动作（含拨号）。请在页面顶部关闭保护模式后重试。': 'Build protection mode is on; actions that change the network (including dialing) are forbidden. Turn protection off at the top of the page and retry.',
+    '构建保护模式已开启，禁止执行会改变网络行为的动作。': 'Build protection mode is on; actions that change network behaviour are forbidden.',
+    '查看详情失败：%s': 'Failed to load details: %s',
+    '格式化失败：%s': 'Formatting failed: %s',
+    '检测到「软加速（flowtable）」正在运行，它会绕过 netfilter 导致 DSCP 打标与 IP 限速失效。请先到「网络状态 / 加速」页关闭软加速，或勾选「我了解冲突，仍然继续」。': '"Software acceleration (flowtable)" is running; it bypasses netfilter, which breaks DSCP marking and per-IP rate limiting. Turn it off in "Network Status / Acceleration" first, or tick "I understand the conflict, continue anyway".',
+    '检测完成：%s 条告警已推送，%s 条被跳过': 'Detection finished: %s alerts pushed, %s skipped',
+    '没有启用任何通知通道': 'No notification channel is enabled',
+    '没有启用任何通知通道，请先添加并启用通道': 'No notification channel is enabled; add and enable a channel first',
+    '没有指定要升级的软件包': 'No package was specified for upgrade',
+    '没有提供公钥内容': 'No public key content provided',
+    '没有收到文件内容，请重新选择主题包': 'No file content received; please select the theme package again',
+    '没有新的流量记录需要聚合': 'There are no new traffic records to aggregate',
+    '没有权限读取该目录': 'No permission to read this directory',
+    '没有选择任何文件': 'No file was selected',
+    '没有需要安装的项目': 'There are no packages to install',
+    '测试消息已发送到 %s 个通道': 'Test message sent to %s channel(s)',
+    '测试页发送失败：%s': 'Failed to send the test page: %s',
+    '测试页已发送到 %s（%s）': 'Test page sent to %s (%s)',
+    '测速完成（200 / 401 都表示链路可用）': 'Speed test finished (both 200 and 401 mean the link is up)',
+    '添加队列失败：%s': 'Failed to add the queue: %s',
+    '清理失败：%s': 'Cleanup failed: %s',
+    '清理策略已保存：%s，触发方式「%s」': 'Cleanup policy saved: %s, triggered by "%s"',
+    '清理项 %s 的保留天数不合法': 'The retention period for cleanup item %s is invalid',
+    '清空历史失败：%s': 'Failed to clear the history: %s',
+    '清空失败：%s': 'Clearing failed: %s',
+    '清空统计失败：%s': 'Failed to clear the statistics: %s',
+    '渲染失败：%s': 'Rendering failed: %s',
+    '父网卡名称不合法：%s': 'Invalid parent interface name: %s',
+    '用户 %s 密码已更新': 'Password for user %s updated',
+    '用户 %s 已%s': 'User %s has been %s',
+    '用户 %s 已存在': 'User %s already exists',
+    '用户不存在：%s': 'User does not exist: %s',
+    '用户名不合法（只允许小写字母、数字、下划线、连字符）': 'Invalid username (only lowercase letters, digits, underscores and hyphens are allowed)',
+    '用户已创建但设置密码失败：%s': 'The user was created but the password could not be set: %s',
+    '用量统计已清空，将从下一轮聚合重新开始': 'Usage statistics cleared; aggregation restarts from the next round',
+    '用量统计设置已保存': 'Usage statistics settings saved',
+    '登录失败：%s（请确认用的是授权码而不是登录密码）': 'Login failed: %s (make sure you are using the authorization code, not the login password)',
+    '目录名非法': 'Invalid directory name',
+    '目录已创建': 'Directory created',
+    '目录已存在：%s': 'Directory already exists: %s',
+    '目标已存在：%s': 'The target already exists: %s',
+    '目标是目录': 'Target is a directory',
+    '目标是目录，无法读取内容': 'Target is a directory, cannot read its content',
+    '目标目录不存在：%s': 'The target directory does not exist: %s',
+    '磁盘 %s%%（阈值 %s%%），未到执行时间 —— 本次跳过': 'Disk usage %s%% (threshold %s%%), not yet due - skipped this time',
+    '私钥生成失败：%s': 'Failed to generate the private key: %s',
+    '端口 %s 已经被系统上的服务占用（%s），请换一个': 'Port %s is already taken by a service on this system (%s); choose another',
+    '端口 %s 已被 %s 占用，请换一个': 'Port %s is already in use by %s; choose another',
+    '端口 %s 已被系统服务占用，请换一个（推荐 8888）': 'Port %s is already used by a system service; choose another (8888 is recommended)',
+    '端口取值不合法（1–65535）': 'Invalid port value (1-65535)',
+    '端口已保存为 %s，但服务重启失败，请稍后手动重启 drouter-web': 'The port was saved as %s, but the service failed to restart; please restart drouter-web manually later',
+    '端口必须在 %s-%s 之间': 'The port must be between %s and %s',
+    '端口必须是 1-65535 的数字': 'Port must be a number between 1 and 65535',
+    '端口必须是数字': 'Port must be a number',
+    '第 %s 个会话的密码含有不支持的字符': 'The password of session #%s contains unsupported characters',
+    '第 %s 个会话的服务名只能包含字母、数字、点、下划线和连字符': 'The service name of session #%s may only contain letters, digits, dots, underscores and hyphens',
+    '第 %s 个会话的账号含有不支持的字符': 'The account of session #%s contains unsupported characters',
+    '第 %s 个会话缺少密码': 'Session #%s has no password',
+    '第 %s 个会话缺少账号': 'Session #%s has no account',
+    '第 %s 个时间组缺少名称': 'Time group #%s has no name',
+    '第 %s 条保证带宽（%sM）超过上行总带宽（%sM）': 'The guaranteed bandwidth in rule #%s (%sM) exceeds the total uplink bandwidth (%sM)',
+    '第 %s 条规则的动作不合法': 'The action in rule #%s is invalid',
+    '第 %s 条限速规则的 IP 格式不合法：%s': 'The IP address in rate limit rule #%s is invalid: %s',
+    '第 %s 条限速规则的带宽/优先级不是数字': 'The bandwidth/priority in rate limit rule #%s is not a number',
+    '签发失败：%s': 'Issuing failed: %s',
+    '系统用户 %s 创建成功': 'System user %s created',
+    '系统用户 %s 已删除': 'System user %s deleted',
+    '累计流量已更新': 'Cumulative traffic updated',
+    '统一日志已关闭，跳过归档': 'Unified logging is off, archiving skipped',
+    '缺少 UUID': 'Missing UUID',
+    '缺少 VLAN 列表': 'Missing VLAN list',
+    '缺少 action 参数': 'Missing "action" parameter',
+    '缺少主题 id': 'Missing theme id',
+    '缺少主题内容': 'Missing theme content',
+    '缺少内核模块：%s。请确认使用 Debian 官方内核。': 'Missing kernel module: %s. Make sure you are using a Debian official kernel.',
+    '缺少客户端 id': 'Missing client id',
+    '缺少设备 IP': 'Missing device IP',
+    '缺少设备列表': 'Missing device list',
+    '网卡名不合法': 'Invalid network interface name',
+    '网卡名不合法：%s': 'Invalid interface name: %s',
+    '自动快照定时器已按「每 %s 小时」重新排程': 'The automatic snapshot timer has been rescheduled to "every %s hours"',
+    '自动快照策略已保存：%s，每 %s 小时一次，%s 天后自动清理': 'Automatic snapshot policy saved: %s, once every %s hours, cleaned up after %s days',
+    '自动清理未开启，本次跳过': 'Automatic cleanup is off, skipped this time',
+    '自检完成：%s 项已就绪，%s 项缺失，%s 项可选未装': 'Self-check finished: %s ready, %s missing, %s optional and not installed',
+    '自签证书生成失败：%s': 'Failed to generate the self-signed certificate: %s',
+    '至少填一个域名（DNS）或 IP，否则浏览器一律报「名称不匹配」': 'Provide at least one domain (DNS) or IP, otherwise the browser will report a name mismatch',
+    '至少需要两张网卡（WAN + LAN）才能启用 flowtable 加速，请先在「网卡与桥接」里完成接口配置。': 'At least two interfaces (WAN + LAN) are required for flowtable acceleration; finish the interface configuration in "NICs & Bridge" first.',
+    '要补全的记录 ID 不合法': 'Invalid record ID to complete',
+    '解包失败：%s': 'Extraction failed: %s',
+    '解析网卡信息失败：%s': 'Failed to parse interface information: %s',
+    '计算失败：%s': 'Calculation failed: %s',
+    '设为默认失败：%s': 'Failed to set as default: %s',
+    '设备组「%s」包含非法地址：%s（请填 IP 或 CIDR，例如 10.0.0.5 或 10.0.0.0/24）': 'Device group "%s" contains an invalid address: %s (enter an IP or CIDR, e.g. 10.0.0.5 or 10.0.0.0/24)',
+    '设置 WOL 失败：%s（可能是网卡或驱动不支持）': 'Failed to set wake-on-lan: %s (the NIC or driver may not support it)',
+    '设置共享失败：%s': 'Failed to set up the share: %s',
+    '设置已保存': 'Settings saved',
+    '设置接受任务失败：%s': 'Failed to set the accept-jobs option: %s',
+    '证书名称不合法': 'Invalid certificate name',
+    '证书名称不能包含逗号、等号、分号，长度不超过 64 个字符': 'The certificate name must not contain commas, equals signs or semicolons, and must be at most 64 characters',
+    '证书已写入磁盘。当前处于构建保护模式，没有重启 Web 服务，下次重启 drouter-web 后生效。': 'The certificate has been written to disk. Build protection mode is on, so the web service was not restarted; it will take effect after drouter-web restarts.',
+    '证书解析失败：%s': 'Failed to parse the certificate: %s',
+    '证书请求生成失败：%s': 'Failed to generate the certificate request: %s',
+    '该主题正在使用中，请先切换到其它主题再删除': 'This theme is in use; switch to another theme before deleting it',
+    '该客户端没有保存私钥（可能是从旧版本升级来的），请删掉重建': 'This client has no stored private key (it may come from an older version); delete and recreate it',
+    '该用户还没有公钥文件': 'This user has no public key file yet',
+    '该设备上没有可识别的文件系统，请先格式化。': 'No recognizable file system on this device, please format it first.',
+    '该设备已经挂载在 %s': 'This device is already mounted at %s',
+    '该设备当前没有挂载': 'This device is not mounted',
+    '该设备本月没有统计记录': 'This device has no statistics for the current month',
+    '该设备没有 UUID（可能尚未格式化），无法写入 /etc/fstab。': 'This device has no UUID (it may not be formatted yet), cannot write to /etc/fstab.',
+    '请先选择一张 CA 证书': 'Please select a CA certificate first',
+    '请先选择上网方式（PPPoE / DHCP / 静态）': 'Please choose a connection type first (PPPoE / DHCP / Static)',
+    '请填写域名（CN）': 'Please fill in the domain name (CN)',
+    '请填写完整的 Bark 推送地址，或直接填设备 Key': 'Please enter the full Bark push URL, or just the device key',
+    '请填写客户端名称（比如「我的手机」）': 'Please fill in a client name (e.g. "My Phone")',
+    '请填写要测试的主机': 'Please fill in the host to test',
+    '请填写证书名称（CN）': 'Please fill in the certificate name (CN)',
+    '请提供 #rrggbb 格式的主色（例如 #1f6feb）': 'Please provide the primary color in #rrggbb format (e.g. #1f6feb)',
+    '请确认：需输入队列名「%s」以完成删除': 'Please confirm: type the queue name "%s" to complete the deletion',
+    '请确认：需输入项目名「%s」以完成删除': 'Please confirm: type the project name "%s" to complete the deletion',
+    '请粘贴证书内容或填写文件路径': 'Please paste the certificate content or enter a file path',
+    '请至少选择加速「IPv4」或「IPv6」中的一项。': 'Please select at least one of "IPv4" or "IPv6" to accelerate.',
+    '请至少配置 1 个拨号会话': 'Please configure at least one dial session',
+    '请输入搜索关键词': 'Please enter a search keyword',
+    '读不出证书有效期，不敢拿它去换正在用的那张': 'Could not read the certificate validity period, so it will not be used to replace the certificate currently in use',
+    '读取块设备失败：lsblk 不可用（请安装 util-linux）': 'Failed to read block devices: lsblk is unavailable (please install util-linux)',
+    '读取失败：%s': 'Failed to read: %s',
+    '读取日志失败：%s': 'Failed to read the log: %s',
+    '读取目录失败：%s': 'Failed to read the directory: %s',
+    '路由追踪完成': 'Route trace finished',
+    '软加速已关闭：所有流量恢复逐包经过防火墙规则': 'Software acceleration is off: all traffic goes through the firewall rules packet by packet again',
+    '软加速已开启：已建立连接将走快速转发路径（%s，覆盖 %s，设备：%s）': 'Software acceleration is on: established connections take the fast forwarding path (%s, covering %s, device: %s)',
+    '还原后重启 CUPS 失败：%s': 'Failed to restart CUPS after restore: %s',
+    '还原失败：%s': 'Restore failed: %s',
+    '还原未完成：%s 项失败（已成功 %s 项）': 'Restore incomplete: %s items failed (%s succeeded)',
+    '这不像是合法的 PEM 证书：%s': 'This does not look like a valid PEM certificate: %s',
+    '这不是 drouter 备份包：缺少 %s': 'This is not a drouter backup package: %s is missing',
+    '这份快照已上锁，自动清理不会删除它。若确实要删除，请确认后重试。': 'This snapshot is locked and will not be removed by automatic cleanup. Confirm to delete it anyway.',
+    '这台机器上没有安装 Docker，无需重启': 'Docker is not installed on this machine, no restart needed',
+    '这张 CA 没有私钥，签不了（导入时没带私钥）': 'This CA has no private key, so it cannot sign (the import did not include the key)',
+    '这张记录还没有证书文件，先用签回来的证书补全它': 'This record has no certificate file yet; fill it in with the signed certificate first',
+    '这张证书不是 CA 证书（basicConstraints 里没有 CA:TRUE），请按「服务器证书」导入': 'This is not a CA certificate (basicConstraints lacks CA:TRUE); import it as a "server certificate"',
+    '这张证书已经过期（%s），换成它等于把自己锁在门外': 'This certificate has already expired (%s); switching to it would lock you out',
+    '这张证书正在被管理后台使用。请先换成别的证书再删除。': 'This certificate is in use by the admin panel. Switch to another certificate before deleting it.',
+    '这张证书没有私钥，部署后 HTTPS 起不来': 'This certificate has no private key, so HTTPS will not start after deployment',
+    '这是二进制文件，无法以文本预览，请下载后查看': 'This is a binary file and cannot be previewed as text, please download it to view',
+    '连接跟踪查询完成': 'Connection tracking query finished',
+    '选了自定义 DNS 就必须填至少一个地址': 'If custom DNS is selected, at least one address is required',
+    '邮件发送失败：%s': 'Failed to send the email: %s',
+    '邮件已发送': 'Email sent',
+    '配置已保存但重启后没跑起来：%s': 'The configuration was saved but the service did not come up after the restart: %s',
+    '配置已保存但重启失败：%s': 'The configuration was saved but the service failed to restart: %s',
+    '配置已保存，但救援服务启动失败：%s': 'The configuration was saved, but the rescue service failed to start: %s',
+    '配置已写入，但 VPN 处于关闭状态（未启动服务）': 'The configuration was written, but the VPN is currently off (the service was not started)',
+    '配置已生成，含私钥，请妥善保管': 'The configuration has been generated and contains the private key; store it safely',
+    '配置校验失败：%s': 'Configuration validation failed: %s',
+    '配置静态加密不能在已有数据之后切换：现有库是%s的，改了这个开关已存的配置就读不出来了。如确需切换，请先卸载（勾选清除数据）再重装。': 'Static-at-rest encryption cannot be switched after data exists: the current database is %s, and switching this option makes the stored configuration unreadable. If you really need to switch, uninstall first (tick "clear data") and reinstall.',
+    '配额聚合写盘失败：%s': 'Failed to write the quota aggregation to disk: %s',
+    '重启 Docker 会中断所有容器，请先确认': 'Restarting Docker will interrupt all containers; please confirm first',
+    '重启 Docker 失败：%s': 'Failed to restart Docker: %s',
+    '重启 Web 服务失败，已还原原来的证书：%s': 'Failed to restart the web service; the original certificate has been restored: %s',
+    '重命名失败：%s': 'Rename failed: %s',
+    '重载 systemd 失败：%s': 'Failed to reload systemd: %s',
+    '镜像源列表格式不合法': 'Invalid mirror list format',
+    '队列 %s 已删除': 'Queue %s deleted',
+    '队列 %s 已添加（%s）': 'Queue %s added (%s)',
+    '队列 %s：%s': 'Queue %s: %s',
+    '防火墙规则应用失败，已自动回滚：%s': 'Failed to apply the firewall rules; the previous configuration has been rolled back: %s',
+    '静态地址模式要填 IP 地址 / 掩码': 'Static address mode requires an IP address and prefix',
+    '静态地址模式要填网关': 'Static address mode requires a gateway',
+    '非法的快照路径': 'Invalid snapshot path',
+    '项目 %s %s': 'Project %s %s',
+    '项目 %s 不存在': 'Project %s does not exist',
+    '项目 %s 已保存到 %s': 'Project %s saved to %s',
+    '项目 %s 的配置文件已删除（容器请用「停止并移除」处理）': 'The configuration file of project %s has been deleted (for containers, use "Stop and Remove")',
+    '项目 %s 里没有 compose 文件': 'Project %s contains no compose file',
+    '项目不存在': 'Project does not exist',
+    '项目路径不合法，已拒绝删除': 'Invalid project path; deletion refused',
+    '预检完成：将写入 %s 个文件': 'Pre-check finished: %s files will be written',
+    '预览已生成（未应用）': 'Preview generated (not applied)',
+    '驱动名不合法': 'Invalid driver name',
+}
+
+# 模板正则兜底：[(模板原文, 已编译正则, 英文模板)]，按字面量长度降序
+# ⚠️ 英文模板里的数值占位符（%d / %.1f）**统一改写成 %s**：
+#    正则捕获组一律是字符串，`% en % m.groups()` 遇 %d 会抛
+#    "TypeError: %d format: a real number is required, not str"。
+#    显示层不关心数字类型，字符串化对用户无差别，却彻底消除类型耦合。
+_MSG_RX = [
+    ('已从租约文件删除 %s 的记录，但本机没有 dhcp_release 工具 —— dnsmasq 内存里的租约还在，客户端续租时可能拿回同一个地址。要彻底回收请安装 dnsmasq-utils 或重启 dnsmasq。', re.compile(r"""^已从租约文件删除\ (.+?)\ 的记录，但本机没有\ dhcp_release\ 工具\ ——\ dnsmasq\ 内存里的租约还在，客户端续租时可能拿回同一个地址。要彻底回收请安装\ dnsmasq\-utils\ 或重启\ dnsmasq。$""", re.S), "The record for %s has been removed from the lease file, but this host has no dhcp_release tool - the lease is still in dnsmasq's memory, so the client may get the same address again when it renews. To reclaim it fully, install dnsmasq-utils or restart dnsmasq."),
+    ('卸载失败：%s。可能仍有进程在访问该目录，可用 <span class="mono">lsof +D 挂载点</span> 或 <span class="mono">fuser -m 挂载点</span> 查占用。', re.compile(r"""^卸载失败：(.+?)。可能仍有进程在访问该目录，可用\ <span\ class="mono">lsof\ \+D\ 挂载点</span>\ 或\ <span\ class="mono">fuser\ \-m\ 挂载点</span>\ 查占用。$""", re.S), 'Failed to unmount: %s. Some process may still be using that directory; check with <span class="mono">lsof +D &lt;mountpoint&gt;</span> or <span class="mono">fuser -m &lt;mountpoint&gt;</span>.'),
+    ('本机内核 %s 里没有 wireguard 模块，无法通过安装修复。精简容器镜像和自编内核会裁掉它；Debian 官方内核与 PVE/KVM 虚拟机都自带。', re.compile(r"""^本机内核\ (.+?)\ 里没有\ wireguard\ 模块，无法通过安装修复。精简容器镜像和自编内核会裁掉它；Debian\ 官方内核与\ PVE/KVM\ 虚拟机都自带。$""", re.S), 'This kernel (%s) has no wireguard module, so installing packages cannot fix it. Minimal container images and custom kernels strip it out; Debian official kernels and PVE/KVM virtual machines ship with it.'),
+    ('救援通道已开启，可通过 http://%s:%s/ 访问（插任一口皆可）。请记下访问令牌 %s —— 页面上的还原操作需要它，同网段其它机器无法凭猜测还原你的配置', re.compile(r"""^救援通道已开启，可通过\ http://(.+?):(.+?)/\ 访问（插任一口皆可）。请记下访问令牌\ (.+?)\ ——\ 页面上的还原操作需要它，同网段其它机器无法凭猜测还原你的配置$""", re.S), 'The rescue tunnel is open; visit http://%s:%s/ (any network port works). Note the access token %s - the restore action on the page needs it, and other machines on the same network cannot restore your configuration by guessing.'),
+    ('配置静态加密不能在已有数据之后切换：现有库是%s的，改了这个开关已存的配置就读不出来了。如确需切换，请先卸载（勾选清除数据）再重装。', re.compile(r"""^配置静态加密不能在已有数据之后切换：现有库是(.+?)的，改了这个开关已存的配置就读不出来了。如确需切换，请先卸载（勾选清除数据）再重装。$""", re.S), 'Static-at-rest encryption cannot be switched after data exists: the current database is %s, and switching this option makes the stored configuration unreadable. If you really need to switch, uninstall first (tick "clear data") and reinstall.'),
+    ('CUPS 没有安装。请到「系统 → 依赖自检与安装」安装后再来配置，或在终端执行 apt-get install -y %s', re.compile(r"""^CUPS\ 没有安装。请到「系统\ →\ 依赖自检与安装」安装后再来配置，或在终端执行\ apt\-get\ install\ \-y\ (.+?)$""", re.S), 'CUPS is not installed. Install it via "System → Dependency Check & Install" before configuring, or run apt-get install -y %s in the terminal'),
+    ('地址池（%s–%s）把本机自己的地址（%s）也包括进去了，这样会自己和自己抢 IP。请把池子的起点往后挪，比如从 %s.100 开始。', re.compile(r"""^地址池（(.+?)–(.+?)）把本机自己的地址（(.+?)）也包括进去了，这样会自己和自己抢\ IP。请把池子的起点往后挪，比如从\ (.+?)\.100\ 开始。$""", re.S), "The address pool (%s-%s) also contains this host's own address (%s), so the host would compete with itself for an IP. Move the start of the pool later, for example to %s.100."),
+    ('待安装的软件包在当前 apt 源里都找不到：%s。请先执行 apt-get update，或换用国内镜像源后重试。', re.compile(r"""^待安装的软件包在当前\ apt\ 源里都找不到：(.+?)。请先执行\ apt\-get\ update，或换用国内镜像源后重试。$""", re.S), 'None of the packages to install were found in the current apt sources: %s. Run apt-get update first, or switch to a mirror in China and retry.'),
+    ('%s 配置已保存。该服务当前处于停止状态，已跳过启动以避免影响现有网络；确认可以启用时请使用「启用服务」按钮。', re.compile(r"""^(.+?)\ 配置已保存。该服务当前处于停止状态，已跳过启动以避免影响现有网络；确认可以启用时请使用「启用服务」按钮。$""", re.S), '%s configuration saved. The service is currently stopped and was not started, to avoid affecting the existing network; use the "Enable service" button when you are ready.'),
+    ('设备组「%s」包含非法地址：%s（请填 IP 或 CIDR，例如 10.0.0.5 或 10.0.0.0/24）', re.compile(r"""^设备组「(.+?)」包含非法地址：(.+?)（请填\ IP\ 或\ CIDR，例如\ 10\.0\.0\.5\ 或\ 10\.0\.0\.0/24）$""", re.S), 'Device group "%s" contains an invalid address: %s (enter an IP or CIDR, e.g. 10.0.0.5 or 10.0.0.0/24)'),
+    ('当前处于【构建保护模式】，已阻止启动 %s。该服务会占用 53/67 端口或改变网络，可能影响现有局域网。', re.compile(r"""^当前处于【构建保护模式】，已阻止启动\ (.+?)。该服务会占用\ 53/67\ 端口或改变网络，可能影响现有局域网。$""", re.S), 'Currently in [build protection mode]; starting %s has been blocked. The service would occupy ports 53/67 or change the network, which may affect the running LAN.'),
+    ('拒绝格式化：/dev/%s 是整块盘且已含 %s 个分区（%s）。请改为格式化其中的具体分区，以免误删整盘数据。', re.compile(r"""^拒绝格式化：/dev/(.+?)\ 是整块盘且已含\ (.+?)\ 个分区（(.+?)）。请改为格式化其中的具体分区，以免误删整盘数据。$""", re.S), 'Formatting refused: /dev/%s is a whole disk already containing %s partitions (%s). Format a specific partition instead, to avoid erasing the whole disk.'),
+    ('%s 的设置已保存（该模块没有独立配置文件，其内容会作为上下文随防火墙 / DHCP 等模块一起生效）', re.compile(r"""^(.+?)\ 的设置已保存（该模块没有独立配置文件，其内容会作为上下文随防火墙\ /\ DHCP\ 等模块一起生效）$""", re.S), '%s settings saved (this module has no configuration file of its own; its content takes effect as context together with modules such as firewall and DHCP)'),
+    ('已迁移到 systemd-networkd 并重启网络服务；如失联请在 PVE 控制台执行回滚：%s', re.compile(r"""^已迁移到\ systemd\-networkd\ 并重启网络服务；如失联请在\ PVE\ 控制台执行回滚：(.+?)$""", re.S), 'Migrated to systemd-networkd and restarted the network service; if you lose access, run this rollback in the PVE console: %s'),
+    ('换上后 %s 端口没能握手成功（%s），已自动还原原来的证书。原来的证书仍在，页面不受影响。', re.compile(r"""^换上后\ (.+?)\ 端口没能握手成功（(.+?)），已自动还原原来的证书。原来的证书仍在，页面不受影响。$""", re.S), 'After switching, the TLS handshake on port %s did not succeed (%s), so the original certificate was automatically restored. The original certificate is still in place and the panel is unaffected.'),
+    ('WireGuard 内核模块未加载，且自动加载失败：%s。可点上方「一键修复」重试。', re.compile(r"""^WireGuard\ 内核模块未加载，且自动加载失败：(.+?)。可点上方「一键修复」重试。$""", re.S), 'The WireGuard kernel module is not loaded and auto-loading failed: %s. You can click "One-click fix" above to retry.'),
+    ('地址池（%s–%s）和本机 LAN 地址（%s）不在同一个网段。地址池前三段必须和本机一致。', re.compile(r"""^地址池（(.+?)–(.+?)）和本机\ LAN\ 地址（(.+?)）不在同一个网段。地址池前三段必须和本机一致。$""", re.S), "The address pool (%s-%s) and this host's LAN address (%s) are not in the same subnet. The first three octets of the pool must match the host."),
+    ('%s 还没有任何流量统计。请确认统一日志与本功能都已启用，并且已经过了一个聚合周期。', re.compile(r"""^(.+?)\ 还没有任何流量统计。请确认统一日志与本功能都已启用，并且已经过了一个聚合周期。$""", re.S), '%s has no traffic statistics yet. Make sure unified logging and this feature are both enabled and that an aggregation period has passed.'),
+    ('不支持以 %s 身份开启终端（可选：root / ajeef / drouter）', re.compile(r"""^不支持以\ (.+?)\ 身份开启终端（可选：root\ /\ ajeef\ /\ drouter）$""", re.S), 'Cannot open a terminal as %s (options: root / ajeef / drouter)'),
+    ('Web 管理端口已改为 %s，请用新地址访问：https://<本机IP>:%s/', re.compile(r"""^Web\ 管理端口已改为\ (.+?)，请用新地址访问：https://<本机IP>:(.+?)/$""", re.S), 'The web admin port is now %s; visit the new address: https://<this-host-IP>:%s/'),
+    ('拒绝格式化：/dev/%s 属于系统盘（承载 %s），格式化会导致系统无法启动。', re.compile(r"""^拒绝格式化：/dev/(.+?)\ 属于系统盘（承载\ (.+?)），格式化会导致系统无法启动。$""", re.S), 'Formatting refused: /dev/%s is the system disk (holding %s); formatting it would make the system unbootable.'),
+    ('端口已保存为 %s，但服务重启失败，请稍后手动重启 drouter-web', re.compile(r"""^端口已保存为\ (.+?)，但服务重启失败，请稍后手动重启\ drouter\-web$""", re.S), 'The port was saved as %s, but the service failed to restart; please restart drouter-web manually later'),
+    ('未知的向导步骤：%s（只能是 wan / lan / dns / v6）', re.compile(r"""^未知的向导步骤：(.+?)（只能是\ wan\ /\ lan\ /\ dns\ /\ v6）$""", re.S), 'Unknown wizard step: %s (only wan / lan / dns / v6 are allowed)'),
+    ('服务器证书「%s」已签发（%s 天）。要去「部署给管理后台」才会真正生效。', re.compile(r"""^服务器证书「(.+?)」已签发（(.+?)\ 天）。要去「部署给管理后台」才会真正生效。$""", re.S), 'Server certificate "%s" issued (%s days). It only takes effect after "Deploy to the admin panel".'),
+    ('已回收 %s：dnsmasq 已从租约表删除该地址（客户端需重新获取）', re.compile(r"""^已回收\ (.+?)：dnsmasq\ 已从租约表删除该地址（客户端需重新获取）$""", re.S), 'Reclaimed %s: dnsmasq has removed that address from the lease table (the client must obtain a new one)'),
+    ('已把 /dev/%s 格式化为 %s。注意：原数据已全部清除且不可恢复。', re.compile(r"""^已把\ /dev/(.+?)\ 格式化为\ (.+?)。注意：原数据已全部清除且不可恢复。$""", re.S), '/dev/%s formatted as %s. Note that all previous data has been erased and cannot be recovered.'),
+    ('已加入开机自动挂载：%s → %s（已加 nofail，拔盘不会卡开机）', re.compile(r"""^已加入开机自动挂载：(.+?)\ →\ (.+?)（已加\ nofail，拔盘不会卡开机）$""", re.S), 'Added to the boot auto-mount list: %s → %s (nofail added, so removing the drive will not block boot)'),
+    ('CA「%s」已创建，有效期 %s 天。可以用它给管理后台签服务器证书了。', re.compile(r"""^CA「(.+?)」已创建，有效期\ (.+?)\ 天。可以用它给管理后台签服务器证书了。$""", re.S), 'CA "%s" created, valid for %s days. You can now use it to sign a server certificate for the admin panel.'),
+    ('本机内核 %s 里没有 wireguard 模块，无法通过安装修复。', re.compile(r"""^本机内核\ (.+?)\ 里没有\ wireguard\ 模块，无法通过安装修复。$""", re.S), 'This kernel (%s) has no wireguard module, so installing packages cannot fix it.'),
+    ('本机内核里没有 WireGuard 模块（内核 %s），无法启动。', re.compile(r"""^本机内核里没有\ WireGuard\ 模块（内核\ (.+?)），无法启动。$""", re.S), 'This kernel has no WireGuard module (kernel %s), so it cannot be started.'),
+    ('内核模块已就绪，但安装 wireguard-tools 失败：%s', re.compile(r"""^内核模块已就绪，但安装\ wireguard\-tools\ 失败：(.+?)$""", re.S), 'The kernel module is ready, but installing wireguard-tools failed: %s'),
+    ('备份包解出后超过上限（%s 个文件 / %s MB），疑似异常包已拒绝', re.compile(r"""^备份包解出后超过上限（(.+?)\ 个文件\ /\ (.+?)\ MB），疑似异常包已拒绝$""", re.S), 'The backup package exceeds the limit after extraction (%s files / %s MB); it looks abnormal and has been refused'),
+    ('DNS 地址「%s」不是合法的 IP（多个地址之间用英文逗号分隔）', re.compile(r"""^DNS\ 地址「(.+?)」不是合法的\ IP（多个地址之间用英文逗号分隔）$""", re.S), 'The DNS address "%s" is not a valid IP (separate multiple addresses with commas)'),
+    ('已生效。Web 服务刚刚重启，请重新登录；新证书剩余 %s 天。', re.compile(r"""^已生效。Web\ 服务刚刚重启，请重新登录；新证书剩余\ (.+?)\ 天。$""", re.S), 'In effect. The web service has just restarted; please sign in again. The new certificate has %s days left.'),
+    ('备份包格式版本 %s 高于本机支持的 %s，请先升级 drouter', re.compile(r"""^备份包格式版本\ (.+?)\ 高于本机支持的\ (.+?)，请先升级\ drouter$""", re.S), 'Backup package format version %s is newer than the supported %s; please upgrade drouter first'),
+    ('QoS 已启用：%s。CAKE 已在 WAN 与 %s 上接管排队。', re.compile(r"""^QoS\ 已启用：(.+?)。CAKE\ 已在\ WAN\ 与\ (.+?)\ 上接管排队。$""", re.S), 'QoS enabled: %s. CAKE now handles queueing on the WAN and %s.'),
+    ('VLAN %s 的静态地址格式应为 192.168.1.2/24', re.compile(r"""^VLAN\ (.+?)\ 的静态地址格式应为\ 192\.168\.1\.2/24$""", re.S), 'The static address for VLAN %s should be in the form 192.168.1.2/24'),
+    ('软加速已开启：已建立连接将走快速转发路径（%s，覆盖 %s，设备：%s）', re.compile(r"""^软加速已开启：已建立连接将走快速转发路径（(.+?)，覆盖\ (.+?)，设备：(.+?)）$""", re.S), 'Software acceleration is on: established connections take the fast forwarding path (%s, covering %s, device: %s)'),
+    ('第 %s 个会话的服务名只能包含字母、数字、点、下划线和连字符', re.compile(r"""^第\ (.+?)\ 个会话的服务名只能包含字母、数字、点、下划线和连字符$""", re.S), 'The service name of session #%s may only contain letters, digits, dots, underscores and hyphens'),
+    ('landscape-router 已彻底删除，备份保留在：%s', re.compile(r"""^landscape\-router\ 已彻底删除，备份保留在：(.+?)$""", re.S), 'landscape-router has been completely removed; the backup is kept at: %s'),
+    ('已还原 %s 个文件，请到相关页面确认后点一次「保存并应用」', re.compile(r"""^已还原\ (.+?)\ 个文件，请到相关页面确认后点一次「保存并应用」$""", re.S), 'Restored %s files; confirm on the relevant pages and click "Save and Apply" once'),
+    ('OpenSOHO 现在连不上（%s）。先把它启动起来再读取。', re.compile(r"""^OpenSOHO\ 现在连不上（(.+?)）。先把它启动起来再读取。$""", re.S), 'OpenSOHO is not reachable right now (%s). Start it before reading.'),
+    ('项目 %s 的配置文件已删除（容器请用「停止并移除」处理）', re.compile(r"""^项目\ (.+?)\ 的配置文件已删除（容器请用「停止并移除」处理）$""", re.S), 'The configuration file of project %s has been deleted (for containers, use "Stop and Remove")'),
+    ('WAN 物理网卡 %s 不存在，请先在「WAN 口」里配置', re.compile(r"""^WAN\ 物理网卡\ (.+?)\ 不存在，请先在「WAN\ 口」里配置$""", re.S), 'WAN physical interface %s does not exist; configure it in "WAN Port" first'),
+    ('磁盘 %s%%（阈值 %s%%），未到执行时间 —— 本次跳过', re.compile(r"""^磁盘\ (.+?)%%（阈值\ (.+?)%%），未到执行时间\ ——\ 本次跳过$""", re.S), 'Disk usage %s%% (threshold %s%%), not yet due - skipped this time'),
+    ('已生成 %s 方式的操作步骤（可复制到 Web 终端执行）', re.compile(r"""^已生成\ (.+?)\ 方式的操作步骤（可复制到\ Web\ 终端执行）$""", re.S), 'Generated %s-mode operation steps (you can copy them into the web terminal)'),
+    ('端口 %s 已被系统服务占用，请换一个（推荐 8888）', re.compile(r"""^端口\ (.+?)\ 已被系统服务占用，请换一个（推荐\ 8888）$""", re.S), 'Port %s is already used by a system service; choose another (8888 is recommended)'),
+    ('缺少内核模块：%s。请确认使用 Debian 官方内核。', re.compile(r"""^缺少内核模块：(.+?)。请确认使用\ Debian\ 官方内核。$""", re.S), 'Missing kernel module: %s. Make sure you are using a Debian official kernel.'),
+    ('自动快照策略已保存：%s，每 %s 小时一次，%s 天后自动清理', re.compile(r"""^自动快照策略已保存：(.+?)，每\ (.+?)\ 小时一次，(.+?)\ 天后自动清理$""", re.S), 'Automatic snapshot policy saved: %s, once every %s hours, cleaned up after %s days'),
+    ('VLAN ID 必须在 1-4094 之间（收到 %s）', re.compile(r"""^VLAN\ ID\ 必须在\ 1\-4094\ 之间（收到\ (.+?)）$""", re.S), 'The VLAN ID must be between 1 and 4094 (received %s)'),
+    ('WAN 网卡 %s 不存在，请先在「WAN 口」里配置', re.compile(r"""^WAN\ 网卡\ (.+?)\ 不存在，请先在「WAN\ 口」里配置$""", re.S), 'WAN interface %s does not exist; configure it in "WAN Port" first'),
+    ('安全确认未通过：请手动输入设备名 %s 以确认格式化。', re.compile(r"""^安全确认未通过：请手动输入设备名\ (.+?)\ 以确认格式化。$""", re.S), 'Safety confirmation failed: please type the device name %s to confirm formatting.'),
+    ('IPv%s 的 MSS 数值不合法（576–9000）', re.compile(r"""^IPv(.+?)\ 的\ MSS\ 数值不合法（576–9000）$""", re.S), 'The MSS value for IPv%s is invalid (576-9000)'),
+    ('已保存 %s 个会话（尚未连接，需点击「应用并连接」）', re.compile(r"""^已保存\ (.+?)\ 个会话（尚未连接，需点击「应用并连接」）$""", re.S), 'Saved %s session(s) (not connected yet; click "Apply and connect")'),
+    ('拒绝格式化：/dev/%s 当前挂载在 %s，请先卸载。', re.compile(r"""^拒绝格式化：/dev/(.+?)\ 当前挂载在\ (.+?)，请先卸载。$""", re.S), 'Formatting refused: /dev/%s is currently mounted at %s; unmount it first.'),
+    ('快照路径只允许位于 %s 之下，避免误写系统关键目录', re.compile(r"""^快照路径只允许位于\ (.+?)\ 之下，避免误写系统关键目录$""", re.S), 'The snapshot path is only allowed under %s, to avoid writing into critical system directories'),
+    ('只支持 http / https 地址，当前是 %s', re.compile(r"""^只支持\ http\ /\ https\ 地址，当前是\ (.+?)$""", re.S), 'Only http / https addresses are supported; this one is %s'),
+    ('Docker 已重启，新配置已生效（当前状态：%s）', re.compile(r"""^Docker\ 已重启，新配置已生效（当前状态：(.+?)）$""", re.S), 'Docker has been restarted and the new configuration is in effect (current state: %s)'),
+    ('%s 语法检查通过（仅预检，未写入磁盘、未启用服务）', re.compile(r"""^(.+?)\ 语法检查通过（仅预检，未写入磁盘、未启用服务）$""", re.S), '%s passed the syntax check (pre-check only; nothing written to disk, no service enabled)'),
+    ('更新完成：成功 %s 项，失败 %s 项（可使用前缀 %s）', re.compile(r"""^更新完成：成功\ (.+?)\ 项，失败\ (.+?)\ 项（可使用前缀\ (.+?)）$""", re.S), 'Update finished: %s succeeded, %s failed (usable prefix: %s)'),
+    ('登录失败：%s（请确认用的是授权码而不是登录密码）', re.compile(r"""^登录失败：(.+?)（请确认用的是授权码而不是登录密码）$""", re.S), 'Login failed: %s (make sure you are using the authorization code, not the login password)'),
+    ('这张证书已经过期（%s），换成它等于把自己锁在门外', re.compile(r"""^这张证书已经过期（(.+?)），换成它等于把自己锁在门外$""", re.S), 'This certificate has already expired (%s); switching to it would lock you out'),
+    ('设置 WOL 失败：%s（可能是网卡或驱动不支持）', re.compile(r"""^设置\ WOL\ 失败：(.+?)（可能是网卡或驱动不支持）$""", re.S), 'Failed to set wake-on-lan: %s (the NIC or driver may not support it)'),
+    ('端口 %s 已经被系统上的服务占用（%s），请换一个', re.compile(r"""^端口\ (.+?)\ 已经被系统上的服务占用（(.+?)），请换一个$""", re.S), 'Port %s is already taken by a service on this system (%s); choose another'),
+    ('WireGuard 环境正常，但写 %s 失败：%s', re.compile(r"""^WireGuard\ 环境正常，但写\ (.+?)\ 失败：(.+?)$""", re.S), 'The WireGuard environment is ready, but writing %s failed: %s'),
+    ('本机找不到 wireguard 模块文件（%s）', re.compile(r"""^本机找不到\ wireguard\ 模块文件（(.+?)）$""", re.S), 'No wireguard module file found on this host (%s)'),
+    ('自检完成：%s 项已就绪，%s 项缺失，%s 项可选未装', re.compile(r"""^自检完成：(.+?)\ 项已就绪，(.+?)\ 项缺失，(.+?)\ 项可选未装$""", re.S), 'Self-check finished: %s ready, %s missing, %s optional and not installed'),
+    ('安装过程返回错误码 %s，部分依赖可能未装成功。%s', re.compile(r"""^安装过程返回错误码\ (.+?)，部分依赖可能未装成功。(.+?)$""", re.S), 'The installation returned error code %s, so some dependencies may not have installed. %s'),
+    ('主题包「%s」导入成功，可在列表中点击「应用」', re.compile(r"""^主题包「(.+?)」导入成功，可在列表中点击「应用」$""", re.S), 'Theme package "%s" imported; click "Apply" in the list'),
+    ('接口名不合法：%s（应形如 ens19.85）', re.compile(r"""^接口名不合法：(.+?)（应形如\ ens19\.85）$""", re.S), 'Invalid interface name: %s (expected a form like ens19.85)'),
+    ('WireGuard 已启动，监听 UDP %s', re.compile(r"""^WireGuard\ 已启动，监听\ UDP\ (.+?)$""", re.S), 'WireGuard started, listening on UDP %s'),
+    ('重启 Web 服务失败，已还原原来的证书：%s', re.compile(r"""^重启\ Web\ 服务失败，已还原原来的证书：(.+?)$""", re.S), 'Failed to restart the web service; the original certificate has been restored: %s'),
+    ('第 %s 条保证带宽（%sM）超过上行总带宽（%sM）', re.compile(r"""^第\ (.+?)\ 条保证带宽（(.+?)M）超过上行总带宽（(.+?)M）$""", re.S), 'The guaranteed bandwidth in rule #%s (%sM) exceeds the total uplink bandwidth (%sM)'),
+    ('已从 %s 还原（当前文件也另存了一份备份）', re.compile(r"""^已从\ (.+?)\ 还原（当前文件也另存了一份备份）$""", re.S), 'Restored from %s (the current file was also backed up separately)'),
+    ('加载 wireguard 内核模块失败：%s', re.compile(r"""^加载\ wireguard\ 内核模块失败：(.+?)$""", re.S), 'Failed to load the wireguard kernel module: %s'),
+    ('只有服务器证书能部署给管理后台（当前是%s）', re.compile(r"""^只有服务器证书能部署给管理后台（当前是(.+?)）$""", re.S), 'Only server certificates can be deployed to the admin panel (currently %s)'),
+    ('自动快照定时器已按「每 %s 小时」重新排程', re.compile(r"""^自动快照定时器已按「每\ (.+?)\ 小时」重新排程$""", re.S), 'The automatic snapshot timer has been rescheduled to "every %s hours"'),
+    ('本次新增 %s 条日志，其中没有可统计的流量', re.compile(r"""^本次新增\ (.+?)\ 条日志，其中没有可统计的流量$""", re.S), '%s new log entries this round, none of which contain countable traffic'),
+    ('RDNSS（%s）不是合法的 IPv6 地址', re.compile(r"""^RDNSS（(.+?)）不是合法的\ IPv6\ 地址$""", re.S), 'RDNSS (%s) is not a valid IPv6 address'),
+    ('已建立 dhcp-release 兜底：%s', re.compile(r"""^已建立\ dhcp\-release\ 兜底：(.+?)$""", re.S), 'A dhcp-release fallback has been set up: %s'),
+    ('受保护的系统账号，禁止删除：%s（UID %d）', re.compile(r"""^受保护的系统账号，禁止删除：(.+?)（UID\ (.+?)）$""", re.S), 'Protected system account, deletion is forbidden: %s (UID %s)'),
+    ('这不是 drouter 备份包：缺少 %s', re.compile(r"""^这不是\ drouter\ 备份包：缺少\ (.+?)$""", re.S), 'This is not a drouter backup package: %s is missing'),
+    ('第 %s 条限速规则的 IP 格式不合法：%s', re.compile(r"""^第\ (.+?)\ 条限速规则的\ IP\ 格式不合法：(.+?)$""", re.S), 'The IP address in rate limit rule #%s is invalid: %s'),
+    ('第 %s 条限速规则的带宽/优先级不是数字', re.compile(r"""^第\ (.+?)\ 条限速规则的带宽/优先级不是数字$""", re.S), 'The bandwidth/priority in rate limit rule #%s is not a number'),
+    ('下发给客户端的 DNS（%s）不是合法地址', re.compile(r"""^下发给客户端的\ DNS（(.+?)）不是合法地址$""", re.S), 'The DNS pushed to clients (%s) is not a valid address'),
+    ('已应用主题「%s」，刷新页面即可看到效果', re.compile(r"""^已应用主题「(.+?)」，刷新页面即可看到效果$""", re.S), 'Theme "%s" applied; refresh the page to see it'),
+    ('项目 %s 里没有 compose 文件', re.compile(r"""^项目\ (.+?)\ 里没有\ compose\ 文件$""", re.S), 'Project %s contains no compose file'),
+    ('还原未完成：%s 项失败（已成功 %s 项）', re.compile(r"""^还原未完成：(.+?)\ 项失败（已成功\ (.+?)\ 项）$""", re.S), 'Restore incomplete: %s items failed (%s succeeded)'),
+    ('检测完成：%s 条告警已推送，%s 条被跳过', re.compile(r"""^检测完成：(.+?)\ 条告警已推送，(.+?)\ 条被跳过$""", re.S), 'Detection finished: %s alerts pushed, %s skipped'),
+    ('内置主题「%s」不可覆盖，请另存为新主题', re.compile(r"""^内置主题「(.+?)」不可覆盖，请另存为新主题$""", re.S), 'The built-in theme "%s" cannot be overwritten; save it as a new theme instead'),
+    ('OpenSOHO 已安装但启动失败：%s', re.compile(r"""^OpenSOHO\ 已安装但启动失败：(.+?)$""", re.S), 'OpenSOHO is installed but failed to start: %s'),
+    ('OpenSOHO 已安装但没跑起来：%s', re.compile(r"""^OpenSOHO\ 已安装但没跑起来：(.+?)$""", re.S), 'OpenSOHO is installed but is not running: %s'),
+    ('已向 %s 发送唤醒魔术包（广播地址：%s）', re.compile(r"""^已向\ (.+?)\ 发送唤醒魔术包（广播地址：(.+?)）$""", re.S), 'A wake-on-lan magic packet was sent to %s (broadcast address: %s)'),
+    ('打开备份包失败（文件可能已损坏）：%s', re.compile(r"""^打开备份包失败（文件可能已损坏）：(.+?)$""", re.S), 'Failed to open the backup package (the file may be corrupted): %s'),
+    ('已清理 %s 条超期记录（保留 %s 条）', re.compile(r"""^已清理\ (.+?)\ 条超期记录（保留\ (.+?)\ 条）$""", re.S), 'Cleaned up %s expired records (%s kept)'),
+    ('第 %s 个会话的账号含有不支持的字符', re.compile(r"""^第\ (.+?)\ 个会话的账号含有不支持的字符$""", re.S), 'The account of session #%s contains unsupported characters'),
+    ('第 %s 个会话的密码含有不支持的字符', re.compile(r"""^第\ (.+?)\ 个会话的密码含有不支持的字符$""", re.S), 'The password of session #%s contains unsupported characters'),
+    ('请确认：需输入项目名「%s」以完成删除', re.compile(r"""^请确认：需输入项目名「(.+?)」以完成删除$""", re.S), 'Please confirm: type the project name "%s" to complete the deletion'),
+    ('请确认：需输入队列名「%s」以完成删除', re.compile(r"""^请确认：需输入队列名「(.+?)」以完成删除$""", re.S), 'Please confirm: type the queue name "%s" to complete the deletion'),
+    ('写入 /etc/fstab 失败：%s', re.compile(r"""^写入\ /etc/fstab\ 失败：(.+?)$""", re.S), 'Failed to write /etc/fstab: %s'),
+    ('配置已保存，但救援服务启动失败：%s', re.compile(r"""^配置已保存，但救援服务启动失败：(.+?)$""", re.S), 'The configuration was saved, but the rescue service failed to start: %s'),
+    ('防火墙规则应用失败，已自动回滚：%s', re.compile(r"""^防火墙规则应用失败，已自动回滚：(.+?)$""", re.S), 'Failed to apply the firewall rules; the previous configuration has been rolled back: %s'),
+    ('主题「%s」校验未通过，已拒绝应用：%s', re.compile(r"""^主题「(.+?)」校验未通过，已拒绝应用：(.+?)$""", re.S), 'Theme "%s" failed validation; applying it has been refused: %s'),
+    ('QoS 已应用，但状态回写失败：%s', re.compile(r"""^QoS\ 已应用，但状态回写失败：(.+?)$""", re.S), 'QoS applied, but writing back the status failed: %s'),
+    ('QoS 已停用，但状态回写失败：%s', re.compile(r"""^QoS\ 已停用，但状态回写失败：(.+?)$""", re.S), 'QoS disabled, but writing back the status failed: %s'),
+    ('救援通道自检：虚拟口 %s，端口 %s %s', re.compile(r"""^救援通道自检：虚拟口\ (.+?)，端口\ (.+?)\ (.+?)$""", re.S), 'Rescue tunnel self-check: virtual interface %s, port %s %s'),
+    ('不支持的 Docker 操作：%s', re.compile(r"""^不支持的\ Docker\ 操作：(.+?)$""", re.S), 'Unsupported Docker action: %s'),
+    ('端口 %s 已被 %s 占用，请换一个', re.compile(r"""^端口\ (.+?)\ 已被\ (.+?)\ 占用，请换一个$""", re.S), 'Port %s is already in use by %s; choose another'),
+    ('已导出 %s 条记录（JSONL）', re.compile(r"""^已导出\ (.+?)\ 条记录（JSONL）$""", re.S), 'Exported %s records (JSONL)'),
+    ('这不像是合法的 PEM 证书：%s', re.compile(r"""^这不像是合法的\ PEM\ 证书：(.+?)$""", re.S), 'This does not look like a valid PEM certificate: %s'),
+    ('清理策略已保存：%s，触发方式「%s」', re.compile(r"""^清理策略已保存：(.+?)，触发方式「(.+?)」$""", re.S), 'Cleanup policy saved: %s, triggered by "%s"'),
+    ('%s 格式不正确，应为 HH:MM', re.compile(r"""^(.+?)\ 格式不正确，应为\ HH:MM$""", re.S), '%s is not in the correct format, expected HH:MM'),
+    ('%s 不是合法的 IPv4 地址：%s', re.compile(r"""^(.+?)\ 不是合法的\ IPv4\ 地址：(.+?)$""", re.S), '%s is not a valid IPv4 address: %s'),
+    ('OpenSOHO %s后没跑起来：%s', re.compile(r"""^OpenSOHO\ (.+?)后没跑起来：(.+?)$""", re.S), 'OpenSOHO did not come up after being %s: %s'),
+    ('互联网测速完成：约 %s Mbps', re.compile(r"""^互联网测速完成：约\ (.+?)\ Mbps$""", re.S), 'Internet speed test finished: about %s Mbps'),
+    ('DDNS 更新成功：%s → %s（%s）', re.compile(r"""^DDNS\ 更新成功：(.+?)\ →\ (.+?)（(.+?)）$""", re.S), 'DDNS updated: %s → %s (%s)'),
+    ('不支持的 AC/AP 操作：%s', re.compile(r"""^不支持的\ AC/AP\ 操作：(.+?)$""", re.S), 'Unsupported AC/AP action: %s'),
+    ('配置已保存但重启后没跑起来：%s', re.compile(r"""^配置已保存但重启后没跑起来：(.+?)$""", re.S), 'The configuration was saved but the service did not come up after the restart: %s'),
+    ('重载 systemd 失败：%s', re.compile(r"""^重载\ systemd\ 失败：(.+?)$""", re.S), 'Failed to reload systemd: %s'),
+    ('WAN 物理网卡名称不合法：%s', re.compile(r"""^WAN\ 物理网卡名称不合法：(.+?)$""", re.S), 'Invalid WAN physical interface name: %s'),
+    ('已从 %s 还原并重启 CUPS', re.compile(r"""^已从\ (.+?)\ 还原并重启\ CUPS$""", re.S), 'Restored from %s and restarted CUPS'),
+    ('还原后重启 CUPS 失败：%s', re.compile(r"""^还原后重启\ CUPS\ 失败：(.+?)$""", re.S), 'Failed to restart CUPS after restore: %s'),
+    ('QoS 规则语法检查未通过：%s', re.compile(r"""^QoS\ 规则语法检查未通过：(.+?)$""", re.S), 'QoS rule syntax check failed: %s'),
+    ('QoS 规则加载校验未通过：%s', re.compile(r"""^QoS\ 规则加载校验未通过：(.+?)$""", re.S), 'QoS rule load validation failed: %s'),
+    ('存在重复的 VLAN 接口：%s', re.compile(r"""^存在重复的\ VLAN\ 接口：(.+?)$""", re.S), 'Duplicate VLAN interface: %s'),
+    ('%s 不是合法的 IPv4 地址', re.compile(r"""^(.+?)\ 不是合法的\ IPv4\ 地址$""", re.S), '%s is not a valid IPv4 address'),
+    ('主题校验通过：%s 个变量，%s模式', re.compile(r"""^主题校验通过：(.+?)\ 个变量，(.+?)模式$""", re.S), 'Theme validation passed: %s variables, %s mode'),
+    ('%s 重载失败，已自动回滚配置：%s', re.compile(r"""^(.+?)\ 重载失败，已自动回滚配置：(.+?)$""", re.S), 'Failed to reload %s; the configuration has been rolled back automatically: %s'),
+    ('已聚合 %s 个统计桶（%s MB）', re.compile(r"""^已聚合\ (.+?)\ 个统计桶（(.+?)\ MB）$""", re.S), 'Aggregated %s statistics buckets (%s MB)'),
+    ('不支持的 CAKE 模式：%s', re.compile(r"""^不支持的\ CAKE\ 模式：(.+?)$""", re.S), 'Unsupported CAKE mode: %s'),
+    ('主题「%s」已损坏，拒绝应用：%s', re.compile(r"""^主题「(.+?)」已损坏，拒绝应用：(.+?)$""", re.S), 'Theme "%s" is corrupted; applying it has been refused: %s'),
+    ('主题「%s」已保存（尚未应用）', re.compile(r"""^主题「(.+?)」已保存（尚未应用）$""", re.S), 'Theme "%s" saved (not applied yet)'),
+    ('用户已创建但设置密码失败：%s', re.compile(r"""^用户已创建但设置密码失败：(.+?)$""", re.S), 'The user was created but the password could not be set: %s'),
+    ('已把 /dev/%s 挂载到 %s', re.compile(r"""^已把\ /dev/(.+?)\ 挂载到\ (.+?)$""", re.S), '/dev/%s mounted at %s'),
+    ('已导出 %s 条记录（CSV）', re.compile(r"""^已导出\ (.+?)\ 条记录（CSV）$""", re.S), 'Exported %s records (CSV)'),
+    ('预检完成：将写入 %s 个文件', re.compile(r"""^预检完成：将写入\ (.+?)\ 个文件$""", re.S), 'Pre-check finished: %s files will be written'),
+    ('修复未完全成功（当前：%s）。%s', re.compile(r"""^修复未完全成功（当前：(.+?)）。(.+?)$""", re.S), 'The fix did not fully succeed (current: %s). %s'),
+    ('测试消息已发送到 %s 个通道', re.compile(r"""^测试消息已发送到\ (.+?)\ 个通道$""", re.S), 'Test message sent to %s channel(s)'),
+    ('创建下行整形设备 %s 失败：%s', re.compile(r"""^创建下行整形设备\ (.+?)\ 失败：(.+?)$""", re.S), 'Failed to create the downlink shaping device %s: %s'),
+    ('重启 Docker 失败：%s', re.compile(r"""^重启\ Docker\ 失败：(.+?)$""", re.S), 'Failed to restart Docker: %s'),
+    ('清理项 %s 的保留天数不合法', re.compile(r"""^清理项\ (.+?)\ 的保留天数不合法$""", re.S), 'The retention period for cleanup item %s is invalid'),
+    ('应用 QoS 规则失败：%s', re.compile(r"""^应用\ QoS\ 规则失败：(.+?)$""", re.S), 'Failed to apply the QoS rules: %s'),
+    ('已立即执行一次自动快照：%s', re.compile(r"""^已立即执行一次自动快照：(.+?)$""", re.S), 'An automatic snapshot was just taken: %s'),
+    ('加速规则语法检查未通过：%s', re.compile(r"""^加速规则语法检查未通过：(.+?)$""", re.S), 'Acceleration rule syntax check failed: %s'),
+    ('第 %s 条规则的动作不合法', re.compile(r"""^第\ (.+?)\ 条规则的动作不合法$""", re.S), 'The action in rule #%s is invalid'),
+    ('PPPoE %s 指令已执行', re.compile(r"""^PPPoE\ (.+?)\ 指令已执行$""", re.S), 'The PPPoE %s command has been executed'),
+    ('已把 %s 转为静态绑定（%s）', re.compile(r"""^已把\ (.+?)\ 转为静态绑定（(.+?)）$""", re.S), '%s has been converted to a static binding (%s)'),
+    ('compose %s 失败：%s', re.compile(r"""^compose\ (.+?)\ 失败：(.+?)$""", re.S), 'compose %s failed: %s'),
+    ('已删除 VLAN 接口 %s', re.compile(r"""^已删除\ VLAN\ 接口\ (.+?)$""", re.S), 'VLAN interface %s deleted'),
+    ('%s 统计：%s 台设备，合计 %s', re.compile(r"""^(.+?)\ 统计：(.+?)\ 台设备，合计\ (.+?)$""", re.S), '%s statistics: %s device(s), %s in total'),
+    ('抓包完成（最多 %s 个包）', re.compile(r"""^抓包完成（最多\ (.+?)\ 个包）$""", re.S), 'Packet capture finished (up to %s packets)'),
+    ('不支持的打印服务操作：%s', re.compile(r"""^不支持的打印服务操作：(.+?)$""", re.S), 'Unsupported print service action: %s'),
+    ('不支持的引擎配置操作：%s', re.compile(r"""^不支持的引擎配置操作：(.+?)$""", re.S), 'Unsupported engine configuration action: %s'),
+    ('未知的 VPN 操作：%s', re.compile(r"""^未知的\ VPN\ 操作：(.+?)$""", re.S), 'Unknown VPN action: %s'),
+    ('配置已保存但重启失败：%s', re.compile(r"""^配置已保存但重启失败：(.+?)$""", re.S), 'The configuration was saved but the service failed to restart: %s'),
+    ('主题包已生成（%s KB）', re.compile(r"""^主题包已生成（(.+?)\ KB）$""", re.S), 'Theme package generated (%s KB)'),
+    ('写入快照保护状态失败：%s', re.compile(r"""^写入快照保护状态失败：(.+?)$""", re.S), 'Failed to write the snapshot protection state: %s'),
+    ('对方返回 HTTP %s：%s', re.compile(r"""^对方返回\ HTTP\ (.+?)：(.+?)$""", re.S), 'The peer returned HTTP %s: %s'),
+    ('%s 的小时或分钟超出范围', re.compile(r"""^(.+?)\ 的小时或分钟超出范围$""", re.S), 'The hour or minute of %s is out of range'),
+    ('第 %s 个时间组缺少名称', re.compile(r"""^第\ (.+?)\ 个时间组缺少名称$""", re.S), 'Time group #%s has no name'),
+    ('已读取会话 #%s 的日志', re.compile(r"""^已读取会话\ \#(.+?)\ 的日志$""", re.S), 'Log of session #%s loaded'),
+    ('已保存 %s 个 VLAN', re.compile(r"""^已保存\ (.+?)\ 个\ VLAN$""", re.S), 'Saved %s VLAN(s)'),
+    ('备份包清单解析失败：%s', re.compile(r"""^备份包清单解析失败：(.+?)$""", re.S), 'Failed to parse the backup manifest: %s'),
+    ('未知的内核选项操作：%s', re.compile(r"""^未知的内核选项操作：(.+?)$""", re.S), 'Unknown kernel option action: %s'),
+    ('未知的新手向导操作：%s', re.compile(r"""^未知的新手向导操作：(.+?)$""", re.S), 'Unknown wizard action: %s'),
+    ('未知的通知通道类型：%s', re.compile(r"""^未知的通知通道类型：(.+?)$""", re.S), 'Unknown notification channel type: %s'),
+    ('不支持的包管理操作：%s', re.compile(r"""^不支持的包管理操作：(.+?)$""", re.S), 'Unsupported package management action: %s'),
+    ('不支持的优先级预设：%s', re.compile(r"""^不支持的优先级预设：(.+?)$""", re.S), 'Unsupported priority preset: %s'),
+    ('系统用户 %s 创建成功', re.compile(r"""^系统用户\ (.+?)\ 创建成功$""", re.S), 'System user %s created'),
+    ('MAC 地址不合法：%s', re.compile(r"""^MAC\ 地址不合法：(.+?)$""", re.S), 'Invalid MAC address: %s'),
+    ('端口必须在 %s-%s 之间', re.compile(r"""^端口必须在\ (.+?)\-(.+?)\ 之间$""", re.S), 'The port must be between %s and %s'),
+    ('文件系统类型不合法：%s', re.compile(r"""^文件系统类型不合法：(.+?)$""", re.S), 'Invalid file system type: %s'),
+    ('已清理 %s 份过期快照', re.compile(r"""^已清理\ (.+?)\ 份过期快照$""", re.S), 'Cleaned up %s expired snapshots'),
+    ('快照已打包（%s KB）', re.compile(r"""^快照已打包（(.+?)\ KB）$""", re.S), 'Snapshot packaged (%s KB)'),
+    ('地址获取方式不合法：%s', re.compile(r"""^地址获取方式不合法：(.+?)$""", re.S), 'Invalid address acquisition method: %s'),
+    ('第 %s 个会话缺少账号', re.compile(r"""^第\ (.+?)\ 个会话缺少账号$""", re.S), 'Session #%s has no account'),
+    ('第 %s 个会话缺少密码', re.compile(r"""^第\ (.+?)\ 个会话缺少密码$""", re.S), 'Session #%s has no password'),
+    ('测试页已发送到 %s（%s）', re.compile(r"""^测试页已发送到\ (.+?)（(.+?)）$""", re.S), 'Test page sent to %s (%s)'),
+    ('OpenSOHO 已%s', re.compile(r"""^OpenSOHO\ 已(.+?)$""", re.S), 'OpenSOHO has been %s'),
+    ('已按主色 %s 生成%s配色', re.compile(r"""^已按主色\ (.+?)\ 生成(.+?)配色$""", re.S), 'Generated a %s colour scheme from the primary colour %s'),
+    ('已保存 %s 台唤醒设备', re.compile(r"""^已保存\ (.+?)\ 台唤醒设备$""", re.S), 'Saved %s wake-on-lan device(s)'),
+    ('安装完成：%s 项已就绪%s', re.compile(r"""^安装完成：(.+?)\ 项已就绪(.+?)$""", re.S), 'Installation finished: %s item(s) ready%s'),
+    ('不支持的队列操作：%s', re.compile(r"""^不支持的队列操作：(.+?)$""", re.S), 'Unsupported queue action: %s'),
+    ('准备数据目录失败：%s', re.compile(r"""^准备数据目录失败：(.+?)$""", re.S), 'Failed to prepare the data directory: %s'),
+    ('准备下载文件失败：%s', re.compile(r"""^准备下载文件失败：(.+?)$""", re.S), 'Failed to prepare the download file: %s'),
+    ('创建备份目录失败：%s', re.compile(r"""^创建备份目录失败：(.+?)$""", re.S), 'Failed to create the backup directory: %s'),
+    ('创建下载目录失败：%s', re.compile(r"""^创建下载目录失败：(.+?)$""", re.S), 'Failed to create the download directory: %s'),
+    ('不允许操作的服务：%s', re.compile(r"""^不允许操作的服务：(.+?)$""", re.S), 'Service not allowed: %s'),
+    ('不支持的服务操作：%s', re.compile(r"""^不支持的服务操作：(.+?)$""", re.S), 'Unsupported service action: %s'),
+    ('不支持的用户操作：%s', re.compile(r"""^不支持的用户操作：(.+?)$""", re.S), 'Unsupported user action: %s'),
+    ('不支持的日志操作：%s', re.compile(r"""^不支持的日志操作：(.+?)$""", re.S), 'Unsupported log action: %s'),
+    ('不支持的证书操作：%s', re.compile(r"""^不支持的证书操作：(.+?)$""", re.S), 'Unsupported certificate action: %s'),
+    ('不支持的电源操作：%s', re.compile(r"""^不支持的电源操作：(.+?)$""", re.S), 'Unsupported power action: %s'),
+    ('不支持的诊断工具：%s', re.compile(r"""^不支持的诊断工具：(.+?)$""", re.S), 'Unsupported diagnostic tool: %s'),
+    ('不支持的测试类型：%s', re.compile(r"""^不支持的测试类型：(.+?)$""", re.S), 'Unsupported test type: %s'),
+    ('不支持的多拨策略：%s', re.compile(r"""^不支持的多拨策略：(.+?)$""", re.S), 'Unsupported multi-dial strategy: %s'),
+    ('不支持的清理类型：%s', re.compile(r"""^不支持的清理类型：(.+?)$""", re.S), 'Unsupported cleanup type: %s'),
+    ('不支持的文件系统：%s', re.compile(r"""^不支持的文件系统：(.+?)$""", re.S), 'Unsupported file system: %s'),
+    ('系统用户 %s 已删除', re.compile(r"""^系统用户\ (.+?)\ 已删除$""", re.S), 'System user %s deleted'),
+    ('用户 %s 密码已更新', re.compile(r"""^用户\ (.+?)\ 密码已更新$""", re.S), 'Password for user %s updated'),
+    ('项目 %s 已保存到 %s', re.compile(r"""^项目\ (.+?)\ 已保存到\ (.+?)$""", re.S), 'Project %s saved to %s'),
+    ('父网卡名称不合法：%s', re.compile(r"""^父网卡名称不合法：(.+?)$""", re.S), 'Invalid parent interface name: %s'),
+    ('解析网卡信息失败：%s', re.compile(r"""^解析网卡信息失败：(.+?)$""", re.S), 'Failed to parse interface information: %s'),
+    ('参数 %s 取值不合法', re.compile(r"""^参数\ (.+?)\ 取值不合法$""", re.S), 'Invalid value for parameter %s'),
+    ('该设备已经挂载在 %s', re.compile(r"""^该设备已经挂载在\ (.+?)$""", re.S), 'This device is already mounted at %s'),
+    ('已卸载 /dev/%s', re.compile(r"""^已卸载\ /dev/(.+?)$""", re.S), '/dev/%s unmounted'),
+    ('已清理 %s 个备份包', re.compile(r"""^已清理\ (.+?)\ 个备份包$""", re.S), 'Cleaned up %s backup packages'),
+    ('已移入回收站 %s 项%s', re.compile(r"""^已移入回收站\ (.+?)\ 项(.+?)$""", re.S), 'Moved %s items to the trash%s'),
+    ('证书请求生成失败：%s', re.compile(r"""^证书请求生成失败：(.+?)$""", re.S), 'Failed to generate the certificate request: %s'),
+    ('CSR 生成失败：%s', re.compile(r"""^CSR\ 生成失败：(.+?)$""", re.S), 'Failed to generate the CSR: %s'),
+    ('自签证书生成失败：%s', re.compile(r"""^自签证书生成失败：(.+?)$""", re.S), 'Failed to generate the self-signed certificate: %s'),
+    ('写入快照备注失败：%s', re.compile(r"""^写入快照备注失败：(.+?)$""", re.S), 'Failed to write the snapshot note: %s'),
+    ('全部通道推送失败：%s', re.compile(r"""^全部通道推送失败：(.+?)$""", re.S), 'All channels failed to push: %s'),
+    ('%s 的阈值必须是数字', re.compile(r"""^(.+?)\ 的阈值必须是数字$""", re.S), 'The threshold of %s must be a number'),
+    ('加载加速规则失败：%s', re.compile(r"""^加载加速规则失败：(.+?)$""", re.S), 'Failed to load the acceleration rules: %s'),
+    ('会话 #%s %s 失败：%s', re.compile(r"""^会话\ \#(.+?)\ (.+?)\ 失败：(.+?)$""", re.S), 'Session #%s failed to %s: %s'),
+    ('写入租约文件失败：%s', re.compile(r"""^写入租约文件失败：(.+?)$""", re.S), 'Failed to write the lease file: %s'),
+    ('队列 %s 已添加（%s）', re.compile(r"""^队列\ (.+?)\ 已添加（(.+?)）$""", re.S), 'Queue %s added (%s)'),
+    ('当前 %s 个打印任务', re.compile(r"""^当前\ (.+?)\ 个打印任务$""", re.S), '%s print job(s) currently'),
+    ('设置接受任务失败：%s', re.compile(r"""^设置接受任务失败：(.+?)$""", re.S), 'Failed to set the accept-jobs option: %s'),
+    ('%s 配置已保存到磁盘%s', re.compile(r"""^(.+?)\ 配置已保存到磁盘(.+?)$""", re.S), '%s configuration saved to disk%s'),
+    ('NAT 检测完成：%s', re.compile(r"""^NAT\ 检测完成：(.+?)$""", re.S), 'NAT detection finished: %s'),
+    ('配额聚合写盘失败：%s', re.compile(r"""^配额聚合写盘失败：(.+?)$""", re.S), 'Failed to write the quota aggregation to disk: %s'),
+    ('创建挂载点失败：%s', re.compile(r"""^创建挂载点失败：(.+?)$""", re.S), 'Failed to create the mount point: %s'),
+    ('导出备份包失败：%s', re.compile(r"""^导出备份包失败：(.+?)$""", re.S), 'Failed to export the backup package: %s'),
+    ('删除备份包失败：%s', re.compile(r"""^删除备份包失败：(.+?)$""", re.S), 'Failed to delete the backup package: %s'),
+    ('未知的清理操作：%s', re.compile(r"""^未知的清理操作：(.+?)$""", re.S), 'Unknown cleanup action: %s'),
+    ('未知的备份操作：%s', re.compile(r"""^未知的备份操作：(.+?)$""", re.S), 'Unknown backup action: %s'),
+    ('未知的告警操作：%s', re.compile(r"""^未知的告警操作：(.+?)$""", re.S), 'Unknown alert action: %s'),
+    ('未知的配额操作：%s', re.compile(r"""^未知的配额操作：(.+?)$""", re.S), 'Unknown quota action: %s'),
+    ('未知的共享类型：%s', re.compile(r"""^未知的共享类型：(.+?)$""", re.S), 'Unknown share type: %s'),
+    ('快照编号不合法：%s', re.compile(r"""^快照编号不合法：(.+?)$""", re.S), 'Invalid snapshot number: %s'),
+    ('快照路径不可用：%s', re.compile(r"""^快照路径不可用：(.+?)$""", re.S), 'Snapshot path is not usable: %s'),
+    ('客户端「%s」已删除', re.compile(r"""^客户端「(.+?)」已删除$""", re.S), 'Client "%s" deleted'),
+    ('「%s」必须是正整数', re.compile(r"""^「(.+?)」必须是正整数$""", re.S), '"%s" must be a positive integer'),
+    ('「%s」必须大于 0', re.compile(r"""^「(.+?)」必须大于\ 0$""", re.S), '"%s" must be greater than 0'),
+    ('本机找不到文件：%s', re.compile(r"""^本机找不到文件：(.+?)$""", re.S), 'File not found on this host: %s'),
+    ('目标目录不存在：%s', re.compile(r"""^目标目录不存在：(.+?)$""", re.S), 'The target directory does not exist: %s'),
+    ('已归档 %s 条日志', re.compile(r"""^已归档\ (.+?)\ 条日志$""", re.S), 'Archived %s log entries'),
+    ('已创建配置快照：%s%s', re.compile(r"""^已创建配置快照：(.+?)(.+?)$""", re.S), 'Configuration snapshot created: %s%s'),
+    ('已打包 %s 个文件', re.compile(r"""^已打包\ (.+?)\ 个文件$""", re.S), 'Packaged %s files'),
+    ('CA 生成失败：%s', re.compile(r"""^CA\ 生成失败：(.+?)$""", re.S), 'Failed to generate the CA: %s'),
+    ('已送达 %s 个通道', re.compile(r"""^已送达\ (.+?)\ 个通道$""", re.S), 'Delivered to %s channel(s)'),
+    ('Bark 拒绝：%s', re.compile(r"""^Bark\ 拒绝：(.+?)$""", re.S), 'Bark refused: %s'),
+    ('广播地址不合法：%s', re.compile(r"""^广播地址不合法：(.+?)$""", re.S), 'Invalid broadcast address: %s'),
+    ('会话 #%s 不存在', re.compile(r"""^会话\ \#(.+?)\ 不存在$""", re.S), 'Session #%s does not exist'),
+    ('测试页发送失败：%s', re.compile(r"""^测试页发送失败：(.+?)$""", re.S), 'Failed to send the test page: %s'),
+    ('服务 %s %s 失败：%s', re.compile(r"""^服务\ (.+?)\ (.+?)\ 失败：(.+?)$""", re.S), 'Service %s failed to %s: %s'),
+    ('互联网测速失败：%s', re.compile(r"""^互联网测速失败：(.+?)$""", re.S), 'Internet speed test failed: %s'),
+    ('不支持的操作：%s', re.compile(r"""^不支持的操作：(.+?)$""", re.S), 'Unsupported action: %s'),
+    ('读取日志失败：%s', re.compile(r"""^读取日志失败：(.+?)$""", re.S), 'Failed to read the log: %s'),
+    ('读取目录失败：%s', re.compile(r"""^读取目录失败：(.+?)$""", re.S), 'Failed to read the directory: %s'),
+    ('查看详情失败：%s', re.compile(r"""^查看详情失败：(.+?)$""", re.S), 'Failed to load details: %s'),
+    ('创建目录失败：%s', re.compile(r"""^创建目录失败：(.+?)$""", re.S), 'Failed to create the directory: %s'),
+    ('打包快照失败：%s', re.compile(r"""^打包快照失败：(.+?)$""", re.S), 'Failed to package the snapshot: %s'),
+    ('清空历史失败：%s', re.compile(r"""^清空历史失败：(.+?)$""", re.S), 'Failed to clear the history: %s'),
+    ('清空统计失败：%s', re.compile(r"""^清空统计失败：(.+?)$""", re.S), 'Failed to clear the statistics: %s'),
+    ('修改密码失败：%s', re.compile(r"""^修改密码失败：(.+?)$""", re.S), 'Failed to change the password: %s'),
+    ('创建用户失败：%s', re.compile(r"""^创建用户失败：(.+?)$""", re.S), 'Failed to create the user: %s'),
+    ('删除用户失败：%s', re.compile(r"""^删除用户失败：(.+?)$""", re.S), 'Failed to delete the user: %s'),
+    ('配置校验失败：%s', re.compile(r"""^配置校验失败：(.+?)$""", re.S), 'Configuration validation failed: %s'),
+    ('强制重启失败：%s', re.compile(r"""^强制重启失败：(.+?)$""", re.S), 'Forced reboot failed: %s'),
+    ('服务启动失败：%s', re.compile(r"""^服务启动失败：(.+?)$""", re.S), 'Failed to start the service: %s'),
+    ('未知终端操作：%s', re.compile(r"""^未知终端操作：(.+?)$""", re.S), 'Unknown terminal action: %s'),
+    ('未知文件操作：%s', re.compile(r"""^未知文件操作：(.+?)$""", re.S), 'Unknown file action: %s'),
+    ('未知主题操作：%s', re.compile(r"""^未知主题操作：(.+?)$""", re.S), 'Unknown theme action: %s'),
+    ('未知的镜像源：%s', re.compile(r"""^未知的镜像源：(.+?)$""", re.S), 'Unknown mirror: %s'),
+    ('不允许的操作：%s', re.compile(r"""^不允许的操作：(.+?)$""", re.S), 'Operation not allowed: %s'),
+    ('主题「%s」已删除', re.compile(r"""^主题「(.+?)」已删除$""", re.S), 'Theme "%s" deleted'),
+    ('用户 %s 已存在', re.compile(r"""^用户\ (.+?)\ 已存在$""", re.S), 'User %s already exists'),
+    ('客户端不存在：%s', re.compile(r"""^客户端不存在：(.+?)$""", re.S), 'Client does not exist: %s'),
+    ('私钥生成失败：%s', re.compile(r"""^私钥生成失败：(.+?)$""", re.S), 'Failed to generate the private key: %s'),
+    ('项目 %s 不存在', re.compile(r"""^项目\ (.+?)\ 不存在$""", re.S), 'Project %s does not exist'),
+    ('备份 %s 不存在', re.compile(r"""^备份\ (.+?)\ 不存在$""", re.S), 'Backup %s does not exist'),
+    ('挂载点不合法：%s', re.compile(r"""^挂载点不合法：(.+?)$""", re.S), 'Invalid mount point: %s'),
+    ('网卡名不合法：%s', re.compile(r"""^网卡名不合法：(.+?)$""", re.S), 'Invalid interface name: %s'),
+    ('证书解析失败：%s', re.compile(r"""^证书解析失败：(.+?)$""", re.S), 'Failed to parse the certificate: %s'),
+    ('推送请求失败：%s', re.compile(r"""^推送请求失败：(.+?)$""", re.S), 'The push request failed: %s'),
+    ('邮件发送失败：%s', re.compile(r"""^邮件发送失败：(.+?)$""", re.S), 'Failed to send the email: %s'),
+    ('队列 %s 已删除', re.compile(r"""^队列\ (.+?)\ 已删除$""", re.S), 'Queue %s deleted'),
+    ('任务 %s 已取消', re.compile(r"""^任务\ (.+?)\ 已取消$""", re.S), 'Job %s cancelled'),
+    ('添加队列失败：%s', re.compile(r"""^添加队列失败：(.+?)$""", re.S), 'Failed to add the queue: %s'),
+    ('删除队列失败：%s', re.compile(r"""^删除队列失败：(.+?)$""", re.S), 'Failed to delete the queue: %s'),
+    ('取消任务失败：%s', re.compile(r"""^取消任务失败：(.+?)$""", re.S), 'Failed to cancel the job: %s'),
+    ('设置共享失败：%s', re.compile(r"""^设置共享失败：(.+?)$""", re.S), 'Failed to set up the share: %s'),
+    ('设为默认失败：%s', re.compile(r"""^设为默认失败：(.+?)$""", re.S), 'Failed to set as default: %s'),
+    ('%s 的唤醒功能已%s', re.compile(r"""^(.+?)\ 的唤醒功能已(.+?)$""", re.S), 'The wake-on-lan function of %s has been %s'),
+    ('写入 %s 失败：%s', re.compile(r"""^写入\ (.+?)\ 失败：(.+?)$""", re.S), 'Failed to write %s: %s'),
+    ('%s 的 %s 用量：%s', re.compile(r"""^(.+?)\ 的\ (.+?)\ 用量：(.+?)$""", re.S), '%s usage of %s: %s'),
+    ('重命名失败：%s', re.compile(r"""^重命名失败：(.+?)$""", re.S), 'Rename failed: %s'),
+    ('格式化失败：%s', re.compile(r"""^格式化失败：(.+?)$""", re.S), 'Formatting failed: %s'),
+    ('未知的模块：%s', re.compile(r"""^未知的模块：(.+?)$""", re.S), 'Unknown module: %s'),
+    ('找不到设备：%s', re.compile(r"""^找不到设备：(.+?)$""", re.S), 'Device not found: %s'),
+    ('快照不存在：%s', re.compile(r"""^快照不存在：(.+?)$""", re.S), 'Snapshot does not exist: %s'),
+    ('主题不存在：%s', re.compile(r"""^主题不存在：(.+?)$""", re.S), 'Theme does not exist: %s'),
+    ('用户不存在：%s', re.compile(r"""^用户不存在：(.+?)$""", re.S), 'User does not exist: %s'),
+    ('%s:%s —— %s %s', re.compile(r"""^(.+?):(.+?)\ ——\ (.+?)\ (.+?)$""", re.S), '%s:%s — %s %s'),
+    ('文件不存在：%s', re.compile(r"""^文件不存在：(.+?)$""", re.S), 'File does not exist: %s'),
+    ('目录已存在：%s', re.compile(r"""^目录已存在：(.+?)$""", re.S), 'Directory already exists: %s'),
+    ('目标已存在：%s', re.compile(r"""^目标已存在：(.+?)$""", re.S), 'The target already exists: %s'),
+    ('已创建目录 %s', re.compile(r"""^已创建目录\ (.+?)$""", re.S), 'Directory %s created'),
+    ('已删除快照 %s', re.compile(r"""^已删除快照\ (.+?)$""", re.S), 'Snapshot %s deleted'),
+    ('会话 #%s 已%s', re.compile(r"""^会话\ \#(.+?)\ 已(.+?)$""", re.S), 'Session #%s has been %s'),
+    ('%s 格式不正确', re.compile(r"""^(.+?)\ 格式不正确$""", re.S), '%s is not in the correct format'),
+    ('%s 配置已应用%s', re.compile(r"""^(.+?)\ 配置已应用(.+?)$""", re.S), '%s configuration applied%s'),
+    ('已执行清理：%s', re.compile(r"""^已执行清理：(.+?)$""", re.S), 'Cleanup performed: %s'),
+    ('未知操作：%s', re.compile(r"""^未知操作：(.+?)$""", re.S), 'Unknown action: %s'),
+    ('不支持的 %s', re.compile(r"""^不支持的\ (.+?)$""", re.S), 'Unsupported %s'),
+    ('读取失败：%s', re.compile(r"""^读取失败：(.+?)$""", re.S), 'Failed to read: %s'),
+    ('写入失败：%s', re.compile(r"""^写入失败：(.+?)$""", re.S), 'Failed to write: %s'),
+    ('操作失败：%s', re.compile(r"""^操作失败：(.+?)$""", re.S), 'Operation failed: %s'),
+    ('计算失败：%s', re.compile(r"""^计算失败：(.+?)$""", re.S), 'Calculation failed: %s'),
+    ('创建失败：%s', re.compile(r"""^创建失败：(.+?)$""", re.S), 'Creation failed: %s'),
+    ('删除失败：%s', re.compile(r"""^删除失败：(.+?)$""", re.S), 'Deletion failed: %s'),
+    ('清理失败：%s', re.compile(r"""^清理失败：(.+?)$""", re.S), 'Cleanup failed: %s'),
+    ('解包失败：%s', re.compile(r"""^解包失败：(.+?)$""", re.S), 'Extraction failed: %s'),
+    ('下载失败：%s', re.compile(r"""^下载失败：(.+?)$""", re.S), 'Download failed: %s'),
+    ('打包失败：%s', re.compile(r"""^打包失败：(.+?)$""", re.S), 'Packaging failed: %s'),
+    ('导出失败：%s', re.compile(r"""^导出失败：(.+?)$""", re.S), 'Export failed: %s'),
+    ('升级失败：%s', re.compile(r"""^升级失败：(.+?)$""", re.S), 'Upgrade failed: %s'),
+    ('安装失败：%s', re.compile(r"""^安装失败：(.+?)$""", re.S), 'Installation failed: %s'),
+    ('停止失败：%s', re.compile(r"""^停止失败：(.+?)$""", re.S), 'Failed to stop: %s'),
+    ('卸载失败：%s', re.compile(r"""^卸载失败：(.+?)$""", re.S), 'Failed to unmount: %s'),
+    ('挂载失败：%s', re.compile(r"""^挂载失败：(.+?)$""", re.S), 'Mount failed: %s'),
+    ('清空失败：%s', re.compile(r"""^清空失败：(.+?)$""", re.S), 'Clearing failed: %s'),
+    ('还原失败：%s', re.compile(r"""^还原失败：(.+?)$""", re.S), 'Restore failed: %s'),
+    ('渲染失败：%s', re.compile(r"""^渲染失败：(.+?)$""", re.S), 'Rendering failed: %s'),
+    ('未知阶段：%s', re.compile(r"""^未知阶段：(.+?)$""", re.S), 'Unknown stage: %s'),
+    ('用户 %s 已%s', re.compile(r"""^用户\ (.+?)\ 已(.+?)$""", re.S), 'User %s has been %s'),
+    ('%s:%s —— %s', re.compile(r"""^(.+?):(.+?)\ ——\ (.+?)$""", re.S), '%s:%s — %s'),
+    ('不是目录：%s', re.compile(r"""^不是目录：(.+?)$""", re.S), 'Not a directory: %s'),
+    ('已删除「%s」', re.compile(r"""^已删除「(.+?)」$""", re.S), 'Deleted "%s"'),
+    ('修复完成：%s', re.compile(r"""^修复完成：(.+?)$""", re.S), 'Fix finished: %s'),
+    ('签发失败：%s', re.compile(r"""^签发失败：(.+?)$""", re.S), 'Issuing failed: %s'),
+    ('已导入%s「%s」%s', re.compile(r"""^已导入(.+?)「(.+?)」(.+?)$""", re.S), 'Imported %s "%s"%s'),
+    ('对方拒绝：%s', re.compile(r"""^对方拒绝：(.+?)$""", re.S), 'The peer refused: %s'),
+    ('服务 %s 已%s', re.compile(r"""^服务\ (.+?)\ 已(.+?)$""", re.S), 'Service %s has been %s'),
+    ('时间组「%s」%s', re.compile(r"""^时间组「(.+?)」(.+?)$""", re.S), 'Time group "%s" %s'),
+    ('客户端已%s', re.compile(r"""^客户端已(.+?)$""", re.S), 'The client has been %s'),
+    ('项目 %s %s', re.compile(r"""^项目\ (.+?)\ (.+?)$""", re.S), 'Project %s %s'),
+    ('%s 失败：%s', re.compile(r"""^(.+?)\ 失败：(.+?)$""", re.S), '%s failed: %s'),
+    ('已上传 %s', re.compile(r"""^已上传\ (.+?)$""", re.S), 'Uploaded %s'),
+    ('容器 %s %s', re.compile(r"""^容器\ (.+?)\ (.+?)$""", re.S), 'Container %s %s'),
+    ('队列 %s：%s', re.compile(r"""^队列\ (.+?)：(.+?)$""", re.S), 'Queue %s: %s'),
+]
+
+
+def _msg_lookup(cn):
+    """按中文原文找英文：先精确键，再模板正则。找不到返回 None。
+
+    ⚠️ 模板正则必须**把捕获组回填进英文模板**，不能直接把英文模板返回 ——
+    那样界面上会出现字面量 "Snapshot does not exist: %s"（%s 没被替换）。
+    回填用 `% en % m.groups()`；英文模板里的数值占位符在生成时已统一
+    归一成 %s，所以捕获组是字符串也不会 TypeError。
+    """
+    v = MSG_EN.get(cn)
+    if v is not None:
+        return v
+    for _tpl, _rx, _en in _MSG_RX:
+        m = _rx.match(cn)
+        if not m:
+            continue
+        try:
+            return _en % m.groups()
+        except (TypeError, ValueError):
+            # 捕获组个数与英文模板占位符个数不一致（表写错了）。
+            # ⚠️ 不许静默返回带 %s 的模板 —— 那等于把 bug 显示给用户。
+            # 降级：跳过这条正则继续找；都没有就回落中文。
+            continue
+    return None
+
+
+def _resolve(msg, en):
+    """把 (中文原文, 显式 en) 归一成 (msg_en, msg)。
+
+    ⚠️ msg_en 必须在这里填好，不能只填 msg ——
+    前端要按语言自己挑时读的是 msg_en，msg_en 为 None 会渲染成空白。
+    优先级：显式 en= 参数 > MSG_EN / 模板正则 > None（None = 没有英文）。
+    """
+    en = en or _msg_lookup(msg)
+    return en, _pick(msg, en)
+
+
+def _pick(cn, en):
+    """按当前语言挑文案。
+
+    优先级：显式 en= 参数 > MSG_EN / 模板正则 > 中文原文。
+    无论走哪条，**返回值永远非空**（缺词显示中文，不显示空白）。
+    """
+    if _cur_lang[0] == 'en-US':
+        if en:
+            return en
+        return _msg_lookup(cn) or cn
+    return cn
+
+
+def ok(data=None, msg='操作成功', code='OK', en=None):
+    """成功响应。
+
+    `en` 可选：显式传就优先用它；不传则按 msg 到 MSG_EN 查表
+    （见文件头 MSG_EN 上方的说明）。查不到就回落中文，不会显示空白。
+    """
+    en, m = _resolve(msg, en)
+    return {'ok': True, 'code': code, 'msg_cn': msg, 'msg_en': en,
+            'msg': m, 'data': data}
+
+
+def fail(msg, code='ERR', data=None, en=None):
+    """失败响应。`en` 的语义同 ok()。"""
+    en, m = _resolve(msg, en)
+    return {'ok': False, 'code': code, 'msg_cn': msg, 'msg_en': en,
+            'msg': m, 'data': data}
 
 
 def sh(cmd, timeout=15, input_data=None, cwd=None, env=None):
@@ -243,14 +1301,19 @@ def sh(cmd, timeout=15, input_data=None, cwd=None, env=None):
     try:
         p = subprocess.run(cmd, **kw)
         return p.returncode, p.stdout.strip(), p.stderr.strip()
+    # ⚠️ 这些串会被直接搬到页面上（Docker 页的「Note:命令不存在：docker」就是这条），
+    #    所以必须跟着界面语言走，不能只给中文。
     except subprocess.TimeoutExpired:
-        return 124, '', '命令执行超时（%ss）' % timeout
+        return 124, '', _pick('命令执行超时（%ss）' % timeout,
+                              'Command timed out (%ss)' % timeout)
     except FileNotFoundError:
-        return 127, '', '命令不存在：%s' % cmd[0]
+        return 127, '', _pick('命令不存在：%s' % cmd[0],
+                              'Command not found: %s' % cmd[0])
     except NotADirectoryError:
-        return 126, '', '工作目录不存在：%s' % cwd
+        return 126, '', _pick('工作目录不存在：%s' % cwd,
+                              'Working directory does not exist: %s' % cwd)
     except PermissionError as e:
-        return 126, '', '权限不足：%s' % e
+        return 126, '', _pick('权限不足：%s' % e, 'Permission denied: %s' % e)
 
 
 # 单份结构化日志的大小阈值：超过就切成 .1（只保留一份旧档）。
@@ -1037,7 +2100,12 @@ def read_sysinfo(_):
     bios_info = _read_bios()
     virt = _detect_virt()
     cpu = _read_cpu()
-    cpu_pct = _read_cpu_usage()
+    # ⚠️ 走带缓存的采样器，**不要**直接 _read_cpu_usage() ——
+    #    后者每次 time.sleep(0.25)，而 /api/sysinfo 是「每次切页面都调」
+    #    的高频接口（2026-10-09 实测真机 252ms，其中 250ms 全在这个 sleep）。
+    #    _cpu_pct_cached 用 _METRIC_CACHE 存上一次 /proc/stat 快照，
+    #    只有首次调用才会 sleep 一次，之后都是零成本差分。
+    cpu_pct = _cpu_pct_cached()
     disks = _read_disks()
     # 根分区百分比（去掉 % 转数字）
     root = next((x for x in disks if x['mount'] == '/'), disks[0] if disks else None)
@@ -1158,6 +2226,186 @@ def read_sysinfo(_):
     })
 
 
+def _boot_id():
+    """本次启动的唯一标识：/proc/sys/kernel/random/boot_id。
+
+    ⚠️ 为什么需要它：算「接口已连接多久」要用 uptime 做基准，但 uptime
+    **每次重启都会归零**。如果只存 uptime 值，重启后会把「上次记录的 80000」
+    与「这次的 3600」相减，得出**负数**。用 boot_id 区分不同次启动，
+    遇到 boot_id 变了就重新记起点。
+    """
+    try:
+        with open('/proc/sys/kernel/random/boot_id') as f:
+            return f.read().strip()
+    except Exception:
+        return ''
+
+
+def _uptime_sec():
+    """系统已运行秒数（浮点取整）。"""
+    try:
+        with open('/proc/uptime') as f:
+            return int(float(f.read().split()[0]))
+    except Exception:
+        return 0
+
+
+def _link_since(name):
+    """接口「本次 up 到现在」的秒数。返回 (秒数, 是否可信)。
+
+    ⛔ 内核**没有**直接给出「接口 up 了多少秒」这个字段
+    （`/sys/class/net/<n>/` 里没有时间戳，carrier 只有 0/1 和翻转**次数**）。
+    但可以用 uptime 做基准把它**算**出来：
+
+      状态文件记「接口变 up 那一刻的 uptime 值 + 当时的 boot_id」，
+      之后每次读：现在 uptime − 记下的 uptime = 已连接秒数。
+
+    ⚠️ 三个必须说清的限制（1.0.10）：
+    ① **首次记录的时刻就是起点**。如果 drouter 是在接口已经 up 之后才装的
+       （绝大多数情况），那算出来的是「从第一次记录到现在」，
+       **不是**「从接口插上到现在」—— 会偏小。
+       所以返回值带上可信度标记，前端要如实说明。
+    ② **标签页关闭期间不再累加**？不 —— 状态写在磁盘上，下次读时用
+       uptime 差值算，所以**关页面、关浏览器都不影响**，重启机器才归零。
+    ③ 接口 down→up 时翻转，重新记起点（这个是准确的）。
+
+    纯标准库：/proc/uptime + /proc/sys/kernel/random/boot_id + json 文件。
+    不需要任何第三方库。
+    """
+    db = os.path.join('/var/lib/drouter', 'link-since.json')
+    try:
+        os.makedirs(os.path.dirname(db), exist_ok=True)
+    except Exception:
+        return 0, False
+    up = _uptime_sec()
+    if up <= 0:
+        return 0, False
+    try:
+        with open('/sys/class/net/%s/operstate' % name) as f:
+            oper = f.read().strip()
+    except Exception:
+        return 0, False
+    boot = _boot_id()
+    try:
+        with open(db, encoding='utf-8') as f:
+            st = json.load(f)
+    except Exception:
+        st = {}
+    rec = st.get(name) or {}
+    # ① 首次记录
+    if not rec or oper != 'up':
+        rec = {'boot': boot, 'start_uptime': up, 'at': time.time()}
+        st[name] = rec
+        try:
+            tmp = db + '.part'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(st, f)
+            os.replace(tmp, db)
+        except Exception:
+            pass
+        return 0, False          # 刚记起点，还不知道过了多久
+    # ② 重启过 → uptime 归零，重新记
+    # ⚠️ 这里必须比对 boot_id：机器重启后 uptime 归零，而状态文件里的
+    #    start_uptime 还是上一次启动的值，直接相减会得到**负数**。
+    #    2026-10-06 曾被误改成 `if False:`（无关注释清理时的误伤），
+    #    重启检测静默失效 —— _dev/t-update.py 的判据就是守这一条的。
+    if rec.get('boot') != boot:
+        rec = {'boot': boot, 'start_uptime': up, 'at': time.time()}
+        st[name] = rec
+        try:
+            tmp = db + '.part'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(st, f)
+            os.replace(tmp, db)
+        except Exception:
+            pass
+        return 0, False
+    # ③ 正常算差值
+    sec = up - int(rec.get('start_uptime') or 0)
+    if sec < 0:
+        return 0, False
+    # 可信度：起点是本次启动的早期（< 5 分钟）说明是开机就连上的，比较准
+    trusted = int(rec.get('start_uptime') or 0) < 300
+    return sec, trusted
+
+
+def _ethtool_stats(name):
+    """读取网卡的 ethtool 详细计数。
+
+    为什么需要：`/sys/class/net/*/statistics/` 只有 6 个基础计数
+    （收发字节/包/错误），用户要看的**丢包、组播、冲突、carrier 变化**
+    这些细分项全在 ethtool 里。
+
+    ⚠️ 三个必须注意的点：
+    ① **ethtool 可能没装**（net-tools 包）。这时返回 ok=False，
+       前端显示「未安装 ethtool，无法显示详细统计」而不是显示一堆 0 ——
+       显示 0 会让用户以为网卡没问题。
+    ② **不同驱动的计数器名字不一样**。igb/ixgbe 叫 rx_dropped，
+       r8169 叫 rx_missed_errors，virtio_net 干脆没有。所以是
+       「抓到什么给什么」，不认识的键不硬编。
+    ③ ethtool 是**外部命令**，逐个网卡调会拖慢接口响应。
+       这里带 4 秒超时，且任何异常都吞掉返回空 —— 拿不到统计不该
+       让整个网卡列表挂掉。
+
+    返回：{'ok': True, 'items': [{'label','value','key'}...],
+           'speed': '1000Mb/s', 'duplex': 'Full', 'link': 'yes'}
+    或 {'ok': False, 'reason': '...'}
+    """
+    out = {'ok': False, 'items': [], 'speed': '', 'duplex': '', 'link': ''}
+    if not re.match(r'^[a-zA-Z0-9_.:-]+$', str(name or '')):
+        out['reason'] = '接口名不合法'
+        return out
+    rc, so, se = sh(['ethtool', name], timeout=4)
+    if rc != 0:
+        rc2, _so2, se2 = sh(['which', 'ethtool'], timeout=4)
+        if rc2 != 0:
+            out['reason'] = '未安装 ethtool（apt install ethtool）'
+        else:
+            out['reason'] = ((se or se2 or '').strip()[:80] or 'ethtool 读取失败')
+        return out
+    # 只保留用户关心的项，顺序按「已接收…」→「发送…」排列（保持原始顺序）
+    keymap = {
+        'rx_bytes': '已接收字节数', 'rx_packets': '已接收数据包',
+        'rx_multicast': '已接收组播', 'rx_errors': '接收出错',
+        'rx_dropped': '接收丢包', 'rx_missed_errors': '接收丢包（硬件）',
+        'rx_no_buffer_count': '接收丢包（无缓冲区）',
+        'rx_fifo_errors': '接收 FIFO 错误', 'rx_frame_errors': '接收帧错误',
+        'rx_crc_errors': '接收 CRC 错误',
+        'tx_bytes': '已发送字节数', 'tx_packets': '已发送数据包',
+        'tx_errors': '发送错误', 'tx_dropped': '发送丢包',
+        'tx_carrier_errors': '发送载波错误', 'tx_fifo_errors': '发送 FIFO 错误',
+        'tx_collisions': '发现冲突', 'collisions': '发现冲突',
+        'multicast': '已发送组播', 'broadcast': '已发送广播',
+    }
+    seen = set()
+    for raw_line in (so or '').splitlines():
+        line = raw_line.strip()
+        if ':' not in line:
+            # 无缩进的是 "Speed: 1000Mb/s" / "Duplex: Full" 这类
+            if line.startswith('Speed:'):
+                out['speed'] = line.split(':', 1)[1].strip()
+            elif line.startswith('Duplex:'):
+                out['duplex'] = line.split(':', 1)[1].strip()
+            elif line.startswith('Link detected:'):
+                out['link'] = line.split(':', 1)[1].strip()
+            continue
+        k, v = line.split(':', 1)
+        k = k.strip()
+        v = v.strip()
+        label = keymap.get(k)
+        if not label or k in seen:
+            continue
+        # 值可能是 "12345" 或 "0 (0.0/sec)"，只取数字部分
+        mnum = re.match(r'^(\d+)', v)
+        if not mnum:
+            continue
+        seen.add(k)
+        out['items'].append({'label': label, 'value': int(mnum.group(1)),
+                             'key': k})
+    out['ok'] = True
+    return out
+
+
 def _mod_version(mod):
     """读取内核模块版本号（sysfs 优先，其次 modinfo）。"""
     try:
@@ -1275,12 +2523,24 @@ def read_ifaces(_):
         bpath = '/sys/class/net/%s/brif' % name
         if os.path.isdir(bpath):
             members = sorted(os.listdir(bpath))
-        res.append({
+        # 详细计数（ethtool）。用户要看「丢包 / 错误 / 组播 / 冲突」这些细分项，
+        # 光靠 /sys/class/net/*/statistics 拿不到（那里只有 6 个基础计数）。
+        et = _ethtool_stats(name)
+        # 「已连接时长」：内核没这个字段，用 uptime 差值算（见 _link_since）
+        # ⚠️ 不要在这里加 `if oper == 'up'` 之类的条件 ——
+        #    read_ifaces 里的 oper 是 IFF_UP 的**数字标志**（16），
+        #    不是 /sys 的 operstate 字符串（"up"），所以那个判断**永远为假**，
+        #    uptime_s 会全是 0。operstate 由 _link_since 自己去读（它只对
+        #    真正 up 的接口计时，down 的会重记起点）。
+        up_sec, up_trusted = _link_since(name)
+        row = {
             'name': name, 'mac': mac, 'mtu': mtu, 'oper': oper,
             'up': 'UP' in flags, 'addrs': addrs, 'speed': speed,
             'driver': driver, 'driver_version': drv_ver,
             'driver_source': drv_src, 'driver_full': drv_full,
             'stat': stat, 'bridge_members': members,
+            'ethtool': et,
+            'uptime_s': up_sec, 'uptime_trusted': up_trusted,
             'is_bridge': bool(members) or os.path.isdir('/sys/class/net/%s/bridge' % name),
             # ifb-* 是本机 QoS 智能限速创建的 Intermediate Functional Block 虚拟网卡
             # （Linux 只能整形出向流量，入向要先重定向到 ifb 才能限速），不是可插网卡，
@@ -1288,7 +2548,8 @@ def read_ifaces(_):
             'is_virtual': name in ('lo', 'docker0') or name.startswith(
                 ('veth', 'br-', 'virbr', 'ppp', 'ifb')),
             'managed_by': ('QoS 智能限速' if name.startswith('ifb') else ''),
-        })
+        }
+        res.append(row)
     # 合并已保存的备注/角色（以 MAC 为键，换网卡名也不会错乱）
     try:
         import sqlite3
@@ -1363,6 +2624,522 @@ def _svc_states(names):
             out[n] = {'active': chunk[0] or 'inactive',
                       'enabled': chunk[1] or 'disabled'}
     return out
+
+
+def _st_settings():
+    """一次性读回 settings 表全部键（健康总览要用好几个模块的配置）。
+
+    逐个 _load_setting 会开 N 次 sqlite 连接；这里一次读完再在内存里取。
+    """
+    out = {}
+    try:
+        import sqlite3
+        conn = sqlite3.connect('/opt/drouter/data/drouter.db')
+        conn.row_factory = sqlite3.Row
+        for r in conn.execute('SELECT key, value FROM settings'):
+            try:
+                out[r['key']] = json.loads(r['value']) if r['value'] else None
+            except Exception:
+                out[r['key']] = None
+        conn.close()
+    except Exception:
+        pass
+    return out
+
+
+def _st_resources():
+    """健康总览用的**轻量**资源快照：全部零 fork。
+
+    ⚠️ 不能用 read_metrics() —— 它顺带做 ping 测 RTT / 抖动，实测本机 1.2s，
+    而状态看板是**被轮询**的接口，把它拖成秒级就等于自己给自己制造卡顿。
+    这里只取 CPU / 内存 / 磁盘 / 温度 / 负载 / 进程数，全是 /proc 与 statvfs。
+    """
+    out = {'cpu_pct': None, 'mem': {}, 'disk': {}, 'temp_c': None,
+           'load': [], 'proc_count': 0}
+    try:
+        out['cpu_pct'] = _cpu_pct_cached()
+    except Exception:
+        pass
+    try:
+        with open('/proc/meminfo') as f:
+            mi = {}
+            for line in f:
+                k, v = line.split(':', 1)
+                mi[k.strip()] = int(v.split()[0])
+        total = mi.get('MemTotal', 0) // 1024
+        avail = mi.get('MemAvailable', 0) // 1024
+        out['mem'] = {'total_mb': total, 'used_mb': total - avail,
+                      'avail_mb': avail,
+                      'pct': round((total - avail) * 100.0 / max(total, 1), 1)}
+    except Exception:
+        pass
+    try:
+        sv = os.statvfs('/')
+        dtot = sv.f_blocks * sv.f_frsize
+        dfree = sv.f_bavail * sv.f_frsize
+        dused = dtot - sv.f_bfree * sv.f_frsize
+        out['disk'] = {'pct': round(dused * 100.0 / max(dtot, 1), 1),
+                       'used_h': _hbytes(dused), 'total_h': _hbytes(dtot),
+                       'free_h': _hbytes(dfree)}
+    except Exception:
+        pass
+    try:
+        out['temp_c'], _src = _read_temp()
+    except Exception:
+        pass
+    try:
+        with open('/proc/loadavg') as f:
+            out['load'] = f.read().split()[0:3]
+    except Exception:
+        pass
+    try:
+        out['proc_count'] = sum(1 for x in os.listdir('/proc') if x.isdigit())
+    except Exception:
+        pass
+    return out
+
+
+def _st_latest_dir(root, pat):
+    """目录下匹配 pat 的条目里最新的一个，返回 (条数, 最新名字, 最新 mtime)。"""
+    n, newest, mt = 0, '', 0.0
+    try:
+        for name in os.listdir(root):
+            if not re.match(pat, name):
+                continue
+            n += 1
+            try:
+                m = os.path.getmtime(os.path.join(root, name))
+            except Exception:
+                continue
+            if m > mt:
+                mt, newest = m, name
+    except Exception:
+        pass
+    return n, newest, mt
+
+
+_STATUS_CACHE = {'ts': 0, 'data': None}
+_STATUS_TTL = 5
+
+
+def read_status(_):
+    """健康总览（#5）：一次性汇总各模块的运行状态灯。
+
+    三条设计约束（都是踩过的坑）：
+      1) **只回稳定枚举 + 原始数值**，中英文文案一律由前端 t() 出 ——
+         后端下发中文正是这套 i18n 债的根源，这里不再新增；
+      2) 每个模块单独 try/except：一个模块炸了只让它那盏灯变 na，
+         不能连坐整块看板（否则一个不认识的 /sys 节点就能把整页打空）；
+      3) 只走已有的轻量加载器 + **一次**批量 systemctl，不额外 fork。
+         结果按 _STATUS_TTL 秒缓存 —— 前端会轮询它，2 核机器上不能每次都全量算。
+
+    返回 {'ts': .., 'items': [{'k': 模块键, 'lv': ok|warn|err|off|na,
+                               'c': 稳定状态码, 'm': {指标名: 值}}]}
+    """
+    now = int(time.time())
+    c = _STATUS_CACHE
+    if c['data'] is not None and (now - c['ts']) < _STATUS_TTL:
+        return ok(c['data'])
+
+    try:
+        # 一次批量取回：SAFE_SERVICES 之外，健康总览还要看这几个单元。
+        # 分开调 _svc_states 会多 fork 好几次（每次都要连 dbus），
+        # 而这是个被轮询的接口 —— 一次问完。
+        svc = _svc_states(SAFE_SERVICES + ['wg-quick@wg0', 'drouter-logd', 'cups'])
+    except Exception:
+        svc = {}
+    met = _st_resources()
+    try:
+        cfg = _st_settings()
+    except Exception:
+        cfg = {}
+
+    items = []
+
+    def _svc(name):
+        d = svc.get(name) or {}
+        return str(d.get('active') or 'unknown'), str(d.get('enabled') or 'unknown')
+
+    def _svc_lv(name):
+        """由 systemd 状态推出 (level, code)。不猜配置，只看事实。"""
+        act, en = _svc(name)
+        if act == 'active':
+            return 'ok', 'running'
+        if act in ('activating', 'reloading'):
+            return 'warn', 'starting'
+        if act == 'failed':
+            return 'err', 'failed'
+        if en in ('enabled', 'enabled-runtime', 'alias'):
+            return 'warn', 'stopped'
+        if en in ('disabled', 'masked', 'masked-runtime'):
+            return 'off', 'disabled'
+        return 'na', 'unknown'
+
+    def _run(k, fn):
+        try:
+            lv, code, m = fn()
+            items.append({'k': k, 'lv': lv, 'c': code or '', 'm': m or {}})
+        except Exception as e:
+            log('warn', 'status', 'ITEM_ERR', '健康总览 %s 判定失败：%s' % (k, e))
+            items.append({'k': k, 'lv': 'na', 'c': 'error', 'm': {}})
+
+    # ---- 1. 系统资源（CPU / 内存 / 磁盘 / 温度 / 负载）----
+    def _system():
+        mem = met.get('mem') or {}
+        dk = met.get('disk') or {}
+        cpu, mp, dp, tp = met.get('cpu_pct'), mem.get('pct'), dk.get('pct'), met.get('temp_c')
+        lv = 'ok'
+        if (dp or 0) >= 95 or (mp or 0) >= 95 or (tp or 0) >= 85:
+            lv = 'err'
+        elif (dp or 0) >= 85 or (mp or 0) >= 85 or (tp or 0) >= 75:
+            lv = 'warn'
+        load = met.get('load') or []
+        return lv, 'ok', {'cpu': cpu, 'mem': mp, 'disk': dp, 'temp': tp,
+                          'load': (load[0] if load else None),
+                          'proc': met.get('proc_count'),
+                          'mem_used_mb': mem.get('used_mb'),
+                          'mem_total_mb': mem.get('total_mb'),
+                          'disk_used_h': dk.get('used_h'),
+                          'disk_total_h': dk.get('total_h')}
+    _run('system', _system)
+
+    # ---- 2. 上游 / 外网链路 ----
+    def _wan():
+        d = (read_upstream({}) or {}).get('data') or {}
+        v4 = [x for x in (d.get('v4') or []) if x.get('addr')]
+        v6 = [x for x in (d.get('v6') or []) if x.get('addr')]
+        gw4 = [x for x in v4 if x.get('gw')]
+        if gw4:
+            lv, code = 'ok', 'up'
+        elif v4:
+            lv, code = 'warn', 'noaddr'
+        else:
+            lv, code = 'err', 'down'
+        first = gw4[0] if gw4 else (v4[0] if v4 else {})
+        return lv, code, {'v4': len(v4), 'v6': len(v6),
+                          'proto': first.get('proto') or '',
+                          'iface': first.get('name') or '',
+                          'gw': first.get('gw') or '',
+                          'dns': len(first.get('dns') or [])}
+    _run('wan', _wan)
+
+    # ---- 3. DNS / DHCP（dnsmasq）----
+    def _dnsdhcp():
+        lv, code = _svc_lv('dnsmasq')
+        leases = 0
+        try:
+            with open('/var/lib/misc/dnsmasq.leases', encoding='utf-8',
+                      errors='replace') as f:
+                for ln in f:
+                    if ln.strip():
+                        leases += 1
+        except Exception:
+            pass
+        return lv, code, {'leases': leases}
+    _run('dnsdhcp', _dnsdhcp)
+
+    # ---- 4. IPv6 / RA（radvd）----
+    def _ipv6():
+        lv, code = _svc_lv('radvd')
+        fwd = 0
+        try:
+            with open('/proc/sys/net/ipv6/conf/all/forwarding') as f:
+                fwd = int((f.read() or '0').strip() or 0)
+        except Exception:
+            pass
+        if lv == 'off' and fwd:
+            # 转发开着但 RA 没跑：双栈环境里这是常见的「只做转发不发 RA」
+            lv = 'na'
+        return lv, code, {'forwarding': fwd}
+    _run('ipv6', _ipv6)
+
+    # ---- 5. 防火墙（drouter 自己的 nft 表）----
+    def _fw():
+        rc, out, _e = sh(['nft', 'list', 'tables'], timeout=15)
+        own = 0
+        for ln in (out or '').splitlines():
+            if 'drouter' in ln:
+                own += 1
+        if own:
+            return 'ok', 'active', {'tables': own}
+        return 'off', 'inactive', {'tables': 0}
+    _run('fw', _fw)
+
+    # ---- 6. UPnP / NAT-PMP ----
+    def _upnp():
+        lv, code = _svc_lv('miniupnpd')
+        maps = 0
+        for p in ('/var/run/miniupnpd.leases', '/run/miniupnpd/miniupnpd.leases',
+                  '/run/miniupnpd.leases'):
+            try:
+                with open(p, encoding='utf-8', errors='replace') as f:
+                    maps += sum(1 for ln in f if ln.strip() and not ln.startswith('#'))
+                break
+            except Exception:
+                continue
+        return lv, code, {'mappings': maps}
+    _run('upnp', _upnp)
+
+    # ---- 7. NTP 时间同步 ----
+    def _ntp():
+        lv, code = _svc_lv('chrony')
+        synced = False
+        offset = ''
+        try:
+            rc, tr, _e = sh(['chronyc', '-n', 'tracking'], timeout=12)
+            if rc == 0:
+                for ln in (tr or '').splitlines():
+                    if 'Leap status' in ln:
+                        synced = ln.split(':')[-1].strip().lower() == 'normal'
+                    if ln.startswith('System time'):
+                        offset = ln.split(':', 1)[-1].strip().split()[0]
+        except Exception:
+            pass
+        if lv == 'ok' and not synced:
+            lv, code = 'warn', 'unsynced'
+        elif lv == 'ok' and synced:
+            code = 'synced'
+        return lv, code, {'synced': synced, 'offset': offset}
+    _run('ntp', _ntp)
+
+    # ---- 8. 动态域名 DDNS ----
+    def _ddns():
+        d = cfg.get('ddns') or {}
+        if not isinstance(d, dict):
+            d = {}
+        recs = d.get('records') if isinstance(d.get('records'), list) else []
+        if not d.get('enabled'):
+            return 'off', 'disabled', {'records': len(recs)}
+        if not recs:
+            return 'warn', 'unconfigured', {'records': 0}
+        return 'ok', 'enabled', {'records': len(recs)}
+    _run('ddns', _ddns)
+
+    # ---- 9. 访问控制 / 家长时间组 ----
+    def _acl():
+        d = _acl_load() or {}
+        rules = d.get('rules') if isinstance(d.get('rules'), list) else []
+        if not d.get('enable'):
+            return 'off', 'disabled', {'rules': len(rules)}
+        return 'ok', 'enabled', {'rules': len(rules)}
+    _run('acl', _acl)
+
+    # ---- 10. 内网文件共享（SMB / NFS）----
+    def _share():
+        d = _share_load() or {}
+        smb = bool(d.get('enable_smb'))
+        nfs = bool(d.get('enable_nfs'))
+        shares = len(((d.get('samba') or {}).get('shares') or []))
+        exports = len(((d.get('nfs') or {}).get('exports') or []))
+        if not (smb or nfs):
+            return 'off', 'disabled', {'shares': shares, 'exports': exports}
+        a1, _ = _svc('smbd')
+        a2, _ = _svc('nfs-server')
+        if (smb and a1 == 'active') or (nfs and a2 == 'active'):
+            return 'ok', 'running', {'shares': shares, 'exports': exports}
+        return 'warn', 'stopped', {'shares': shares, 'exports': exports}
+    _run('share', _share)
+
+    # ---- 11. Docker / Compose ----
+    def _docker():
+        # 先看有没有 docker 可执行文件（零 fork）。没有就**不查包状态** ——
+        # _docker_pkg_state 要跑 apt-cache，本机实测 340ms，为了给一台
+        # 根本没装 Docker 的机器点一盏灰灯而付这个钱不值得。
+        if not shutil.which('docker'):
+            return 'na', 'not_installed', {'containers': 0}
+        try:
+            pk = _docker_pkg_state() or {}
+        except Exception:
+            pk = {}
+        inst = bool((pk.get('docker') or {}).get('installed'))
+        if not inst:
+            return 'na', 'not_installed', {'containers': 0}
+        lv, code = _svc_lv('docker')
+        running = 0
+        total = 0
+        try:
+            rc, out, _e = sh(['docker', 'ps', '-a', '--format', '{{.State}}'], timeout=20)
+            if rc == 0:
+                for ln in (out or '').splitlines():
+                    if ln.strip():
+                        total += 1
+                        if ln.strip() == 'running':
+                            running += 1
+        except Exception:
+            pass
+        return lv, code, {'containers': total, 'running': running}
+    _run('docker', _docker)
+
+    # ---- 12. DPI 应用识别库 ----
+    def _dpi():
+        st = _dpi_load_state() or {}
+        if not st:
+            return 'off', 'unconfigured', {}
+        ver = st.get('version') or st.get('lib_version') or ''
+        ts = st.get('last_success') or st.get('ts') or 0
+        age_d = 0
+        try:
+            if ts:
+                age_d = int((time.time() - float(ts)) / 86400)
+        except Exception:
+            age_d = 0
+        if age_d >= 90:
+            return 'warn', 'stale', {'version': ver, 'age_days': age_d}
+        return 'ok', 'installed', {'version': ver, 'age_days': age_d}
+    _run('dpi', _dpi)
+
+    # ---- 13. QoS 智能限速 ----
+    def _qos():
+        d = _qos_load() or {}
+        if not d.get('enabled'):
+            return 'off', 'disabled', {}
+        return 'ok', 'enabled', {'down_mbit': d.get('down_mbit'),
+                                 'up_mbit': d.get('up_mbit'),
+                                 'ips': len(d.get('ips') or [])}
+    _run('qos', _qos)
+
+    # ---- 14. WireGuard VPN ----
+    def _vpn():
+        d = _vpn_load() or {}
+        peers = len(d.get('peers') or [])
+        if not d.get('enabled'):
+            return 'off', 'disabled', {'peers': peers}
+        lv, code = _svc_lv('wg-quick@wg0')
+        if lv == 'na':
+            lv, code = 'ok', 'enabled'
+        return lv, code, {'peers': peers, 'port': d.get('port')}
+    _run('vpn', _vpn)
+
+    # ---- 15. 软加速（flowtable）----
+    def _accel():
+        st = _accel_status() or {}
+        if not st.get('supported'):
+            return 'na', 'unsupported', {}
+        if not st.get('enabled'):
+            return 'off', 'disabled', {'devices': len(st.get('devices') or [])}
+        return 'ok', 'enabled', {'devices': len(st.get('devices') or []),
+                                 'flows': st.get('flows')}
+    _run('accel', _accel)
+
+    # ---- 16. 统一日志 / 连接跟踪 ----
+    def _ulog():
+        d = _ulog_load() or {}
+        if not d.get('enabled'):
+            return 'off', 'disabled', {}
+        lv, code = _svc_lv('drouter-logd')
+        srcs = d.get('sources') or {}
+        on = len([1 for v in srcs.values() if v])
+        if lv == 'na':
+            lv, code = 'ok', 'enabled'
+        return lv, code, {'sources': on, 'keep_days': d.get('keep_days')}
+    _run('ulog', _ulog)
+
+    # ---- 17. 快照 ----
+    def _snapshot():
+        root = snap_root()
+        n, newest, mt = _st_latest_dir(root, r'^[0-9]{8}-[0-9]{6}$')
+        age_h = int((time.time() - mt) / 3600) if mt else -1
+        auto = {}
+        try:
+            with open(SNAP_CONF, encoding='utf-8') as f:
+                auto = json.load(f) or {}
+        except Exception:
+            auto = {}
+        on = bool(auto.get('enabled'))
+        if n == 0:
+            return ('warn' if on else 'off'), ('empty' if on else 'disabled'), {
+                'count': 0, 'age_hours': -1, 'auto': on}
+        if age_h >= 24 * 30:
+            return 'warn', 'stale', {'count': n, 'age_hours': age_h, 'auto': on}
+        return 'ok', 'fresh', {'count': n, 'age_hours': age_h, 'auto': on}
+    _run('snapshot', _snapshot)
+
+    # ---- 18. 配置备份 ----
+    def _backup():
+        n, newest, mt = _st_latest_dir(
+            BACKUP_DIR, r'^drouter-backup-[0-9]{8}-[0-9]{6}(-[a-z0-9]+)?\.tar\.gz$')
+        age_h = int((time.time() - mt) / 3600) if mt else -1
+        if n == 0:
+            return 'off', 'empty', {'count': 0, 'age_hours': -1}
+        if age_h >= 24 * 30:
+            return 'warn', 'stale', {'count': n, 'age_hours': age_h}
+        return 'ok', 'fresh', {'count': n, 'age_hours': age_h}
+    _run('backup', _backup)
+
+    # ---- 19. 版本与升级 ----
+    def _update():
+        local = ''
+        try:
+            with open('/opt/drouter/VERSION', encoding='utf-8') as f:
+                local = f.read().strip()
+        except Exception:
+            # ⚠️ 不能引 VERSION_FALLBACK —— 那个常量在 drouter-web.py 里，
+            #    helper 里没有；写了会在 except 分支再抛 NameError，
+            #    让整个 update 项退化成 na（正是这里要避免的）。
+            local = ''
+        cache = {}
+        try:
+            with open('/var/lib/drouter/update/check-cache.json', encoding='utf-8') as f:
+                cache = json.load(f) or {}
+        except Exception:
+            cache = {}
+        latest = cache.get('latest') or ''
+        has = bool(cache.get('has_update'))
+        if has:
+            return 'warn', 'update_available', {'local': local, 'latest': latest}
+        if not latest:
+            return 'na', 'unknown', {'local': local}
+        return 'ok', 'latest', {'local': local, 'latest': latest}
+    _run('update', _update)
+
+    # ---- 20. 告警与通知 ----
+    def _alert():
+        d = cfg.get('alert') or {}
+        if not isinstance(d, dict):
+            d = {}
+        ch = d.get('channels') if isinstance(d.get('channels'), dict) else {}
+        on = len([1 for v in ch.values() if v])
+        if not d.get('enabled'):
+            return 'off', 'disabled', {'channels': on}
+        if not on:
+            return 'warn', 'unconfigured', {'channels': 0}
+        return 'ok', 'enabled', {'channels': on}
+    _run('alert', _alert)
+
+    # ---- 21. 打印服务 ----
+    def _print():
+        d = _print_load() or {}
+        mode = d.get('mode') or 'off'
+        if mode == 'off':
+            return 'off', 'disabled', {}
+        lv, code = _svc_lv('cups')
+        if mode == 'raw':
+            return ('ok' if lv == 'ok' else 'na'), mode, {}
+        return lv, code, {}
+    _run('print', _print)
+
+    # ---- 22. 证书 / SSL ----
+    def _ca():
+        items_, broken = _ca_index_load()
+        if broken:
+            return 'err', 'broken', {'certs': len(items_)}
+        if not items_:
+            return 'off', 'empty', {'certs': 0}
+        return 'ok', 'ok', {'certs': len(items_)}
+    _run('ca', _ca)
+
+    lv_rank = {'err': 3, 'warn': 2, 'ok': 1, 'off': 0, 'na': 0}
+    worst = 'ok'
+    for it in items:
+        if lv_rank.get(it['lv'], 0) > lv_rank.get(worst, 0):
+            worst = it['lv']
+    if worst not in ('err', 'warn'):
+        worst = 'ok' if any(x['lv'] == 'ok' for x in items) else 'off'
+
+    data = {'ts': now, 'worst': worst, 'items': items}
+    _STATUS_CACHE['ts'] = now
+    _STATUS_CACHE['data'] = data
+    return ok(data)
 
 
 def read_services(_):
@@ -1580,7 +3357,7 @@ def read_ppp_log(_):
         ts, msg = _split_journal_line(line)
         if not msg:
             continue
-        lines.append({'ts': ts, 'raw': msg, 'cn': _translate_ppp(msg), 'level': _ppp_level(msg)})
+        lines.append({'ts': ts, 'raw': msg, 'en': msg, 'cn': _translate_ppp(msg), 'level': _ppp_level(msg)})
     # 2) 状态判定
     state, state_cn, remain = 'idle', '未拨号', 0
     rc, ip4, _e = sh(['ip', '-4', '-o', 'addr', 'show', 'ppp0'], timeout=8)
@@ -2166,7 +3943,7 @@ def read_wan_log(p):
         # 内核 ppp 事件补充
         klog = _wan_from_journal((), (), limit=0)  # 占位，避免多余调用
         for ts, msg in got:
-            lines.append({'ts': ts, 'raw': msg, 'cn': _wan_translate(msg, table),
+            lines.append({'ts': ts, 'raw': msg, 'en': msg, 'cn': _wan_translate(msg, table),
                           'level': _wan_level(msg, ok_pats=[r'authorized', r'local  ip'],
                                               err_pats=[r'authentication failed', r'no pado', r'timeout'])})
         running = False
@@ -2200,7 +3977,7 @@ def read_wan_log(p):
             v6 = _wan_from_journal((), ('dhcp6c', 'odhcp6c', 'systemd-networkd'), limit=40, since=since)
             for ts, msg in v6:
                 if re.search(r'dhcpv6|ia_pd|prefix|router advertisement', msg, re.I):
-                    lines.append({'ts': ts, 'raw': msg, 'cn': _wan_translate(msg, IPV6_TRANS),
+                    lines.append({'ts': ts, 'raw': msg, 'en': msg, 'cn': _wan_translate(msg, IPV6_TRANS),
                                   'level': _wan_level(msg)})
             if st['ip6']:
                 meta.append('IPv6 地址 ' + st['ip6'])
@@ -2220,7 +3997,7 @@ def read_wan_log(p):
         got = _wan_from_journal(units, tags, limit=limit, since=since)
         for ts, msg in got:
             if re.search(r'dhcp|bound|lease|offer|ack|nak|discover|request', msg, re.I):
-                lines.append({'ts': ts, 'raw': msg, 'cn': _wan_translate(msg, table),
+                lines.append({'ts': ts, 'raw': msg, 'en': msg, 'cn': _wan_translate(msg, table),
                               'level': _wan_level(msg,
                                                   ok_pats=[r'dhcpack', r'bound to'],
                                                   err_pats=[r'dhcpnak', r'no dhcpoffers'])})
@@ -2252,7 +4029,7 @@ def read_wan_log(p):
                 v6 = _wan_from_journal((), ('systemd-networkd',), limit=40, since=since)
                 for ts, msg in v6:
                     if re.search(r'ipv6|ra|prefix|router advertisement', msg, re.I):
-                        lines.append({'ts': ts, 'raw': msg, 'cn': _wan_translate(msg, IPV6_TRANS),
+                        lines.append({'ts': ts, 'raw': msg, 'en': msg, 'cn': _wan_translate(msg, IPV6_TRANS),
                                       'level': _wan_level(msg)})
             else:
                 meta.append('IPv6 未获取（检查上级是否开启 IPv6）')
@@ -2271,10 +4048,10 @@ def read_wan_log(p):
                 continue
             if ifname and ifname in msg and re.search(
                     r'link|carrier|route|addr|duplicate', msg, re.I):
-                lines.append({'ts': ts, 'raw': msg, 'cn': _wan_translate(msg, table),
+                lines.append({'ts': ts, 'raw': msg, 'en': msg, 'cn': _wan_translate(msg, table),
                               'level': _wan_level(msg)})
             elif re.search(r'default via %s' % re.escape(st.get('gw') or '\x00'), msg, re.I):
-                lines.append({'ts': ts, 'raw': msg, 'cn': _wan_translate(msg, table),
+                lines.append({'ts': ts, 'raw': msg, 'en': msg, 'cn': _wan_translate(msg, table),
                               'level': _wan_level(msg)})
         if st['exists'] and st['oper'] == 'UP' and st['ip4']:
             state, state_cn = 'connected', '链路已就绪（静态配置生效）'
@@ -2314,7 +4091,7 @@ def read_wan_log(p):
         for line in (out or '').splitlines():
             ts, msg = _split_journal_line(line)
             if msg and re.search(r'bridge|br\d|vlan', msg, re.I):
-                lines.append({'ts': ts, 'raw': msg, 'cn': _wan_translate(msg, table),
+                lines.append({'ts': ts, 'raw': msg, 'en': msg, 'cn': _wan_translate(msg, table),
                               'level': _wan_level(msg)})
         state, state_cn = ('up', '网桥已工作（透传模式）') if st['exists'] else ('idle', '未启用')
         meta.append('接口 ' + (ifname or '—') + '，桥接模式不参与拨号')
@@ -2875,6 +4652,9 @@ PUBIP_COMBO_NOTE = {
         'advice': ['建议同时启用 A 与 AAAA 记录，客户端会优先走 IPv6（延迟更低）',
                    'IPv6 地址通常是动态前缀（DHCPv6-PD），需开启前缀变化检测并重新下发',
                    '公网 IPv4 若为动态，请把 TTL 设为 300 秒以内，加快解析生效'],
+        'en_title': "Dual-stack public (both IPv4 + IPv6 have public capability)",
+        'en_conclusion': "Your broadband has both public IPv4 and public IPv6. DDNS can resolve both A (IPv4) and AAAA (IPv6) records, giving the best compatibility for inbound access.",
+        'en_advice': ["Enable both A and AAAA records; clients will prefer IPv6 (lower latency)", "IPv6 addresses usually have a dynamic prefix (DHCPv6-PD); enable prefix-change detection and re-publish", "If the public IPv4 is dynamic, set TTL to 300 seconds or less to speed up propagation"],
     },
     'v4only': {
         'title': '仅 IPv4 有公网能力',
@@ -2883,6 +4663,9 @@ PUBIP_COMBO_NOTE = {
         'advice': ['只配置 A 记录即可，不需要 AAAA',
                    '若需要 IPv6 访问，需向运营商申请开启 IPv6 或改用支持 IPv6 的接入方式',
                    '如检测到 IPv4 位于 CGNAT（100.64.0.0/10）之后，公网端口映射可能不生效'],
+        'en_title': "Only IPv4 has public capability",
+        'en_conclusion': "Currently only public IPv4 is available; there is no usable public IPv6. DDNS can only serve via A records.",
+        'en_advice': ["Just configure the A record; no AAAA needed", "If IPv6 access is needed, ask the carrier to enable IPv6 or switch to an IPv6-capable access method", "If the IPv4 is detected behind CGNAT (100.64.0.0/10), public port mapping may not work"],
     },
     'v6only': {
         'title': '仅 IPv6 有公网能力（IPv4 在 NAT 之后）',
@@ -2893,6 +4676,9 @@ PUBIP_COMBO_NOTE = {
                    '对外提供 Web/服务时优先用 IPv6 域名访问（需对端也支持 IPv6）',
                    'IPv6 前缀由运营商动态下发（DHCPv6-PD），务必开启前缀变更后自动更新DDNS',
                    '如需公网 IPv4，可致电运营商申请（多数地区家庭宽带已不再分配）'],
+        'en_title': "Only IPv6 has public capability (IPv4 is behind NAT)",
+        'en_conclusion': "IPv4 is behind the carrier NAT / large private network (no public IPv4), but IPv6 is a public address. This is the form now widespread among the three major carriers in China (IPv4 scarce, IPv6 universal).",
+        'en_advice': ["Focus on AAAA records for DDNS; even if A is configured it cannot be reached directly from the public Internet", "Prefer IPv6 domain access when exposing Web/services (peer must also support IPv6)", "IPv6 prefix is dynamically assigned by the carrier (DHCPv6-PD); be sure to enable auto-update of DDNS after prefix change", "If a public IPv4 is truly needed, call the carrier to request one (most home broadband no longer allocates it)"],
     },
     'neither': {
         'title': '双私网（IPv4 与 IPv6 均无公网能力）',
@@ -2903,6 +4689,9 @@ PUBIP_COMBO_NOTE = {
                    '检查是否被运营商做了 CGNAT（100.64.0.0/10 地址段即为大内网）',
                    '若确需外部访问，可考虑内网穿透方案（FRP / Cloudflare Tunnel / Tailscale）',
                    'IPv6 若完全未获取，请到「IPv6 / RA」页面检查是否已开启'],
+        'en_title': "Dual private (neither IPv4 nor IPv6 has public capability)",
+        'en_conclusion': "Neither IPv4 nor IPv6 currently has public capability; this host is behind multi-level NAT. DDNS will not work — even if the domain resolves to a public address, it cannot reach this host.",
+        'en_advice': ["First confirm the modem is set to bridge mode (this host dials); in most cases \"modem bridge + local PPPoE\" yields a public IPv4", "Check whether the carrier has applied CGNAT (the 100.64.0.0/10 range is the large private network)", "If external access is truly needed, consider an intranet penetration solution (FRP / Cloudflare Tunnel / Tailscale)", "If IPv6 is completely absent, go to the IPv6 / RA page to check whether it is enabled"],
     },
 }
 
@@ -2932,6 +4721,9 @@ PUBIP_VERDICT = {
         'advice': ['DDNS 与端口转发可以正常使用',
                    '注意暴露端口等于暴露服务，请配合防火墙只放行必要端口',
                    '地址可能仍是动态的，建议 DDNS 的 TTL 设为 300 秒以内'],
+        'en_title': "Real public IP (inbound connections from the Internet are possible)",
+        'en_conclusion': "The egress address is a public address, and inbound packets from the Internet have been measured. This address can be actively accessed by other hosts on the Internet, and once DDNS resolves to it, port mapping will actually take effect.",
+        'en_advice': ["DDNS and port forwarding can be used normally", "Exposing a port equals exposing a service; pair it with a firewall that only allows necessary ports", "The address may still be dynamic; set DDNS TTL to 300 seconds or less"],
     },
     'likely': {
         'title': '疑似公网（地址是公网段，入向未验证）',
@@ -2943,6 +4735,9 @@ PUBIP_VERDICT = {
         'advice': ['点下方「开始入向实测」，按提示从一台外网主机 ping / 访问一次',
                    '没有外网主机时，可用手机蜂窝网络（关掉 Wi-Fi）访问一次',
                    '实测前不要急着配置端口转发，先确认入向是通的'],
+        'en_title': "Suspected public (address is in a public range, inbound not verified)",
+        'en_conclusion': "The egress address falls in a public range and multiple external services echo the same address, but \"whether the Internet can actively connect in\" has not yet been measured. This step cannot be skipped — many broadband connections give a public address but block inbound, in which case DDNS updates succeed and the domain resolves, but others simply cannot connect.",
+        'en_advice': ["Click \"Start inbound test\" below and follow the prompt to ping / access once from an external host", "Without an external host, use mobile cellular network (turn off Wi-Fi) to access once", "Do not rush to configure port forwarding before the actual test; confirm inbound is reachable first"],
     },
     'blocked': {
         'title': '有公网地址，但入向被拦（外网连不进来）',
@@ -2955,6 +4750,9 @@ PUBIP_VERDICT = {
                    '需要外网访问时改用内网穿透（EasyTier / Tailscale / FRP 一类）',
                    '或联系运营商确认是否可开通入向（部分专线需报备）',
                    '若只需要在家访问，走 IPv6 往往可行 —— IPv6 通常没有入向封锁'],
+        'en_title': "Has a public address, but inbound is blocked (Internet cannot connect in)",
+        'en_conclusion': "The address is indeed a public range and external echoes are consistent, but measured inbound packets from the Internet never reach this host — the carrier or upstream gateway blocks inbound. This is exactly the \"looks like a public IP, but ping from another VPS fails\" situation.",
+        'en_advice': ["DDNS can update successfully, but others still cannot connect after resolving, and port forwarding will not take effect", "For external access, switch to intranet penetration (EasyTier / Tailscale / FRP type)", "Or contact the carrier to confirm whether inbound can be enabled (some dedicated lines require filing)", "If you only need access from home, IPv6 often works — IPv6 usually has no inbound blocking"],
     },
     'cgnat': {
         'title': '运营商级 NAT（CGNAT）之后',
@@ -2964,6 +4762,9 @@ PUBIP_VERDICT = {
         'advice': ['无论 DDNS 怎么配都无法从外网直连，请改用内网穿透',
                    '可致电运营商咨询是否能分配公网 IPv4（多数家宽已不再提供）',
                    '优先使用 IPv6：CGNAT 只影响 IPv4，IPv6 通常仍是真公网'],
+        'en_title': "Behind carrier-grade NAT (CGNAT)",
+        'en_conclusion': "The egress address falls in the carrier-grade NAT reserved range (100.64.0.0/10) or passes through multiple levels of private NAT; this address is not routable on the Internet and cannot be actively connected from outside.",
+        'en_advice': ["No matter how DDNS is configured, direct external connection is impossible; use intranet penetration instead", "Call the carrier to ask whether a public IPv4 can be allocated (most home broadband no longer provides it)", "Prefer IPv6: CGNAT only affects IPv4; IPv6 is usually still a real public address"],
     },
     'private': {
         'title': '私有地址（本机未直接出网）',
@@ -2972,6 +4773,9 @@ PUBIP_VERDICT = {
                       '说明本机目前没有互联网出口或出口不在默认路由上。',
         'advice': ['确认 WAN 口已接好并获取到地址',
                    '若上级还有一层路由，请在那台设备上做端口映射或改成桥接'],
+        'en_title': "Private address (this host does not directly reach the Internet)",
+        'en_conclusion': "The address on the default egress is an RFC1918 private address, and the external echo could not obtain an address, indicating this host currently has no Internet egress or the egress is not on the default route.",
+        'en_advice': ["Confirm the WAN port is connected and has obtained an address", "If there is another layer of routing upstream, do port mapping on that device or switch it to bridge mode"],
     },
     'unknown': {
         'title': '无法判定（外部探测全部失败）',
@@ -2981,6 +4785,9 @@ PUBIP_VERDICT = {
                       '避免用一个不可靠的结果误导你。',
         'advice': ['先确认本机能否正常上网',
                    '可在「诊断工具」里测试 DNS 与外网连通性后重试'],
+        'en_title': "Cannot determine (all external probes failed)",
+        'en_conclusion': "All external echo services did not respond, possibly because the network is temporarily down, DNS is not ready, or these domains are blocked. No conclusion is given here to avoid misleading you with an unreliable result.",
+        'en_advice': ["First confirm this host can access the Internet normally", "You can test DNS and external connectivity in the Diagnostic Tools page and retry"],
     },
 }
 
@@ -3235,10 +5042,16 @@ def act_pubip(p):
                 time.sleep(0.3)
         if method == 'icmp':
             cmdline = 'ping -c 3 %s' % ip
-            how = ('在另一台能上外网的主机（你的 VPS、云主机，或手机开热点连的电脑）上执行：')
+            how = ('Run this on another host that can reach the Internet '
+                   '(your VPS, cloud host, or a PC tethered via phone hotspot):'
+                   ) if _cur_lang[0] == 'en-US' else (
+                   '在另一台能上外网的主机（你的 VPS、云主机，或手机开热点连的电脑）上执行：')
         else:
             cmdline = ('curl -s -m 8 http://%s:%s/%s' % (ip, port or _PROBE_PORTS[0], token))
-            how = '在另一台能上外网的主机上执行（tcpdump 不可用，改用临时端口回连）：'
+            how = ('Run this on another host that can reach the Internet '
+                   '(tcpdump unavailable; using a temporary port callback):'
+                   ) if _cur_lang[0] == 'en-US' else (
+                   '在另一台能上外网的主机上执行（tcpdump 不可用，改用临时端口回连）：')
         return ok({'state': 'running', 'probe': st, 'cmd': cmdline, 'how': how,
                    'timeout': _PROBE_TIMEOUT,
                    'msg_cn': '入向实测已启动，请在 %d 秒内从外网执行下面的命令'
@@ -3335,14 +5148,19 @@ def act_pubip(p):
     # ① 地址段
     cls = _addr_class_of(v4)
     evidence.append({
-        'key': 'class', 'name': '出口地址段',
-        'value': v4 or '（未获取）',
+        'key': 'class', 'name': '出口地址段', 'en_name': 'Egress address range',
+        'value': v4 or '（未获取）', 'en_value': v4 or '(not obtained)',
         'pass': cls == 'public',
         'detail': {'public': '属于公网地址段，在互联网上可路由',
                    'cgnat': '属于运营商级 NAT 保留段 100.64.0.0/10',
                    'private': '属于 RFC1918 私有地址段',
                    'reserved': '属于保留 / 链路本地地址段',
                    'empty': '没有取到 IPv4 地址'}.get(cls, ''),
+        'en_detail': {'public': 'Belongs to a public address range, routable on the Internet',
+                      'cgnat': 'Belongs to the carrier-grade NAT reserved range 100.64.0.0/10',
+                      'private': 'Belongs to an RFC1918 private range',
+                      'reserved': 'Belongs to a reserved / link-local range',
+                      'empty': 'No IPv4 address was obtained'}.get(cls, ''),
     })
 
     # ② 多源一致性
@@ -3351,14 +5169,20 @@ def act_pubip(p):
     addrs = sorted(seen.keys(), key=lambda k: -len(seen[k]))
     consistent = len(addrs) == 1 and len(seen[addrs[0]]) >= 2 if addrs else False
     evidence.append({
-        'key': 'echo', 'name': '多源回显一致性',
+        'key': 'echo', 'name': '多源回显一致性', 'en_name': 'Multi-source echo consistency',
         'value': ('、'.join(addrs) if addrs else '（全部失败）'),
+        'en_value': ('; '.join(addrs) if addrs else '(all failed)'),
         'pass': bool(addrs),
         'detail': ('%d 个独立服务都返回同一个地址，出口地址可信'
                    % len(seen[addrs[0]])) if consistent
                   else ('不同服务返回了不同地址：%s —— 可能有多出口或负载均衡'
                         % '；'.join('%s(%s)' % (a, '+'.join(seen[a])) for a in addrs))
                   if addrs else '所有外部回显服务都取不到地址，无法交叉验证',
+        'en_detail': ('%d independent services all returned the same address; the egress address is trustworthy'
+                      % len(seen[addrs[0]])) if consistent
+                     else ('Different services returned different addresses: %s — possibly multiple egress paths or load balancing'
+                           % '; '.join('%s(%s)' % (a, '+'.join(seen[a])) for a in addrs))
+                     if addrs else 'All external echo services failed to return an address; cannot cross-verify',
         'sources': {a: seen[a] for a in addrs},
     })
 
@@ -3366,13 +5190,18 @@ def act_pubip(p):
     hops = hops_all
     nat_hops = [h for h in hops if _is_private_v4(h)]
     evidence.append({
-        'key': 'path', 'name': '首跳链路',
+        'key': 'path', 'name': '首跳链路', 'en_name': 'First-hop link',
         'value': ' → '.join(hops) if hops else '（未取到）',
+        'en_value': ' → '.join(hops) if hops else '(not obtained)',
         'pass': not nat_hops,
         'detail': ('出网第一跳是私网地址（%s），说明本机上面至少还有一层 NAT'
                    % nat_hops[0]) if nat_hops
                   else ('出网第一跳就是公网地址，本机直接对接运营商'
                         if hops else 'traceroute 不可用，跳过这条证据'),
+        'en_detail': ('The first egress hop is a private address (%s), meaning there is at least one more layer of NAT above this host'
+                      % nat_hops[0]) if nat_hops
+                     else ('The first egress hop is already a public address; this host connects directly to the carrier'
+                           if hops else 'traceroute unavailable; skipping this evidence'),
         'hops': hops,
     })
 
@@ -3390,10 +5219,15 @@ def act_pubip(p):
         inbound = None
         detail = '尚未做入向实测 —— 这是唯一能拍板「外网能不能主动连进来」的证据'
     evidence.append({
-        'key': 'inbound', 'name': '入向可达性实测',
+        'key': 'inbound', 'name': '入向可达性实测', 'en_name': 'Inbound reachability test',
         'value': {True: '可达', False: '不可达', None: '未测试'}[inbound],
+        'en_value': {True: 'Reachable', False: 'Unreachable', None: 'Not tested'}[inbound],
         'pass': inbound is True,
-        'detail': detail, 'probed': inbound is not None,
+        'detail': detail, 'en_detail': {
+            True: 'Actually received inbound packets from %s' % '、'.join(hits[:3]),
+            False: 'An inbound test was run: waited %d seconds and received no packets from the Internet' % _PROBE_TIMEOUT,
+            None: 'No inbound test has been run yet — this is the only evidence that can decide whether the Internet can actively connect in',
+        }[inbound], 'probed': inbound is not None,
     })
 
     # ---- 综合结论 ----
@@ -3422,6 +5256,12 @@ def act_pubip(p):
                             '是否影响入向，以实测结果为准。）' % nat_hops[0])
         v['advice'] = list(v['advice']) + [
             '出网路径上有私网跳（%s），建议务必做一次入向实测再决定要不要配端口转发'
+            % nat_hops[0]]
+        v['en_conclusion'] += (' (Note: a private address %s appeared on the egress path, '
+                               'meaning there is at least one more layer of private forwarding above this host; '
+                               'whether it affects inbound is subject to the actual test result.)' % nat_hops[0])
+        v['en_advice'] = list(v['en_advice']) + [
+            'There is a private hop (%s) on the egress path; be sure to run an inbound test before deciding on port forwarding'
             % nat_hops[0]]
     return ok({
         'ip': v4, 'v6': info.get('v6_public') or info.get('v6_local') or '',
@@ -4263,11 +6103,22 @@ def _vpn_env():
     tool = bool(shutil.which('wg'))
     # 查模块**文件**在不在 —— 这一级以前完全没有，是本轮误报的根因。
     # 不能只认 .ko：Debian 默认压成 .ko.xz，个别发行版用 .ko.zst。
+    # ⚠️ 三种扩展名都要查：Debian 默认压成 .ko.xz，个别发行版用 .ko.zst，
+    #    自编内核可能是裸 .ko。**漏一个就会把「模块在但没加载」
+    #    误判成 unsupported** —— 正是本函数 docstring 里写的那个原 bug。
+    #    （2026-10-06 t-107 判据抓到：注释说了三种，代码只查一种。）
     mod_file = ''
+    _wdir = os.path.join('/lib/modules', kver, 'kernel/drivers/net/wireguard')
     for _n in ('wireguard.ko', 'wireguard.ko.xz', 'wireguard.ko.zst'):
-        _p = os.path.join('/lib/modules', kver, _n)
+        # 优先精确路径（Debian 的实际布局：…/kernel/drivers/net/wireguard/）
+        _p = os.path.join(_wdir, _n)
         if os.path.isfile(_p):
             mod_file = _p
+            break
+        # 兜底：老布局直接在 /lib/modules/<kver>/ 下
+        _p2 = os.path.join('/lib/modules', kver, _n)
+        if os.path.isfile(_p2):
+            mod_file = _p2
             break
     # ⚠️ 四态必须**逐级降级**，顺序不能换、不能漏：
     #     已加载 + 有工具   → ready
@@ -6508,8 +8359,12 @@ def read_docker(p):
         'stacks': _docker_stack_list(),
         'compose_cmd': ' '.join(_compose_cmd() or ['docker', 'compose']),
         'stack_dir': DOCKER_STACK_DIR,
-        'note': ('Docker 面板支持容器/镜像/网络/卷的日常运维，以及 Compose 项目管理。'
-                 '「命令转换」可以把任意 docker run 命令转成 docker-compose.yml。'),
+        'note': _pick(
+            ('Docker 面板支持容器/镜像/网络/卷的日常运维，以及 Compose 项目管理。'
+             '「命令转换」可以把任意 docker run 命令转成 docker-compose.yml。'),
+            ('The Docker panel covers day-to-day operations on containers, images, '
+             'networks and volumes, plus Compose project management. '
+             'Command Convert turns any docker run command into a docker-compose.yml.')),
     })
 
 
@@ -11022,6 +12877,266 @@ def act_acl(p):
     return fail('不支持的操作：%s' % op, 'BAD_OP')
 
 
+def _dhcp6_stats():
+    """读 DHCPv6 客户端统计（/proc/net/snmp6 的 dhcp6s 组）。
+
+    用户要看的 solicit / renew / rebind / reply 等 12 项全部在这里。
+    ⚠️ 两个坑：
+    ① 文件格式是「键名行」与「值行」**成对出现**，必须按位置对应 ——
+       值行的第一个 token 也是 'dhcp6s'，但后面全是数字，键名不重复，
+       所以不能同名去查。
+    ② dhcp6s 组可能整个不存在（内核没编进 DHCPv6 客户端时）。
+       此时返回空列表，**不能返回全 0** —— 全 0 会让用户以为
+       「一条 DHCPv6 消息都没发过」，而真相是没开着。
+    """
+    try:
+        with open('/proc/net/snmp6', encoding='utf-8', errors='replace') as f:
+            lines = f.read().splitlines()
+    except Exception:
+        return []
+    for i in range(0, len(lines) - 1, 2):
+        if not lines[i].startswith('dhcp6s'):
+            continue
+        keys = lines[i].split()[1:]
+        vals = lines[i + 1].split()[1:]
+        out = []
+        for k, v in zip(keys, vals):
+            try:
+                out.append({'key': k, 'value': int(v)})
+            except ValueError:
+                continue
+        return out
+    return []
+
+
+DHCP6_CN = {
+    'solicit': 'solicit（请求地址）', 'advertise': 'advertise（服务端回应）',
+    'request': 'request（确认租约）', 'confirm': 'confirm（确认现有租约）',
+    'renew': 'renew（续租）', 'rebind': 'rebind（重新绑定）',
+    'reply': 'reply（应答）', 'release': 'release（释放）',
+    'decline': 'decline（拒绝）', 'reconfigure': 'reconfigure（重配置）',
+    'information_request': 'information_request（请求参数）',
+    'discarded_packets': 'discarded_packets（丢弃的包）',
+    'transmit_failures': 'transmit_failures（发送失败）',
+}
+
+
+def _if_common(name):
+    """接口的公共信息：MAC、网桥归属、已连接时长。"""
+    mac = ''
+    try:
+        with open('/sys/class/net/%s/address' % name) as f:
+            mac = f.read().strip()
+    except Exception:
+        pass
+    bridge = ''
+    p = '/sys/class/net/%s/master' % name
+    try:
+        if os.path.islink(p):
+            bridge = os.path.basename(os.path.realpath(p))
+    except Exception:
+        pass
+    up_sec, up_trusted = _link_since(name)
+    return mac, bridge, up_sec, up_trusted
+
+
+def read_upstream(_):
+    """上游（WAN）链路详情：IPv4 / IPv6 两块 + DHCPv6 统计。
+
+    关于「已连接时长」：内核**没有**直接字段（`/sys/class/net/<n>/` 里没有
+    时间戳，carrier 只有 0/1 和翻转次数），但可以用 **uptime 差值算**出来 ——
+    见 `_link_since()`。纯标准库，不需要任何第三方依赖。
+
+    返回 `uptime_s` + `uptime_trusted`：
+    - `uptime_s > 0` → 可以显示时长
+    - `uptime_trusted = False` → 起点是「drouter 第一次记录到该接口 up」的时刻，
+      不一定等于「接口插上」的时刻（drouter 装得晚就会偏小），
+      前端要如实说明，不能当成精确值。
+    """
+    out4, out6 = [], []
+
+    # ---- IPv4 ----
+    rc, a4, _e = sh(['ip', '-4', '-j', 'addr'])
+    if rc == 0:
+        try:
+            for it in json.loads(a4):
+                nm = it.get('ifname') or ''
+                if not nm or nm == 'lo':
+                    continue
+                v4 = [x for x in (it.get('addr_info') or [])
+                      if x.get('family') == 'inet']
+                if not v4:
+                    continue
+                first = v4[0]
+                mac, bridge, up_sec, up_trusted = _if_common(nm)
+                out4.append({
+                    'name': nm, 'mac': mac, 'bridge': bridge,
+                    'proto': 'static', 'proto_cn': '静态地址',
+                    'addr': '%s/%s' % (first.get('local', ''),
+                                       first.get('prefixlen', '')),
+                    'uptime_s': up_sec, 'uptime_trusted': up_trusted,
+                })
+        except Exception:
+            pass
+    # 默认网关
+    gw4 = ''
+    rc, r4, _e = sh(['ip', '-4', 'route', 'show', 'default'])
+    if rc == 0:
+        m = re.search(r'default via (\S+) dev (\S+)', r4)
+        if m:
+            gw4 = m.group(1)
+    # DNS：直接读 /etc/resolv.conf。
+    # ⚠️ 原先还先试 `resolvectl status`，但那会引入 systemd-resolved 这个
+    #    依赖（目标机不一定装了），而且 resolv.conf 才是实际生效的配置
+    #    —— resolved 未启用时 resolvectl 什么都不显示。所以只用 resolv.conf。
+    #    部署审计也会因为 resolvectl 未登记到 DEPS 而报错（t-audit.py）。
+    dns4 = ''
+    try:
+        with open('/etc/resolv.conf') as f:
+            dns4 = ' '.join(re.findall(r'nameserver\s+(\S+)', f.read()))
+    except Exception:
+        pass
+    for x in out4:
+        x['gw'] = gw4
+        x['dns'] = dns4
+
+    # ---- IPv6 ----
+    rc, a6, _e = sh(['ip', '-6', '-j', 'addr'])
+    if rc == 0:
+        try:
+            for it in json.loads(a6):
+                nm = it.get('ifname') or ''
+                if not nm or nm == 'lo':
+                    continue
+                v6 = [x for x in (it.get('addr_info') or [])
+                      if x.get('family') == 'inet6']
+                if not v6:
+                    continue
+                # 只要全局地址（排除 fe80:: 链路本地）
+                glob = [x for x in v6 if x.get('scope') == 'global']
+                if not glob:
+                    continue
+                mac, bridge, up_sec, up_trusted = _if_common(nm)
+                out6.append({
+                    'name': nm, 'mac': mac, 'bridge': bridge,
+                    'proto': 'dhcpv6', 'proto_cn': 'DHCPv6 客户端',
+                    'addr': '%s/%s' % (glob[0].get('local', ''),
+                                       glob[0].get('prefixlen', '')),
+                    'addrs': ['%s/%s' % (x.get('local', ''),
+                                         x.get('prefixlen', '')) for x in v6],
+                    'valid_life': glob[0].get('valid_life'),
+                    'prefer_life': glob[0].get('preferred_life'),
+                    'uptime_s': up_sec, 'uptime_trusted': up_trusted,
+                })
+        except Exception:
+            pass
+    gw6 = ''
+    rc, r6, _e = sh(['ip', '-6', 'route', 'show', 'default'])
+    if rc == 0:
+        m = re.search(r'default via (\S+) dev (\S+)', r6)
+        if m:
+            gw6 = m.group(1)
+    for x in out6:
+        x['gw'] = gw6
+
+    raw6 = _dhcp6_stats()
+    for it in raw6:
+        it['label'] = DHCP6_CN.get(it['key'], it['key'])
+
+    return ok({'v4': out4, 'v6': out6, 'dhcp6': raw6})
+
+
+def read_netdetail(_):
+    """邻居表 + 路由表 + IPv6 规则表（用户排障最常看的三张表）。
+
+    全部走 `ip -j`（JSON）而不是解析文本 —— 文本格式里有 `pref`/`flags`
+    这类字段会随内核版本变，解析文本等于给自己埋雷。
+
+    ⚠️ 邻居表会区分「可达」和「失效」：
+    `ip neigh` 里的 STALE 意思是「这个 MAC 曾经用过，现在没有通信」，
+    它**不是错误**，也不是活跃连接。界面上必须区分显示，
+    否则用户看到一堆 STALE 会以为网络有问题。
+
+    ⚠️ IPv6 规则表里的「优先级 0 → local 表」是内核自动建的，
+    不是用户配的。展示时要标出来，否则用户会去删它。
+    """
+    def _j(cmd, timeout=6):
+        rc, out, _e = sh(cmd, timeout=timeout)
+        if rc != 0:
+            return []
+        try:
+            return json.loads(out) if out.strip() else []
+        except Exception:
+            return []
+
+    # ---- 邻居表 ----
+    neigh4 = []
+    for it in _j(['ip', '-4', '-j', 'neigh', 'show']):
+        states = it.get('state') or []
+        neigh4.append({
+            'dst': it.get('dst', ''),
+            'mac': it.get('lladdr', ''),
+            'dev': it.get('dev', ''),
+            # STALE 表示「曾可达、现在静默」，是正常状态不是故障
+            'stale': 'STALE' in states,
+            'failed': 'FAILED' in states,
+            'permanent': 'PERMANENT' in states,
+            'states': '/'.join(states),
+        })
+    neigh6 = []
+    for it in _j(['ip', '-6', '-j', 'neigh', 'show']):
+        states = it.get('state') or []
+        neigh6.append({
+            'dst': it.get('dst', ''),
+            'mac': it.get('lladdr', ''),
+            'dev': it.get('dev', ''),
+            'stale': 'STALE' in states,
+            'failed': 'FAILED' in states,
+            'permanent': 'PERMANENT' in states,
+            'states': '/'.join(states),
+        })
+
+    # ---- IPv6 路由（排除 loopback 的本地表条目，噪音太大）----
+    routes6 = []
+    for it in _j(['ip', '-6', '-j', 'route', 'show', 'table', 'main']):
+        routes6.append({
+            'dev': it.get('dev', ''),
+            'dst': it.get('dst', ''),
+            'gw': it.get('gateway', ''),
+            'src': it.get('prefsrc', ''),
+            'metric': it.get('metric', ''),
+            'table': it.get('table', 'main'),
+            'proto': it.get('protocol', ''),
+        })
+    # IPv4 路由（只看 main 表）
+    routes4 = []
+    for it in _j(['ip', '-4', '-j', 'route', 'show', 'table', 'main']):
+        routes4.append({
+            'dev': it.get('dev', ''),
+            'dst': it.get('dst', ''),
+            'gw': it.get('gateway', ''),
+            'src': it.get('prefsrc', ''),
+            'metric': it.get('metric', ''),
+            'table': it.get('table', 'main'),
+            'proto': it.get('protocol', ''),
+        })
+
+    # ---- IPv6 规则 ----
+    rules6 = []
+    for it in _j(['ip', '-j', '-6', 'rule', 'show']):
+        prio = it.get('priority', '')
+        rules6.append({
+            'prio': prio,
+            'src': it.get('src', 'all'),
+            'table': it.get('table', ''),
+            # 优先级 0 / local 表是内核自动建的，用户没配过
+            'builtin': str(prio) in ('0', '32766'),
+        })
+
+    return ok({'neigh4': neigh4, 'neigh6': neigh6,
+               'routes4': routes4, 'routes6': routes6, 'rules6': rules6})
+
+
 def read_ipv6(_):
     rc, addrs, _e = sh(['ip', '-6', '-j', 'addr'])
     rc2, routes, _e = sh(['ip', '-6', '-j', 'route'])
@@ -11449,9 +13564,14 @@ def _ulog_read_flows(p):
     return ok({
         'rows': rows[:limit], 'stat': stat, 'cap': cap,
         'err': (err or '') if rc != 0 else '',
-        'note': ('「当前连接」是 conntrack 表的实时快照，展示 NAT 映射后的地址、'
-                 '连接状态与已传输字节数。开启软加速（flowtable）后，'
-                 '已卸载流量的字节计数可能不再增长。'),
+        'note': _pick(
+            ('「当前连接」是 conntrack 表的实时快照，展示 NAT 映射后的地址、'
+             '连接状态与已传输字节数。开启软加速（flowtable）后，'
+             '已卸载流量的字节计数可能不再增长。'),
+            ('"Current connections" is a live snapshot of the conntrack table, '
+             'showing NAT-mapped addresses, connection states and transferred bytes. '
+             'With software acceleration (flowtable) on, byte counters for offloaded '
+             'traffic may stop growing.')),
     })
 
 
@@ -11686,8 +13806,12 @@ def read_ulog(p=None):
         'levels': [{'v': l, 'n': ULOG_LEVEL_CN[l]} for l in ULOG_LEVELS],
         'archive': {'path': ULOG_ARCHIVE, 'size': _file_size(ULOG_ARCHIVE),
                     'rows': _ulog_count_rows(ULOG_ARCHIVE)},
-        'note': ('统一日志把防火墙、连接跟踪、WAN 接入、DDNS、应用与系统日志'
-                 '规范化成同一种记录结构，可用同一套条件检索。'),
+        'note': _pick(
+            ('统一日志把防火墙、连接跟踪、WAN 接入、DDNS、应用与系统日志'
+             '规范化成同一种记录结构，可用同一套条件检索。'),
+            ('Unified logging normalizes firewall, conntrack, WAN access, DDNS, '
+             'application and system logs into one record structure, so they can all '
+             'be searched with the same set of filters.')),
     })
 
 
@@ -15851,6 +17975,17 @@ def _missing_dev_nodes():
             if not os.path.exists(p)]
 
 
+def _thread_id():
+    """当前线程的稳定 id。
+
+    只用于生成预检临时文件名（见 _verify），不需要跨进程唯一。
+    drouter-helpd 是 ThreadingUnixStreamServer，_verify 会被并发调用，
+    固定文件名会让线程之间互相覆盖对方的待校验配置。
+    """
+    import threading
+    return threading.get_ident()
+
+
 def _verify(module, files):
     """写入临时文件后做语法预检。返回 (ok, msg)"""
     # 校验目录必须是一路 0755 都能 traverse 进来的：radvd 这类守护会降权后读配置，
@@ -15862,7 +17997,41 @@ def _verify(module, files):
     os.chmod(checkdir, 0o755)
     for path, content in files:
         # 个别守护还受 AppArmor 限制，只能读自己那几个固定路径 —— 见下方注释
-        tmp = VERIFY_PATH.get(module) or os.path.join(checkdir, os.path.basename(path))
+        #
+        # ⚠️ 文件名必须**唯一**（1.0.10 修）：原先 chrony 走 VERIFY_PATH
+        # 里的固定路径，而 drouter-helpd 是 ThreadingUnixStreamServer、
+        # 并发调本函数。线程A 写完 → 线程B 覆盖同一路径 → 线程A 执行
+        # `chronyd -p -f <该路径>`，**校验的其实是 B 的配置**。
+        # 结果：A 的语法被「验证通过」而从未被检查，或 A 被误判失败。
+        _tid = _thread_id()
+        _vt = VERIFY_PATH.get(module)
+        if _vt:
+            tmp = '%s.%d.%d.tmp' % (_vt, os.getpid(), _tid)
+        else:
+            tmp = os.path.join(checkdir, '%s.%d.tmp'
+                               % (os.path.basename(path), _tid))
+        # ⚠️ 校验与清理必须成对（1.0.10 修）：原来 os.remove 写在循环体
+        # 末尾，而下面 dnsmasq / radvd / nft / chrony 四个分支失败时都是
+        # `return False, ...`，**直接跳过了它** —— 每次预检失败都落一份
+        # 临时文件。普通模块在 /run（tmpfs，重启清）还能接受，但 chrony
+        # 用的是 /etc/chrony.drouter-verify.conf —— **持久化分区**，
+        # 每次失败就永久留一份含用户 NTP 服务器配置的明文文件（0644
+        # root:root），永远不会清理。
+        # 修法：把「写文件 + 校验 + 清理」整体挪进 _verify_one()，
+        # 用 try/finally 兜住。分成两个函数后 finally 才是真的 finally。
+        good, msg = _verify_one(module, path, content, tmp)
+        if not good:
+            return False, msg
+    return True, '语法检查通过'
+
+
+def _verify_one(module, path, content, tmp):
+    """写入一个临时文件并做语法预检，返回 (ok, msg)。
+
+    **保证返回前一定清理 tmp** —— 无论校验通过、失败还是抛异常。
+    从 _verify 拆出来（1.0.10）就是为了让 finally 能覆盖所有返回路径。
+    """
+    try:
         with open(tmp, 'w', encoding='utf-8') as f:
             f.write(content)
         # chrony / radvd 等会以自身权限读取该文件，需放宽读权限
@@ -15904,11 +18073,13 @@ def _verify(module, files):
                     # miniupnpd 版本差异较大，检查失败不阻断，仅记录
                     log('warn', 'config', 'MINIUPNPD_CHECK_SKIP',
                         'miniupnpd 配置预检未通过（已忽略，应用时会再次校验）：%s' % (e or _o))
+        return True, ''
+    finally:
+        # 这里才是「任何路径都一定会走到」的位置
         try:
             os.remove(tmp)
         except Exception:
             pass
-    return True, '语法检查通过'
 
 
 def read_render_text(p):
@@ -16355,10 +18526,12 @@ def _diag_ipv6test(which):
     """
     targets = []
     if which in ('cn', 'all'):
-        targets.append({'key': 'cn', 'name': '国内 IPv6 测试', 'target': 'testipv6.cn',
+        targets.append({'key': 'cn', 'name': _pick('国内 IPv6 测试', 'IPv6 test (domestic)'),
+                        'target': 'testipv6.cn',
                         'url': 'https://testipv6.cn/'})
     if which in ('intl', 'all'):
-        targets.append({'key': 'intl', 'name': '国际 IPv6 测试', 'target': 'testipv6.com',
+        targets.append({'key': 'intl', 'name': _pick('国际 IPv6 测试', 'IPv6 test (international)'),
+                        'target': 'testipv6.com',
                         'url': 'https://testipv6.com/'})
     if not targets:
         return fail('不支持的测试类型：%s' % which)
@@ -16380,9 +18553,14 @@ def _diag_ipv6test(which):
                            '-A', 'Mozilla/5.0 (drouter IPv6 test)', t['url']], timeout=30)
         parts = (out or '').strip().split()
         if rc != 0:
-            item['detail'] = ('通过 IPv6 访问 %s 失败。\n可能原因：本机无公网 IPv6、'
-                              '运营商未下发 PD、或当前网络不支持 IPv6。\n'
-                              '原始信息：%s' % (t['target'], (err or '').strip() or '连接超时'))
+            item['detail'] = _pick(
+                ('通过 IPv6 访问 %s 失败。\n可能原因：本机无公网 IPv6、'
+                 '运营商未下发 PD、或当前网络不支持 IPv6。\n'
+                 '原始信息：%s' % (t['target'], (err or '').strip() or '连接超时')),
+                ('Failed to reach %s over IPv6.\nPossible causes: this host has no '
+                 'public IPv6, the ISP did not delegate a prefix (PD), or the current '
+                 'network does not support IPv6.\nRaw message: %s'
+                 % (t['target'], (err or '').strip() or 'connection timed out')))
         else:
             code = parts[0] if parts else ''
             try:
@@ -16391,18 +18569,26 @@ def _diag_ipv6test(which):
                 item['ms'] = None
             remote = parts[2] if len(parts) > 2 else ''
             item['ok'] = bool(code) and code not in ('000', '')
-            item['detail'] = ('HTTP 状态码 %s，远端 IPv6 地址 %s\n目标：%s'
-                              % (code or '无', remote or '未知', t['target']))
+            item['detail'] = _pick(
+                ('HTTP 状态码 %s，远端 IPv6 地址 %s\n目标：%s'
+                 % (code or '无', remote or '未知', t['target'])),
+                ('HTTP status %s, remote IPv6 address %s\nTarget: %s'
+                 % (code or 'none', remote or 'unknown', t['target'])))
         results.append(item)
     good = sum(1 for x in results if x['ok'])
     if not has_v6:
-        msg = '未检测到公网 IPv6，测试未通过'
+        msg = _pick('未检测到公网 IPv6，测试未通过',
+                    'No public IPv6 detected, test failed')
     elif good == len(results):
-        msg = 'IPv6 测试全部通过（%d/%d）' % (good, len(results))
+        msg = _pick('IPv6 测试全部通过（%d/%d）' % (good, len(results)),
+                    'All IPv6 tests passed (%d/%d)' % (good, len(results)))
     elif good > 0:
-        msg = 'IPv6 部分连通（%d/%d），部分站点不可达' % (good, len(results))
+        msg = _pick('IPv6 部分连通（%d/%d），部分站点不可达' % (good, len(results)),
+                    'IPv6 partially reachable (%d/%d), some sites unreachable'
+                    % (good, len(results)))
     else:
-        msg = 'IPv6 测试未通过，请检查运营商是否下发 IPv6'
+        msg = _pick('IPv6 测试未通过，请检查运营商是否下发 IPv6',
+                    'IPv6 test failed - check whether your ISP delegates IPv6')
     return ok({'results': results, 'has_ipv6': has_v6, 'passed': good, 'total': len(results)},
               msg)
 
@@ -16426,8 +18612,11 @@ def act_pkg(p):
             if re.match(r'^(xserver-xorg|xorg|linux-image|linux-headers|xfce4|realvnc|vnc)', name):
                 risky.append(name)
         return ok({'rows': rows, 'risky': risky,
-                   'notice': '标记为高危的包（%s 个）可能影响桌面/RealVNC，升级前请先创建快照'
-                             % len(risky)})
+                   'notice': _pick(
+                       '标记为高危的包（%s 个）可能影响桌面/RealVNC，升级前请先创建快照'
+                       % len(risky),
+                       '%s package(s) marked as high risk may affect the desktop / '
+                       'RealVNC - create a snapshot before upgrading' % len(risky))})
     if op == 'upgrade':
         names = (p or {}).get('packages') or []
         names = [re.sub(r'[^a-zA-Z0-9.+-]', '', str(n)) for n in names][:50]
@@ -17787,13 +19976,37 @@ QOS_IFB = 'ifb-drouter'
 QOS_MARK_BASE = 0x1000          # 每个内网 IP 的 mark 基址（0x1000 + 序号）
 
 # CAKE 队列方案说明（differv 档位越多，CPU 开销略高）
+# ⚠️ 档位名与说明必须与 `tc-cake` 手册一致（2026-10-05 修正）。
+# 原文写「语音/尽力/背景」是**错的**：CAKE 的三档tin 叫
+#   Bulk（CS1/LE，6.25% 阈值，低优先级）/ Best Effort（100%）/ Voice（CS7/CS6/EF/VA/TOS4，25%，Codel 间隔缩短）
+# 「背景」对应不上 Bulk —— Bulk 说的是「批量传输」（视频/下载/P2P），
+# 不是「背景流量」。besteffort 那条写「只做公平分流、不做优先级」也反了：
+# besteffort 恰恰是**放弃优先级**（所有流量进同一个 tin），
+# 公平性来自 flow isolation（dual-srchost/dsthost），不是来自分档。
 QOS_CAKE_MODES = [
     {'id': 'diffserv3', 'name': 'diffserv3（三档，推荐）',
-     'why': '把流量分为 语音/尽力/背景 三档，兼顾效果与 CPU 占用。'},
+     'why': '按 Diffserv 分为三档：语音（CS7/CS6/EF/VA，占 25% 带宽份额，'
+            'Codel 间隔缩短）、尽力（普通流量，占满带宽）、'
+            '批量（CS1/LE，低优先级，只分到 6.25% 带宽份额，'
+            '用于下载 / BT / 视频等大流量）。',
+     'why_en': 'Three DiffServ tiers: Voice (CS7/CS6/EF/VA; 25% bandwidth '
+               'share, shortened Codel interval), Best Effort (normal '
+               'traffic, full bandwidth), Bulk (CS1/LE; low priority, only '
+               '6.25% bandwidth share — downloads, BitTorrent, video).'},
     {'id': 'diffserv4', 'name': 'diffserv4（四档）',
-     'why': '更细的优先级（含视频档），CPU 略高，适合带宽充裕的场景。'},
-    {'id': 'besteffort', 'name': 'besteffort（不分档）',
-     'why': '只做公平分流、不做优先级，CPU 最省。'},
+     'why': '在 diffserv3 基础上多出一个视频档（AF4x/AF3x/CS3/AF2x/CS2，'
+            '占 50% 带宽份额），语音档的 DSCP 覆盖也更全。'
+            '多一个 tin，CPU 开销略高。',
+     'why_en': 'Adds a Video tier on top of diffserv3 (AF4x/AF3x/CS3/AF2x/CS2; '
+               '50% bandwidth share) and covers more DSCP codes for Voice. '
+               'One more tin costs slightly more CPU.'},
+    {'id': 'besteffort', 'name': 'besteffort（不分优先级）',
+     'why': '关闭优先级分档，所有流量进同一个队列按 CAKE 的 flow isolation '
+            '公平排队（每台主机 / 每条流各自分得一份）。'
+            'CPU 最省，但游戏、语音不会被优先转发。',
+     'why_en': 'Priority tiering is off: all traffic shares one queue, made '
+               'fair by CAKE flow isolation (per host / per flow). Lowest CPU '
+               'cost, but gaming and voice traffic get no priority.'},
 ]
 
 QOS_PRESETS = [
@@ -19312,6 +21525,29 @@ def _dep_installed(kind, target):
     return False, ''
 
 
+# apt 包可用性缓存：{包名元组: (apt 索引指纹, have, lack)}。
+# 活在常驻守护进程里，跨请求复用；索引变了自动失效（见 _apt_lists_stamp）。
+_PKG_AVAIL_CACHE = {}
+
+
+def _apt_lists_stamp():
+    """apt 索引目录的指纹（最大 mtime + 文件数）。索引一变就变。"""
+    d = '/var/lib/apt/lists'
+    try:
+        ent = os.listdir(d)
+    except Exception:
+        return 0.0
+    mx = 0.0
+    for f in ent:
+        try:
+            m = os.path.getmtime(os.path.join(d, f))
+            if m > mx:
+                mx = m
+        except Exception:
+            continue
+    return mx + len(ent) / 1000.0
+
+
 def _pkgs_available(names):
     """从候选包名里挑出本机 apt 真实存在的那些。
 
@@ -19329,13 +21565,33 @@ def _pkgs_available(names):
         return [], []
     if not shutil.which('apt-cache'):
         return names, []
-    have, lack = [], []
-    for n in names:
-        rc, _o, _e = sh(['apt-cache', 'show', '--no-all-versions', n], timeout=20)
-        (have if rc == 0 else lack).append(n)
+    # ⚠️ 一次 apt-cache 查全部候选，**不要**逐个 fork。
+    #    apt-cache 每次调用都要加载整个包索引（本机实测 ~250ms/次），
+    #    逐个查 3 个候选就是 ~750ms —— 而 read:docker 是概览页 / 容器页的
+    #    高频接口，2026-10-09 实测 read:docker 960ms 里有 878ms 全在这里。
+    #    多个包名一次传进去，apt-cache 只加载一次索引。
+    #    不存在的包名 apt-cache 会往 stderr 报错并返回非 0，但 stdout 里
+    #    仍然只有真实存在的那些 —— 所以按 stdout 的 `Package:` 行判定。
+    # 再上一层缓存：apt 索引没变就没必要重新加载。
+    # ⚠️ 失效信号用 **/var/lib/apt/lists 的 mtime**，不是盲 TTL ——
+    #    `apt update` / `apt install` 都会改它，改了立刻重查；
+    #    没改就说明包可用性不可能变。缓存活在常驻守护进程里（跨请求）。
+    stamp = _apt_lists_stamp()
+    ck = tuple(names)
+    hit = _PKG_AVAIL_CACHE.get(ck)
+    if hit and hit[0] == stamp:
+        return list(hit[1]), list(hit[2])
+    _rc, out, _e = sh(['apt-cache', 'show', '--no-all-versions'] + names, timeout=30)
+    found = set()
+    for _ln in (out or '').splitlines():
+        if _ln.startswith('Package: '):
+            found.add(_ln[len('Package: '):].strip())
+    have = [n for n in names if n in found]
+    lack = [n for n in names if n not in found]
     if not have:
         # 一个都查不到：多半是 apt 索引没建/被锁，交给 apt 自己报错更好排查
         return names, []
+    _PKG_AVAIL_CACHE[ck] = (stamp, tuple(have), tuple(lack))
     return have, lack
 
 
@@ -22054,6 +24310,10 @@ ACTIONS = {
     'read:leases': read_leases,
     'read:upnpmap': read_upnpmap,
     'read:ipv6': read_ipv6,
+    # 上游链路详情（IPv4/IPv6 协议、地址、网关、DNS、DHCPv6 统计）
+    'read:upstream': read_upstream,
+    # 邻居表 + 路由表 + IPv6 规则表（排障常用）
+    'read:netdetail': read_netdetail,
     'read:iface_method': read_iface_method,
     'read:ppp_log': read_ppp_log,
     'read:wan_log': read_wan_log,
@@ -22071,6 +24331,7 @@ ACTIONS = {
     'read:share': read_share,
     'storage': act_storage,
     'share': act_share,
+    'read:status': read_status,
     'read:docker': read_docker,
     'docker': act_docker,
     'dcfg': act_dcfg,
@@ -22146,7 +24407,13 @@ def run_action(action, payload=None):
     """
     fn = ACTIONS.get(action)
     if not fn:
-        return fail('未授权的操作：%s' % action)
+        return fail('未授权的操作：%s' % action, 'NOACTION',
+                   en='Unauthorized action: %s' % action)
+    # 1.0.10：设置本次调用的界面语言。web 层把它塞在 payload._lang 里
+    # （不能走命令行参数 —— 守护进程是长驻的，没有 per-request 的 argv）。
+    # ⚠️ 必须在**分发之前**设，因为各处 act_* 里会调 ok()/fail()。
+    if payload and payload.get('_lang'):
+        set_lang(payload['_lang'])
     # 构建保护模式熔断
     guard = check_build_guard(action, payload)
     if guard is not None:
@@ -22157,7 +24424,8 @@ def run_action(action, payload=None):
         import traceback
         log('error', 'helper', 'EXCEPTION', '执行 %s 时发生异常：%s' % (action, e),
             traceback.format_exc()[-1500:])
-        return fail('执行异常：%s' % e, 'EXCEPTION')
+        return fail('执行异常：%s' % e, 'EXCEPTION',
+                   en='Execution error: %s' % e)
 
 
 def main():

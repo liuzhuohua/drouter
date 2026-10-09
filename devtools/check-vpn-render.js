@@ -56,6 +56,13 @@ const ctxObj = {
   location: { hash: '', href: '' },
   navigator: { userAgent: 'node' },
   alert() {}, confirm() { return true; },
+  // 1.0.10 起 app.js 的文案走 i18n 的 t()。本检查器不加载 i18n.js
+  // （它要 DOM + localStorage），给恒等兜底保证渲染流程能跑完。
+  t: k => k,
+  i18n: {
+    t: k => k, setLang() {}, getLang: () => 'zh-CN', toggle() {},
+    onChange() {}, applyDom() {}, dict: {}, register() {}, rerenderAll() {},
+  },
 };
 ctxObj.window = ctxObj;
 vm.createContext(ctxObj);

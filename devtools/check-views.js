@@ -6,7 +6,8 @@ const WEB = require('path').join(__dirname, '..', 'web', 'app.js');
 const path = process.argv[2] || WEB;
 const s = fs.readFileSync(path, 'utf8');
 
-const nav = s.match(/const NAV_GROUPS = \[([\s\S]*?)\n\];/);
+// 惰性写法 `const NAV_GROUPS = () => ([ ... ]);` 也要认（见 t-nav-i18n-run）
+const nav = s.match(/const NAV_GROUPS = (?:\(\)\s*=>\s*\()?\[([\s\S]*?)\n\]\)?;/);
 if (!nav) { console.log('✘ 未找到 NAV_GROUPS'); process.exit(1); }
 
 const items = [];

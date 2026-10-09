@@ -65,8 +65,14 @@ async function fetchStub(url, opts) {
   else if (/\/api\/ddns/.test(url)) data = { ok: true, data: {
     cfg: { provider: 'custom', domain: '', ipv4: true, ipv6: false },
     public: { combo: 'both', v4: '1.2.3.4', v6: '2408::1', note: '' },
-    note: { level: 'ok', text: '' },
-    providers: [{ v: 'custom', name: '自定义', region: 'other', fields: [] }],
+    // note 形状与真后端 read_ddns 一致（title/conclusion/advice + en_* 孪生），
+    // viewDdns 里 enOrZh(note.en_advice, note.advice).map(...) 需要它是数组。
+    note: { level: 'ok', text: '',
+      title: '双栈公网', en_title: 'Dual-stack public IP',
+      conclusion: 'v4 与 v6 都有公网能力', en_conclusion: 'Both v4 and v6 have public reachability',
+      advice: ['建议同时启用 A 与 AAAA 记录'], en_advice: ['Enable both A and AAAA records'] },
+    providers: [{ v: 'custom', name: '自定义', region: 'other', fields: [],
+      n: '自定义（URL 模板）', desc: '适用于任何提供 HTTP 更新的服务商', doc: 'manual' }],
     records: [], last_result: '' } };
   else if (/\/api\/ulog\/daemon/.test(url)) data = { ok: true, data: { units: { 'drouter-logd.timer': { active: 'active', enabled: 'enabled' } }, next: 'in 42s', last: { ts: '2026-09-28T22:00:00', msg_cn: '已归档 12 条日志', code: 'ULOG_ARCHIVE_OK' } } };
   else if (/\/api\/ulog\/daemon/.test(url)) data = { ok: true, data: {
@@ -197,6 +203,17 @@ const sandbox = {
   location: { reload() {}, href: '' },
   navigator: { userAgent: 'node' }, window: {},
   TextEncoder, TextDecoder, URL, Blob: function () {}, FormData: function () {},
+};
+// 1.0.10 起 app.js 里的文案走 t()（i18n.js 提供）。离线检查器不加载
+// i18n.js（它要 DOM + localStorage），所以这里给一个**恒等兜底**：
+// 保证渲染检查能跑完、且不会因为缺 t() 而把「概览页抛异常」误报成
+// 真 bug。⚠️ 必须是兜底而不是「加载真的 i18n.js」——
+// 后者会让检查器依赖字典，而字典天天在改，改一个词就可能连带
+// 让 check-render 失败，掩盖真正的渲染问题。
+sandbox.t = k => k;
+sandbox.i18n = {
+  t: k => k, setLang() {}, getLang: () => 'zh-CN', toggle() {},
+  onChange() {}, applyDom() {}, dict: {}, register() {}, rerenderAll() {},
 };
 sandbox.window = sandbox;
 sandbox.globalThis = sandbox;

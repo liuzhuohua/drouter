@@ -56,6 +56,23 @@ def log(level, code, msg_cn, detail=None):
         pass
 
 
+def emit(line):
+    """把结果行打到 stdout，供调用方判定。
+
+    ⚠️ 为什么需要它（1.0.10 加）：log() 只写 jsonl 文件，**stdout 上什么都没有**。
+    「更新前自动备份」要靠 stdout 判断「真的产出备份包了吗」——
+    光看 returncode 会被「自动备份未开启 → return 0」骗过去，
+    于是一份配置都没备份却显示「备份完成」。
+    所以 --run-now 模式下每一步都用 emit() 同步输出一行，
+    调用方 grep 'BK_CREATED' 就能确认。
+    """
+    try:
+        sys.stdout.write(line + '\n')
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
 def call(action, payload=None, timeout=CALL_TIMEOUT):
     try:
         p = subprocess.run(
@@ -79,7 +96,20 @@ def disk_ok(path='/opt/drouter'):
         return True, str(e)
 
 
-def main():
+def main(argv=None):
+    """argv 支持 `--run-now`：**强制**导出一次，绕过 auto_enabled 判断。
+
+    ⚠️ 为什么需要这个开关（1.0.10 加）：
+    「更新前自动备份」这类场景，不能依赖用户的「自动备份」开关 ——
+    默认它是关的（helper 里 auto_enabled 默认 False），而 main() 会
+    直接 `return 0` 表示「无事发生」。调用方只看 returncode 的话，
+    **会把「一份配置都没备份」误判成「备份成功」** ——
+    用户看到「备份完成，开始下载…」，真出事时无包可回滚。
+    有了 --run-now，语义明确：要么真的产出一个包，要么非 0 退出。
+    """
+    argv = list(sys.argv[1:] if argv is None else argv)
+    force = '--run-now' in argv
+
     # 1) 读设置。读不到就默认「不导出」而不是默认开启 ——
     #    定时器被谁 enable 的不好追溯，默认执行一个会写盘的动作不安全。
     r = call('backup', {'op': 'status'})
@@ -87,13 +117,15 @@ def main():
         log('warn', 'BK_STATUS_FAIL', '读取备份设置失败：%s' % r.get('msg_cn'))
         return 1
     conf = (r.get('data') or {}).get('conf') or {}
-    if not conf.get('auto_enabled'):
+    if not force and not conf.get('auto_enabled'):
         log('info', 'BK_SKIP', '自动备份未开启，跳过本次导出')
+        emit('BK_SKIP 自动备份未开启，跳过本次导出')
         return 0
 
     ok_disk, why = disk_ok()
     if not ok_disk:
         log('error', 'BK_DISK_LOW', '磁盘空间不足，跳过自动备份：%s' % why)
+        emit('BK_DISK_LOW 磁盘空间不足：%s' % why)
         return 1
 
     # 2) 导出。include_sensitive 不在这里覆盖 —— 定时备份默认不含私钥，
@@ -101,10 +133,15 @@ def main():
     r = call('backup', {'op': 'create'})
     if not r.get('ok'):
         log('error', 'BK_CREATE_FAIL', '自动备份导出失败：%s' % r.get('msg_cn'))
+        emit('BK_CREATE_FAIL 导出失败：%s' % r.get('msg_cn'))
         return 1
     d = r.get('data') or {}
     log('info', 'BK_CREATED', '自动备份已导出 %s（%d 个文件，%.1f KB）'
         % (d.get('name', ''), d.get('files', 0), (d.get('size') or 0) / 1024.0))
+    # ⚠️ 这一行是「真的产出了备份包」的凭证。drouter-update 的 _do_backup()
+    #    靠 grep 它来判断成功，没有它就只能在「什么都没备份」时也报成功。
+    emit('BK_CREATED %s files=%d size=%d'
+         % (d.get('name', ''), d.get('files', 0), d.get('size') or 0))
 
     # 3) 清理
     r = call('backup', {'op': 'prune', 'keep_count': conf.get('keep_count', 0),

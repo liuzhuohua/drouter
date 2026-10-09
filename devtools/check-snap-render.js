@@ -160,6 +160,24 @@ async function fetchStub(url, opts) {
 }
 
 // ---------------------------------------------------------------- 沙箱
+// ---- 取 i18n.js 的 DICT（只取纯数据，不执行它的 IIFE）----
+const SNAP_I18N_DICT = (() => {
+  const fs = require('fs');
+  const p = require('path').join(__dirname, '..', 'web', 'i18n.js');
+  const src = fs.readFileSync(p, 'utf-8');
+  const sb = { window: {}, console,
+    document: { documentElement: {}, readyState: 'complete',
+      getElementById: () => null, querySelectorAll: () => [],
+      addEventListener: () => {} },
+    localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    navigator: { language: 'zh-CN' },
+    setTimeout: () => 0, setInterval: () => 0, clearInterval: () => {} };
+  sb.window = sb; sb.globalThis = sb;
+  vm.createContext(sb);
+  vm.runInContext(src, sb, { filename: p });
+  return (sb.window.i18n && sb.window.i18n.dict) || {};
+})();
+
 const ctx = {
   document, fetch: fetchStub, console,
   setTimeout: () => 0, clearTimeout() {},
@@ -176,6 +194,43 @@ const ctx = {
   FormData: function () { return {}; },
   crypto: { randomUUID: () => 'uuid' },
   CSS: { escape: s => String(s) },
+  // 1.0.10 起 app.js 里的文案走 t()（i18n.js 提供）。本检查器**不加载**
+  // i18n.js（它要 DOM + localStorage），所以给一个恒等兜底，
+  // 保证渲染流程能跑完、不会因「t 未定义」而误报成快照功能坏了。
+  // ⚠️ 必须是兜底而不是加载真 i18n.js —— 后者会让本检查器依赖字典，
+  // 而字典天天在改，改一个词就可能连带让它失败，**掩盖真正的渲染问题**。
+  // 1.0.10 起 app.js 的文案走 i18n 的 t()（i18n.js 提供）。
+  //
+  // ⚠️ 本检查器**与其它 check-* 相反**：它专门验「弹窗文案是不是
+  //    『仍要删除』而不是『确定』」，所以**必须拿到真实中文** ——
+  //    恒等兜底（t: k => k）会让所有文案断言拿到 key 原文而全红。
+  //
+  // ✅ 做法：用 vm 跑 i18n.js 只取 DICT（纯数据），再造查 DICT 的 t()。
+  //    不执行它的 IIFE（那要 DOM + localStorage），只读数据 ——
+  //    字典改了这里自动跟着变，不会「因为改了个词就打不开检查器」。
+  t: (key, vars) => {
+    const parts = String(key).split('.');
+    let node = SNAP_I18N_DICT;
+    for (const p of parts) {
+      if (node == null || typeof node !== 'object') return key;
+      node = node[p];
+    }
+    if (node == null) return key;
+    // 词条形状是 {zh, en}
+    let s = (node && typeof node === 'object' && 'zh' in node) ? node.zh : node;
+    if (s == null) return key;
+    if (Array.isArray(vars)) {
+      vars.forEach((v, ix) => {
+        s = String(s).split('{' + ix + '}').join(v == null ? '' : String(v));
+      });
+    }
+    return s;
+  },
+  i18n: {
+    t: (k) => k, setLang() {}, getLang: () => 'zh-CN', toggle() {},
+    onChange() {}, applyDom() {}, dict: SNAP_I18N_DICT,
+    register() {}, rerenderAll() {},
+  },
   __TOASTS: [],
 };
 ctx.window = ctx;

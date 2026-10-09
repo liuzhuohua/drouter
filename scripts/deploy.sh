@@ -55,6 +55,12 @@ install -m 0644 $SRC/backend/drouter-quotad.py  $OPT/backend/drouter-quotad.py
 # 周期取自用户填的「检测间隔」，由 helper 的 _write_ddns_timer() 运行时生成。
 install -m 0644 $SRC/backend/drouter-ddnsd.py  $OPT/backend/drouter-ddnsd.py
 
+# 版本检测/自更新（1.0.10）。它不是守护进程，是被 drouter-web.py 按路径
+# importlib 加载的模块 —— 文件名带连字符，不是合法 Python 标识符，
+# 所以 web.py 里用 spec_from_file_location 加载，**不要**改成普通 import。
+# 这里必须装：漏了的话 web.py 每次调 /api/update/* 都会抛异常。
+install -m 0644 $SRC/backend/drouter-update.py $OPT/backend/drouter-update.py
+
 # 主题之家（#12）：自定义主题目录 + 生效主题标记
 mkdir -p /etc/drouter/themes
 # 只在「还没有生效主题」时播种默认值。
@@ -83,6 +89,15 @@ echo "=== 3. 安装前端 ==="
 install -m 0644 $SRC/web/index.html $OPT/web/index.html
 install -m 0644 $SRC/web/app.css    $OPT/web/app.css
 install -m 0644 $SRC/web/app.js     $OPT/web/app.js
+# ⚠️ 新增的前端模块（1.0.10）必须在这里逐个登记 —— 这一段是**逐个 install**，
+#    不是通配符，漏登记 = 真机上文件不存在 = 页面 JS 404。
+#    2026-10-04 首次部署就踩了：drouter-update.py 装上了，
+#    但 update.js / update.css / upstream.js 三个都没装，概览页直接坏掉。
+#    加新的 web/*.js|css 时**必须同步这里**，t-audit 的部署判据会检查。
+for wf in update.js update.css upstream.js netdetail.js realtime.js i18n.js; do
+  [ -f "$SRC/web/$wf" ] || { echo "✘ 源码缺少 web/$wf"; exit 1; }
+  install -m 0644 "$SRC/web/$wf" "$OPT/web/$wf"
+done
 if [ -f "$SRC/web/logo.svg" ]; then
   install -m 0644 $SRC/web/logo.svg $OPT/web/logo.svg
 fi
@@ -382,10 +397,13 @@ echo "=== 10. 校验 ==="
 for f in render.py drouter-helper.py drouter-web.py drouter-logd.py \
          drouter-snapshotd.py drouter-rescue.py drouter-shelld.py \
          drouter-helpd.py drouter-backupd.py drouter-alertd.py \
-         drouter-quotad.py drouter-ddnsd.py theme.py; do
+         drouter-quotad.py drouter-ddnsd.py drouter-update.py \
+         theme.py; do
     p="$OPT/backend/$f"
     if [ ! -f "$p" ]; then echo "✘ 缺少文件: $p"; exit 1; fi
-    python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' "$p" \
+    # ⚠️ 用 compile() 不是 ast.parse()：后者只做语法分析，抓不到
+    # 「重复关键字参数」这类语义错误（1.0.10 实测：静态全绿、import 才炸）
+    python3 -c 'import sys; compile(open(sys.argv[1],encoding="utf-8").read(),sys.argv[1],"exec")' "$p" \
         && echo "语法OK: $p" || { echo "✘ 语法错误: $p"; exit 1; }
 done
 echo "--- 目录 ---"

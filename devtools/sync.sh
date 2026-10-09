@@ -10,7 +10,13 @@ echo "=== 0. 本地预检（语法 + 编译）==="
 cd "$SRC"
 # Python 用 py_compile 才能抓出 "global 声明位置错误" 这类只有编译期才报的 bug
 PYBIN="C:/Users/lyrz-pve-win10/.workbuddy/binaries/python/versions/3.13.12/python.exe"
-NODEBIN="C:/Users/lyrz-pve-win10/.workbuddy/binaries/node/versions/22.22.2-3/node.exe"
+# ⚠️ 不要硬编码 node 的版本目录（WorkBuddy 升级后路径会变，2026-10-07 实测同一因素导致预检全挂在 line 25）。
+NODEBIN=""
+for _nc in $(ls -1d "$HOME/.workbuddy/binaries/node/versions/"*/node.exe 2>/dev/null | sort -r); do
+  if [ -f "$_nc" ]; then NODEBIN="$_nc"; break; fi
+done
+[ -n "$NODEBIN" ] || NODEBIN="node"
+echo "  节点: $NODEBIN"
 "$PYBIN" - <<'PY' || { echo "❌ Python 预检失败"; exit 1; }
 import py_compile, tempfile, sys, glob
 bad = 0

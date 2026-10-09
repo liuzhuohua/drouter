@@ -52,6 +52,15 @@ _ensure_sbin_path()
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+# 让按路径加载的同目录模块能工作（见 _load_mod）。
+# 服务由 systemd 以绝对路径启动，脚本所在目录**不在** sys.path 里
+# （sys.path[0] 是启动时的 CWD，不是脚本目录）—— 早先没注入，
+# 结果是版本检测一访问就 ImportError，前端只能显示「检测失败」。
+# 显式把脚本自身所在目录插到最前面，不依赖 CWD。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
 BASE = '/opt/drouter'
 DATA_DIR = os.path.join(BASE, 'data')
 WEB_DIR = os.path.join(BASE, 'web')
@@ -65,7 +74,7 @@ BUILD_FLAG = '/etc/drouter/BUILD_MODE'
 # 早先版本号在 openapi 里硬编码，于是「页面显示什么版本」和「包管理器认为
 # 是哪个版本」是两条互不相干的线，只能靠人手记着同步 —— 漏一次就是一个
 # 改不掉的 bug（apt 按 control 认版本，文件名是 1.0.9 它就当 1.0.8）。
-VERSION_FALLBACK = '1.0.9'
+VERSION_FALLBACK = '1.0.10'
 _VERSION_READ = [False]
 
 
@@ -158,6 +167,13 @@ CREATE TABLE IF NOT EXISTS snapshots (
 """
 
 _lock = threading.RLock()
+
+# ---- 当前界面语言（1.0.10）----
+# 前端每个请求都带 X-Lang；helper() 据此把 lang 透传给 helper 进程。
+# ⚠️ 存成**单元素列表**而不是裸字符串：Python 里模块级变量
+#    在别的函数里赋值时不会被重新绑定（会变成局部变量），
+#    列表原地改就没这个问题。同 helper 里的 _cur_lang 写法。
+_cur_lang = ['zh-CN']
 
 # NAT 检测最近一次结果的进程内缓存（重启即失效，前端用于展示"上次检测"）
 NAT_LAST = {'nat': '', 'title': '', 'desc': '', 'detail': '', 'checked_at': ''}
@@ -364,6 +380,29 @@ MAX_WORKERS = 48
 _WORKER_SEM = threading.BoundedSemaphore(MAX_WORKERS)
 # 会话表上限：GC 线程万一挂了，也不能让 token 无限堆积。
 MAX_SESSIONS_WEB = 500
+
+# ---- 按路径加载的模块缓存（见 Handler._load_mod 的注释）----
+# ⚠️ 缓存不是性能优化，是**正确性要求**：不缓存会让每个请求得到一个
+#    全新模块对象，其模块级 threading.Event / Lock 全部失效 ——
+#    最直接的后果是「中断更新」永远不生效（详见 _load_mod 里的说明）。
+# key 是模块名，value 是 (mtime, 模块对象)；带 mtime 是为了部署新版本后
+# 自动失效，不会拿着旧代码不放。
+_MOD_CACHE = {}
+_MOD_CACHE_LOCK = threading.Lock()
+
+# ---- 「保存并应用」允许的模块名 ----
+# 权威定义在 helper 侧，由两部分组成（act_apply 的实际判定逻辑）：
+#   APPLY_SPEC（12 项：有独立配置文件，需渲染 + 语法预检 + 重载服务）
+# ∪ CONFIG_ONLY_MODULES（2 项：纯配置，web.py 落库即可，无独立配置文件）
+# ⚠️ 少一个 → 用户点「应用」被拒；多一个 → 任意 key 落库（1.0.10 修的正是后者）。
+# ⚠️ 两份定义会漂移，t-107 断言两边一致，改一处必须改另一处。
+APPLY_MODULES = {
+    # == helper.APPLY_SPEC
+    'dnsmasq', 'radvd', 'dhcpv6', 'miniupnpd', 'upnp', 'chrony', 'ntp',
+    'nft_v4', 'nft_v6', 'network', 'ppp', 'pppoe',
+    # == helper.CONFIG_ONLY_MODULES
+    'system', 'portfwd',
+}
 
 # ---- 静态资源压缩缓存（#7）----
 # app.js 有 583KB，gzip 后 198KB。每次请求都重压一遍纯属浪费 CPU，
@@ -576,8 +615,17 @@ def _helpd_call(action, payload, timeout):
             pass
 
 
-def helper(action, payload=None, timeout=120):
-    """调用 root 特权白名单脚本，返回 dict"""
+def helper(action, payload=None, timeout=120, lang=None):
+    """调用 root 特权白名单脚本，返回 dict
+
+    `lang` 透传给 helper（'en-US' / 'zh-CN'），由 helper 的 set_lang()
+    决定 msg_en 是真英文还是回落中文。None = 不传（helper 保持默认中文）。
+    """
+    if lang is None:
+        lang = _cur_lang[0]
+    if lang != 'zh-CN':
+        payload = dict(payload or {})
+        payload['_lang'] = lang
     # 1) 先试常驻守护（快路径）
     r = _helpd_call(action, payload, timeout)
     if r is not None:
@@ -588,16 +636,25 @@ def helper(action, payload=None, timeout=120):
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, errors='replace')
     except subprocess.TimeoutExpired:
-        return {'ok': False, 'code': 'TIMEOUT', 'msg_cn': '操作超时（%ss）' % timeout}
+        return {'ok': False, 'code': 'TIMEOUT', 'msg_cn': '操作超时（%ss）' % timeout,
+                'msg_en': 'Operation timed out after %ss' % timeout,
+                'msg': ('Operation timed out after %ss' % timeout) if lang == 'en-US'
+                       else '操作超时（%ss）' % timeout}
     except FileNotFoundError:
-        return {'ok': False, 'code': 'NO_HELPER', 'msg_cn': '找不到特权执行器'}
+        return {'ok': False, 'code': 'NO_HELPER', 'msg_cn': '找不到特权执行器',
+                'msg_en': 'Privileged executor not found',
+                'msg': 'Privileged executor not found' if lang == 'en-US'
+                       else '找不到特权执行器'}
     out = (p.stdout or '').strip()
     line = out.splitlines()[-1] if out else ''
     try:
         return json.loads(line)
     except Exception:
         return {'ok': False, 'code': 'BAD_OUTPUT',
-                'msg_cn': '特权执行器返回异常', 'data': {'stdout': out[-800:], 'stderr': (p.stderr or '')[-800:]},
+                'msg_cn': '特权执行器返回异常', 'msg_en': 'Privileged executor returned malformed output',
+                'msg': ('Privileged executor returned malformed output' if lang == 'en-US'
+                        else '特权执行器返回异常'),
+                'data': {'stdout': out[-800:], 'stderr': (p.stderr or '')[-800:]},
                 'rc': p.returncode}
 
 
@@ -788,6 +845,14 @@ class Api:
     def dispatch(self, method, path, query):
         p = path.rstrip('/') or '/'
         self.method = method
+        # 1.0.10：先记下当前请求要用的语言，后面的 helper() 会读它。
+        # 放在 dispatch 最开头，任何分支（含免鉴权的）都能取到。
+        try:
+            _cur_lang[0] = ('en-US'
+                            if (self.h.headers.get('X-Lang') or '').lower()
+                            .startswith('en') else 'zh-CN')
+        except Exception:
+            _cur_lang[0] = 'zh-CN'
 
         # ========== 无需登录 ==========
         if p == '/api/login' and method == 'POST':
@@ -815,12 +880,18 @@ class Api:
             '/api/nft': 'read:nft', '/api/leases': 'read:leases',
             '/api/upnpmap': 'read:upnpmap',
             '/api/ipv6': 'read:ipv6', '/api/ntp': 'read:ntp',
+            # 上游链路详情（IPv4/IPv6 协议 + DHCPv6 统计）
+            '/api/upstream': 'read:upstream',
+            # 邻居表 + 路由表 + IPv6 规则表
+            '/api/netdetail': 'read:netdetail',
             '/api/users': 'read:users', '/api/logs': 'read:logs',
             '/api/journal': 'read:journal',
             '/api/iface_method': 'read:iface_method',
             '/api/ppp/log': 'read:ppp_log',
             '/api/ppp_log': 'read:ppp_log',
             '/api/metrics': 'read:metrics',
+            # 健康总览（#5）：一次拿回所有模块的状态灯
+            '/api/status': 'read:status',
             '/api/ddns': 'read:ddns',
             '/api/acl': 'read:acl',
             '/api/share': 'read:share',
@@ -1389,6 +1460,12 @@ class Api:
                 return
             return self.json(self.helper('depcheck', {'op': 'log'}))
 
+        # ========== 版本检测 / 自更新（概述页）============
+        if p.startswith('/api/update'):
+            if not self.auth():
+                return
+            return self.update_api(p, query, method)
+
         # ========== 对外通用 API 说明 + 文本范例（#17） ==========
         if p in ('/api/openapi', '/api/openapi.json') and method == 'GET':
             return self.openapi_descriptor()
@@ -1407,6 +1484,83 @@ class Api:
                 return
             return self.files_api(p, query, method)
 
+        return self.json({'ok': False, 'code': 'NOTFOUND',
+                          'msg_cn': '接口不存在：%s' % p}, 404)
+
+    # ---------- 版本检测 / 自更新 ----------
+    def _load_mod(self, name):
+        """按文件路径加载 backend/ 下的模块，**结果缓存**。
+
+        ⚠️ 三个坑叠在一起，改之前先读完：
+
+        1) **不能写 `import drouter_update`** —— 文件名带连字符
+           （drouter-update.py），不是合法 Python 标识符，import 必然
+           ModuleNotFoundError。项目里 drouter-ddnsd.py / drouter-helpd.py
+           都是用 importlib 按路径加载的，这里跟着同一套做法。
+
+        2) ⛔ **必须缓存，否则模块级状态全部失效**（1.0.10 实测踩到）：
+           每次请求都 `exec_module` 会得到**全新的模块对象**，于是
+           `drouter-update.py` 里的 `_stop_flag = threading.Event()`、
+           `_lock`、`_worker` 每个请求都是新的。后果：
+             · `apply_update` 在实例 A 上 clear()，
+             · 用户点「中断」→ 新请求 → 新实例 B → `cancel()` 在 B 上 set()，
+             · **对 A 毫无影响** → 169MB 继续下完，但界面显示「正在取消」。
+           这是本项目最典型的「报成功但没做」。同理 `_lock` 失效会让并发
+           点「开始更新」的请求各自起一个 worker，同时写同一个 `.part`
+           文件 → 产出损坏的安装包。
+
+        3) **缓存 key 要带 mtime** —— 部署新版本后模块内容变了，
+           但文件名没变，不看 mtime 就永远用旧代码。
+        """
+        path = os.path.join(_HERE, name + '.py')
+        if not os.path.isfile(path):
+            raise IOError('模块不存在：%s' % path)
+        try:
+            mt = os.stat(path).st_mtime
+        except OSError:
+            mt = 0
+        with _MOD_CACHE_LOCK:
+            hit = _MOD_CACHE.get(name)
+            if hit and hit[0] == mt:
+                return hit[1]
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                name.replace('-', '_'), path)
+            m = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(m)
+            _MOD_CACHE[name] = (mt, m)
+            return m
+
+    def update_api(self, p, query, method):
+        """/api/update/* —— 概述页的「检测新版本 / 一键更新」。
+
+        刻意**不自动安装**：下载+校验后停住，安装动作交给用户或 apt。
+        一次点击就默默改系统，不是这个面板该有的行为。
+        """
+        U = self._load_mod('drouter-update')
+        if p == '/api/update/check':
+            force = (query.get('force') or ['0'])[0] in ('1', 'true', 'yes')
+            r = U.check(force=force)
+            # ⚠️ assets 现在**无论有没有更新都要给**（1.0.10 改）。
+            #    原先只在 has_update 时给，于是「已是最新」的用户打开
+            #    「查看版本发布说明」窗口时拿不到附件清单，
+            #    里面就没有「下载地址 / 安装命令」——
+            #    而那些恰恰是「已是最新」的用户最想看的东西
+            #    （别人问「这版能不能装」时直接复制命令用）。
+            if r.get('ok') and r.get('latest'):
+                r['assets'] = U.asset_list(r['latest'])
+            else:
+                r['assets'] = []
+            return self.json({'ok': True, 'data': r})
+        if p == '/api/update/state':
+            return self.json({'ok': True, 'data': U.read_state()})
+        if p == '/api/update/apply' and method == 'POST':
+            b = self.body()
+            r = U.apply_update(b.get('version') or '', b.get('asset') or 'deb',
+                               backup=b.get('backup', True))
+            return self.json(r)
+        if p == '/api/update/cancel' and method == 'POST':
+            return self.json(U.cancel())
         return self.json({'ok': False, 'code': 'NOTFOUND',
                           'msg_cn': '接口不存在：%s' % p}, 404)
 
@@ -1511,6 +1665,16 @@ class Api:
         data = b.get('data')
         live = bool(b.get('live'))          # 默认 False：只写盘不生效
         check_only = bool(b.get('check_only'))
+        # ⚠️ 白名单必须在写库**之前**判。
+        #    早先这里没有校验，于是 `POST /api/apply {"module":"任意字符串"}`
+        #    会把任意 module 写进 settings 表（merge_cfg → set_cfg 直落库），
+        #    然后才在 helper 的 APPLY_SPEC 里被拒 —— 接口返回
+        #    「未知的模块」，但**配置已经写进去了**。用户完全不知道。
+        #    这就是本项目最典型的「报失败但副作用已发生」。
+        #    取值与 helper 的 APPLY_SPEC 保持一致（APPLY_SPEC 是权威定义）。
+        if module not in APPLY_MODULES:
+            return self.json({'ok': False, 'code': 'BADMODULE',
+                              'msg_cn': '未知配置模块'})
         # 预检绝不写配置库：只该校验「传进来的这份数据能不能渲染成合法配置」，
         # 不该把这份数据变成「当前配置」。否则点一次「仅语法检查」
         # 就等于悄悄保存了一次，用户完全没察觉。
@@ -2036,17 +2200,31 @@ class Api:
                     risky.append(l)
             out['upgradable'] = rows
             out['risky'] = risky
-            out['notice'] = ('发现 %d 个可升级包，其中 %d 个可能影响桌面/RealVNC，'
-                             '升级前请先创建快照。' % (len(rows), len(risky)))
+            # 「发现 127 个可升级包…」这行在概览/更新页直接上屏，必须按界面语言给
+            if _cur_lang[0] == 'en-US':
+                out['notice'] = ('Found %d upgradable package(s), %d of which may '
+                                 'affect the desktop / RealVNC - create a snapshot '
+                                 'before upgrading.' % (len(rows), len(risky)))
+            else:
+                out['notice'] = ('发现 %d 个可升级包，其中 %d 个可能影响桌面/RealVNC，'
+                                 '升级前请先创建快照。' % (len(rows), len(risky)))
         except Exception as e:
-            out['notice'] = '检查失败：%s' % e
+            out['notice'] = ('Check failed: %s' % e) if _cur_lang[0] == 'en-US' \
+                else ('检查失败：%s' % e)
         try:
             p2 = subprocess.run(['systemctl', 'is-active', 'vncserver-x11-serviced'],
                                 capture_output=True, text=True, timeout=5)
             out['vnc_active'] = (p2.stdout or '').strip() == 'active'
         except Exception:
             out['vnc_active'] = None
-        out['holds'] = helper('pkg', {'op': 'holds'}).get('data', {}).get('holds', [])
+        # ⚠️ `helper().get('data', {})` 在 helper 走 fail() 分支时**不生效**：
+        #    fail() 返回的 dict 里 'data' 键是存在的（值是 None），
+        #    dict.get 只在键**缺失**时才用默认值 —— 于是拿到 None，
+        #    紧接着 .get('holds') 抛 AttributeError，整个接口 500。
+        #    概述页是登录后必调接口，这个 500 很显眼。
+        #    正确写法：`(x.get('data') or {})`，None 与缺失都能兜住。
+        out['holds'] = (helper('pkg', {'op': 'holds'}).get('data')
+                        or {}).get('holds', [])
         return self.json({'ok': True, 'data': out})
 
     # -------------------------------------------------- 对外通用 API（#17）
@@ -2224,6 +2402,11 @@ def build_openapi(base):
         '/api/ntp': '时间同步状态',
         '/api/logs': '日志',
         '/api/journal': '系统日志',
+        # ↓ 1.0.10 新增。⚠️ build_openapi 是**逐个显式登记**的，
+        #   不是从 dispatch 的 readings 自动生成 —— 所以新端点光在 readings
+        #   里加一行不够，这里也必须加，否则 API 文档里看不到。
+        '/api/upstream': '上游链路详情（IPv4/IPv6 协议、地址、网关、DNS、DHCPv6 统计）',
+        '/api/netdetail': '邻居表 / 路由表 / IPv6 规则表',
     }
     for path, summary in reads.items():
         paths.update(ep(path, 'get', summary, tag='只读观测'))
@@ -2233,6 +2416,14 @@ def build_openapi(base):
         '/api/accel': ('post', 'nftables flowtable 软加速 开关/查询', {'op': 'string: get|on|off'}, '网络加速'),
         '/api/vlan': ('post', 'VLAN 接口 查询/保存/应用/删除', {'op': 'string: get|save|apply|delete', 'id': 'string', 'parent': 'string', 'vid': 'integer', 'name': 'string'}, '二层网络'),
         '/api/wol': ('post', 'WOL 网络唤醒 / 网卡能力查询', {'op': 'string: get|iface|save|wake', 'mac': 'string', 'iface': 'string'}, '二层网络'),
+        # ↓ 1.0.10 新增：版本检测 / 下载更新。
+        #   check 与 state 是 GET，apply/cancel 是 POST —— openapi 里只能记一种
+        #   方法，这里记 POST（真正会改状态的那个），GET 的两个在 API 文档里
+        #   按摘要说明。apply 只下载+校验，**不自动安装**。
+        '/api/update/apply': ('post', '下载指定版本的安装包（先备份→官方源下载→SHA256 校验）',
+                              {'version': 'string: 形如 1.0.9', 'asset': 'string: deb|offline|docker',
+                               'backup': 'boolean'}, '版本更新'),
+        '/api/update/cancel': ('post', '中断正在进行的更新下载', None, '版本更新'),
         '/api/pppoe-multi': ('post', 'PPPoE 多拨：查询/保存/应用/启停/单会话操作',
                              {'op': 'string: get|save|apply|stop|session_start|session_stop|session_restart',
                               'strategy': 'string: balance|primary_backup|weighted',
@@ -2358,29 +2549,44 @@ def build_openapi(base):
 
 
 def build_examples(base):
-    """多语言调用范例（文本块，前后端都可直接展示/复制）。"""
+    """Multilingual API call examples (plain-text blocks shown / copied on both
+    the frontend and backend). Language follows the request's X-Lang header."""
+    EN = _cur_lang[0] == 'en-US'
+    def pick(zh, en):
+        return en if EN else zh
+    c1 = pick('# 1) 登入拿 token\n', '# 1) Log in to obtain the token\n')
+    c2 = pick('# 2) 读取系统概览\n', '# 2) Read the system overview\n')
+    c3 = pick('# 3) 一键开启软加速\n', '# 3) Enable acceleration with one call\n')
+    py_cert = pick('   # 自签证书\n\n', '   # self-signed certificate\n\n')
+    http_sep = pick('--- 拿到 token 后 ---\n\n', '--- after obtaining the token ---\n\n')
+    http_tok = pick('<上一步返回的 token>', '<token from the previous step>')
     return {
         'base': base,
-        'note': '所有接口统一返回 {"ok":..,"msg_cn":..,"data":..}；失败时 ok=false。'
-                '除 /api/health、/api/login 外均需 X-Token 头。',
+        'note': pick(
+            '所有接口统一返回 {"ok":..,"msg_cn":..,"data":..}；失败时 ok=false。'
+            '除 /api/health、/api/login 外均需 X-Token 头。',
+            'All endpoints return {"ok":..,"msg_cn":..,"data":..}; on failure ok=false. '
+            'Every endpoint except /api/health and /api/login requires the X-Token header.'),
         'examples': [
-            {'lang': 'curl', 'title': 'cURL（最通用，Linux/macOS/Windows 均可）', 'code':
-                "BASE=\"%s\"\n"
-                "# 1) 登入拿 token\n"
+            {'lang': 'curl', 'title': pick('cURL（最通用，Linux/macOS/Windows 均可）',
+                                           'cURL (most universal; Linux/macOS/Windows)'), 'code':
+                ("BASE=\"%s\"\n"
+                + c1 +
                 "TOKEN=$(curl -sk -X POST \"$BASE/api/login\" \\\n"
                 "  -H 'Content-Type: application/json' \\\n"
                 "  -d '{\"username\":\"admin\",\"password\":\"admin123\"}' \\\n"
                 "  | python3 -c 'import sys,json;print(json.load(sys.stdin)[\"data\"][\"token\"])')\n\n"
-                "# 2) 读取系统概览\n"
+                + c2 +
                 "curl -sk \"$BASE/api/sysinfo\" -H \"X-Token: $TOKEN\"\n\n"
-                "# 3) 一键开启软加速\n"
+                + c3 +
                 "curl -sk -X POST \"$BASE/api/accel\" -H \"X-Token: $TOKEN\" \\\n"
-                "  -H 'Content-Type: application/json' -d '{\"op\":\"on\"}'\n" % base},
-
-            {'lang': 'python', 'title': 'Python（仅用标准库 requests 可省）', 'code':
-                "import json, urllib.request, ssl\n\n"
+                "  -H 'Content-Type: application/json' -d '{\"op\":\"on\"}'\n"
+                ) % base},
+            {'lang': 'python', 'title': pick('Python（仅用标准库 requests 可省）',
+                                            'Python (standard library only; no requests needed)'), 'code':
+                ("import json, urllib.request, ssl\n\n"
                 "BASE = \"%s\"\n"
-                "CTX = ssl._create_unverified_context()   # 自签证书\n\n"
+                + py_cert +
                 "def call(path, data=None, token=None, method=None):\n"
                 "    body = json.dumps(data).encode() if data is not None else None\n"
                 "    req = urllib.request.Request(BASE + path, data=body,\n"
@@ -2392,9 +2598,9 @@ def build_examples(base):
                 "        return json.load(r)\n\n"
                 "tok = call('/api/login', {'username': 'admin', 'password': 'admin123'})['data']['token']\n"
                 "print(call('/api/sysinfo', token=tok)['data']['hostname'])\n"
-                "print(call('/api/nat/check', token=tok)['data']['title'])\n" % base},
-
-            {'lang': 'javascript', 'title': 'JavaScript / Node.js / 浏览器 fetch', 'code':
+                "print(call('/api/nat/check', token=tok)['data']['title'])\n"
+                ) % base},
+            {'lang': 'javascript', 'title': 'JavaScript / Node.js / browser fetch', 'code':
                 "const BASE = '%s';\n\n"
                 "async function call(path, data, token) {\n"
                 "  const r = await fetch(BASE + path, {\n"
@@ -2409,8 +2615,8 @@ def build_examples(base):
                 "  const info = await call('/api/sysinfo', null, data.token);\n"
                 "  console.log(info.data.hostname, info.data.virt.name);\n"
                 "})();\n" % base},
-
-            {'lang': 'go', 'title': 'Go（net/http 标准库）', 'code':
+            {'lang': 'go', 'title': pick('Go（net/http 标准库）',
+                                        'Go (net/http standard library)'), 'code':
                 "package main\n\n"
                 "import (\n\t\"bytes\"\n\t\"crypto/tls\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"io\"\n\t\"net/http\"\n)\n\n"
                 "const base = \"%s\"\n\n"
@@ -2432,8 +2638,8 @@ def build_examples(base):
                 "\tinfo := call(\"/api/sysinfo\", nil, tok)\n"
                 "\tfmt.Println(info[\"data\"].(map[string]any)[\"hostname\"])\n"
                 "}\n" % base},
-
-            {'lang': 'java', 'title': 'Java 11+（HttpClient）', 'code':
+            {'lang': 'java', 'title': pick('Java 11+（HttpClient）',
+                                          'Java 11+ (HttpClient)'), 'code':
                 "import java.net.URI;\nimport java.net.http.*;\nimport java.time.Duration;\n\n"
                 "public class Drouter {\n"
                 "  static final String BASE = \"%s\";\n\n"
@@ -2447,8 +2653,8 @@ def build_examples(base):
                 "        .POST(HttpRequest.BodyPublishers.ofString(login)).build();\n"
                 "    System.out.println(c.send(rq, HttpResponse.BodyHandlers.ofString()).body());\n"
                 "  }\n}\n" % base},
-
-            {'lang': 'php', 'title': 'PHP（file_get_contents / curl 通用写法）', 'code':
+            {'lang': 'php', 'title': pick('PHP（file_get_contents / curl 通用写法）',
+                                         'PHP (file_get_contents / curl)'), 'code':
                 "<?php\n"
                 "$base = '%s';\n\n"
                 "function call($path, $data = null, $token = null) {\n"
@@ -2467,16 +2673,16 @@ def build_examples(base):
                 "}\n"
                 "$t = call('/api/login', ['username' => 'admin', 'password' => 'admin123'])['data']['token'];\n"
                 "echo call('/api/sysinfo', null, $t)['data']['os'];\n" % base},
-
-            {'lang': 'shell', 'title': 'Shell（wget 版，无 curl 环境）', 'code':
+            {'lang': 'shell', 'title': pick('Shell（wget 版，无 curl 环境）',
+                                           'Shell (wget variant, no curl)'), 'code':
                 "#!sh\n"
                 "BASE=\"%s\"\n"
                 "TOKEN=$(wget -qO- --no-check-certificate --header='Content-Type: application/json' \\\n"
                 "  --post-data='{\"username\":\"admin\",\"password\":\"admin123\"}' \\\n"
                 "  \"$BASE/api/login\" | sed -n 's/.*\"token\":\"\\([^\"]*\\)\".*/\\1/p')\n"
                 "wget -qO- --no-check-certificate --header=\"X-Token: $TOKEN\" \"$BASE/api/sysinfo\"\n" % base},
-
-            {'lang': 'powershell', 'title': 'PowerShell（Windows）', 'code':
+            {'lang': 'powershell', 'title': pick('PowerShell（Windows）',
+                                                 'PowerShell (Windows)'), 'code':
                 "$base = '%s'\n"
                 "$login = Invoke-RestMethod -Method Post -Uri \"$base/api/login\" `\n"
                 "  -Body (@{username='admin';password='admin123'} | ConvertTo-Json) `\n"
@@ -2484,18 +2690,19 @@ def build_examples(base):
                 "$info = Invoke-RestMethod -Uri \"$base/api/sysinfo\" -Headers @{'X-Token'=$login.data.token} `\n"
                 "  -SkipCertificateCheck\n"
                 "$info.data.hostname\n" % base},
-
-            {'lang': 'http', 'title': '原始 HTTP 报文（任何 HTTP 客户端 / 工单系统 / IoT）', 'code':
-                "POST /api/login HTTP/1.1\n"
+            {'lang': 'http', 'title': pick('原始 HTTP 报文（任何 HTTP 客户端 / 工单系统 / IoT）',
+                                          'Raw HTTP messages (any HTTP client / ticketing system / IoT)'), 'code':
+                ("POST /api/login HTTP/1.1\n"
                 "Host: %s\n"
                 "Content-Type: application/json\n"
                 "Content-Length: 44\n\n"
                 "{\"username\":\"admin\",\"password\":\"admin123\"}\n\n"
-                "--- 拿到 token 后 ---\n\n"
+                + http_sep +
                 "GET /api/sysinfo HTTP/1.1\n"
                 "Host: %s\n"
-                "X-Token: <上一步返回的 token>\n" % (base.replace('https://', '').replace('http://', ''),
-                                                      base.replace('https://', '').replace('http://', ''))},
+                "X-Token: " + http_tok + "\n"
+                ) % (base.replace('https://', '').replace('http://', ''),
+                     base.replace('https://', '').replace('http://', ''))},
         ],
     }
 

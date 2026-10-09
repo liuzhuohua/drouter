@@ -446,15 +446,29 @@ chk('每行有保护开关，且走 change 事件（不是 onclick）',
     'data-lock=' in app and 'b.onchange' in app)
 chk('保护开关调用 /api/snapshot/protect', '/api/snapshot/protect' in app)
 chk('删除受保护快照会追加一次确认（读后端 needs_force）',
-    'needs_force' in app and '仍要删除' in app)
+    # ⚠️ 判据改过两轮，两轮都是「假红」不是产品 bug：
+    #    ① 1.0.10 做 i18n 后原文不在 app.js 里了 → 改成查逻辑 + 词条；
+    #    ② 后来词条又从 `sy.forceDel` 这类点分 key 换成了 **raw 分组的
+    #       中文 key** `T('仍要删除')`，原来那条 `t\('\w+\.\w*[Ff]orce'`
+    #       就再也匹配不上（2026-10-08 实测）。现在两种形态都认。
+    #       （APP 是 read() 出来的**文件内容**，不是路径 —— 我一开始写成
+    #         os.path.dirname(APP) 报 FileNotFoundError 才注意到。）
+    'needs_force' in app
+    and re.search(r"[tT]\('[^']*(?:仍要删除|[Ff]orce\w*Del|\w+\.\w*[Ff]orce)'", app) is not None,
+    '（needs_force 判断在 + 确认按钮文案走了 t()/T()）')
 chk('创建时有「创建后上锁」勾选', 'id="sy-protect"' in APP)
 chk('创建请求带 protected 字段',
     re.search(r"api\('/api/snapshot'.*?protected: \$\('#sy-protect'\)\.checked",
               app, re.S) is not None)
+# 下面两条查的是中文说明文案，i18n 后要查字典
+_I18N = read('web/i18n.js')
 chk('文案说明了「手动快照与已上锁快照都不被自动清理」',
-    '手动快照' in APP and '上锁' in APP and '自动清理' in APP)
+    re.search(r"手动快照", _I18N) is not None
+    and re.search(r"自动清理", _I18N) is not None
+    and re.search(r"上锁", _I18N) is not None)
 chk('自动快照卡片说明了「上锁不占用保留份数额度」',
-    '上锁' in APP and '额度' in APP)
+    re.search(r"上锁", _I18N) is not None
+    and re.search(r"额度", _I18N) is not None)
 chk('页面里没有重复的快照列表容器（#sy-snapout 只出现一次）',
     APP.count('id="sy-snapout"') == 1, APP.count('id="sy-snapout"'))
 chk('CSS 里有快照备注输入框的样式', '.snap-tag-input' in read('web/app.css'))

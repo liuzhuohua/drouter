@@ -4,9 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light">
-<title>Drouter · Debian 13 主路由管理</title>
+<title data-i18n="common.ui.pageTitle">Drouter · Debian 13 主路由管理</title>
 <link rel="icon" href="/logo.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/update.css">
 <!-- 主题之家（#12）：由后端根据「当前生效主题」动态生成，覆盖 app.css 里的 CSS 变量。
      文件不存在时后端返回空样式，页面自动回落到内置默认配色。 -->
 <link rel="stylesheet" href="/theme.css" id="theme-css">
@@ -40,12 +41,12 @@
   <div class="login-box">
     <div class="login-logo"><svg class="lg-mark" width="56" height="56"><use href="#drouter-logo"/></svg></div>
     <h1>Drouter</h1>
-    <p class="sub">Debian 13 主路由 · 本地管理台</p>
-    <label>管理员用户名<input id="lg-user" autocomplete="username" value="admin"></label>
-    <label>密码<input id="lg-pass" type="password" autocomplete="current-password"></label>
-    <button id="lg-btn" class="primary">登 录</button>
+    <p class="sub" data-i18n="common.ui.localConsole">Debian 13 主路由 · 本地管理台</p>
+    <label><span data-i18n="common.ui.adminUser">管理员用户名</span><input id="lg-user" autocomplete="username" value="admin"></label>
+    <label><span data-i18n="common.ui.password">密码</span><input id="lg-pass" type="password" autocomplete="current-password"></label>
+    <button id="lg-btn" class="primary" data-i18n="common.ui.login">登 录</button>
     <div id="lg-msg" class="msg"></div>
-    <p class="hint">首次使用默认账号 admin / admin123，登录后请立即修改密码。</p>
+    <p class="hint" data-i18n="common.ui.firstHint">首次使用默认账号 admin / admin123，登录后请立即修改密码。</p>
   </div>
 </div>
 
@@ -55,7 +56,7 @@
          用 <a> 而不是 <div onclick>：Tab 能聚焦、Enter 能触发、读屏会念
          「链接」。role/button + tabindex 只能骗过一部分辅助工具，语义标签
          是免费的。href="#" 会被下面的 click preventDefault 吃掉。 -->
-    <a class="brand brand-home" href="#dash" id="brand-home" title="返回系统概览">
+    <a class="brand brand-home" href="#dash" id="brand-home" data-i18n-attr="title:common.ui.backDash" title="返回系统概览">
       <svg class="brand-mark" width="30" height="30" aria-hidden="true"><use href="#drouter-logo"/></svg>
       <div class="brand-txt">
         <b>Drouter</b>
@@ -63,19 +64,20 @@
       </div>
     </a>
     <div class="nav-search">
-      <input id="nav-filter" placeholder="搜索菜单…" autocomplete="off">
+      <input id="nav-filter" data-i18n-attr="placeholder:nav.search"
+             placeholder="搜索菜单…" autocomplete="off">
     </div>
     <nav id="nav"></nav>
     <div class="side-foot">
       <div id="vnc-dot" class="dot-line"></div>
       <!-- 左下角退出：显示当前登录账号，点一下即登出 -->
-      <button id="btn-logout" class="side-logout" title="退出系统" aria-label="退出系统">
+      <button id="btn-logout" class="side-logout" data-i18n-attr="title:退出系统, aria-label:退出系统"
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
              stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
           <path d="M16 17l5-5-5-5"/><path d="M21 12H9"/>
         </svg>
-        <span class="sl-txt">退出系统</span>
+        <span class="sl-txt" data-i18n="退出系统">退出系统</span>
       </button>
     </div>
   </aside>
@@ -85,23 +87,33 @@
   <main>
     <header class="topbar">
       <div class="tb-left">
-        <button id="btn-side" class="icon-btn" title="折叠/展开菜单" aria-label="折叠或展开菜单">
+        <button id="btn-side" class="icon-btn" data-i18n-attr="title:common.ui.toggleMenu, aria-label:common.ui.toggleMenuAria" title="折叠/展开菜单" aria-label="折叠或展开菜单">
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
         </button>
         <h2 id="page-title">概览</h2>
+        <!-- 本页模块的状态灯（#5）：由主脚本的 paintPageLight() 填。
+             只在这个页面确实对应一个受监控模块时才出现，其余页面留空。 -->
+        <span id="page-health" class="page-health" hidden></span>
       </div>
       <div class="tb-right">
+        <!-- 语言切换（1.0.10 新增）。i18n.js 挂载时会给它填当前语言文字，
+             点击调用 window.i18n.toggle()。开关放在刷新按钮旁边，
+             因为它和刷新一样是「作用于整个面板」的动作。 -->
+        <button id="btn-lang" class="icon-btn" data-i18n-attr="title:app.langToZh,aria-label:app.langToZh"
+                title="切换到中文" aria-label="切换到中文">
+          <span id="lang-label">中</span>
+        </button>
         <!-- 右上角刷新：重新加载当前页面数据（旋转动画表示正在刷新） -->
-        <button id="btn-refresh" class="icon-btn" title="刷新当前页面" aria-label="刷新当前页面">
+        <button id="btn-refresh" class="icon-btn" data-i18n-attr="title:common.ui.refreshPage, aria-label:common.ui.refreshPage" title="刷新当前页面" aria-label="刷新当前页面">
           <svg id="btn-refresh-ico" width="17" height="17" viewBox="0 0 24 24" fill="none"
                stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>
           </svg>
         </button>
-        <div id="clock-box" class="clockbox" title="点击切换 12/24 小时制">
+        <div id="clock-box" class="clockbox" data-i18n-attr="title:common.ui.switchClock" title="点击切换 12/24 小时制">
           <span id="clock-time" class="ck-time">--:--:--</span>
-          <span id="clock-date" class="ck-date">加载中…</span>
+          <span id="clock-date" class="ck-date" data-i18n="common.ui.loading">加载中…</span>
           <span id="clock-lunar" class="ck-lunar"></span>
         </div>
       </div>
@@ -111,20 +123,20 @@
     <div id="actionbar" class="actionbar hidden">
       <div id="ab-msg" class="ab-msg"></div>
       <div class="ab-btns">
-        <button id="ab-save" class="ghost">仅保存</button>
-        <button id="ab-apply" class="primary">保存并应用</button>
+        <button id="ab-save" class="ghost" data-i18n="common.ui.saveOnly">仅保存</button>
+        <button id="ab-apply" class="primary" data-i18n="common.ui.saveApply">保存并应用</button>
       </div>
     </div>
     <footer class="site-footer">
-      <span>Drouter · Debian 13 主路由管理系统</span>
+      <span data-i18n="common.ui.footer">Drouter · Debian 13 主路由管理系统</span>
       <span class="sep">·</span>
       <span>火麒麟 (ajeef)</span>
       <span class="sep">·</span>
       <a href="https://github.com/liuzhuohua" target="_blank" rel="noopener noreferrer">https://github.com/liuzhuohua</a>
       <span class="sep">·</span>
-      <span>遵循 MIT 开源协议</span>
+      <span data-i18n="common.ui.mit">遵循 MIT 开源协议</span>
       <span class="sep">·</span>
-      <span class="site-ver" id="app-ver" title="当前安装的版本">v__APP_VERSION__</span>
+      <span class="site-ver" id="app-ver" data-i18n-attr="title:common.ui.curVer" title="当前安装的版本">v__APP_VERSION__</span>
     </footer>
   </main>
 </div>
@@ -132,6 +144,30 @@
 <div id="toast" class="toast hidden"></div>
 <div id="modal" class="modal hidden"><div class="modal-box" id="modal-box"></div></div>
 
+<!-- ⚠️⚠️ i18n 框架**必须排在 app.js 之前**（2026-10-05 修：顺序写反了，
+     整站登录失效）。app.js 的**顶层**就有 t() 调用 —— 左侧导航的
+     `g: t('概览')` 之类是模块加载时求值的常量，i18n.js 还没加载就
+     ReferenceError: t is not defined，于是 app.js 整个挂掉，
+     登录按钮的 onclick 根本没绑上（用户反馈「输入密码后网页无反应」）。
+
+     而下面的 update.js / upstream.js / netdetail.js / realtime.js
+     必须在 app.js **之后** —— 它们要用 app.js 暴露的 api()/esc()。
+     两组顺序要求相反，注意别再弄反。 -->
+<script src="/i18n.js"></script>
 <script src="/app.js"></script>
+<!-- 版本检测 / 一键更新。刻意**独立于 app.js**：
+     app.js 是 690KB 的主面板 SPA，这个模块只服务概览页的一个卡片。
+     分开的好处是它可以被单独缓存/替换，而不必让整个 SPA 失效。 -->
+<script src="/update.js"></script>
+<!-- 上游链路详情（IPv4/IPv6 协议 + DHCPv6 统计）。独立文件：
+     每个请求要 fork 多个 ip/resolvectl 命令，刷新节奏也与主面板不同，
+     混进 app.js 会让首屏背不必要的重量。必须在 app.js 之后
+     —— 要用它暴露的 api() 与 __drouterEsc。 -->
+<script src="/upstream.js"></script>
+<!-- 网络明细（邻居表 / 路由表 / IPv6 规则）。15 秒刷新一次，理由同上。 -->
+<script src="/netdetail.js"></script>
+<!-- 实时柱状流动图（负载 / 带宽 / 连接）。canvas 绘制、3 秒采样，
+     独立成文件避免给首屏再加重量。 -->
+<script src="/realtime.js"></script>
 </body>
 </html>
