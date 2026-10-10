@@ -74,9 +74,21 @@ def emit(line):
 
 
 def call(action, payload=None, timeout=CALL_TIMEOUT):
+    """调用 helper 的备份能力。
+
+    ⚠️ 这里用 sudo -n 提权（2026-10-10 修）：
+    helper 写备份包要进 /opt/drouter/backups（root:root drwxr-xr-x），
+    而 backupd 有两种运行身份 ——
+      · 定时器（systemd timer）→ root，本来就能写；
+      · 「更新前自动备份」→ 由 drouter-web（drouter 用户）spawn，
+        这条链不带 sudo 时 helper 也继承 drouter 身份，写 .part 直接
+        [Errno 13] Permission denied，更新被卡在备份这步。
+    sudoers 已放行 drouter ALL=(root) NOPASSWD: python3 .../drouter-helper.py，
+    所以 root 跑 sudo -n 免密、drouter 跑也走白名单提权，两种身份都通。
+    """
     try:
         p = subprocess.run(
-            ['/usr/bin/python3', HELPER, action,
+            ['sudo', '-n', '/usr/bin/python3', HELPER, action,
              json.dumps(payload or {}, ensure_ascii=False)],
             capture_output=True, text=True, timeout=timeout, errors='replace')
         return json.loads(p.stdout or '{}')

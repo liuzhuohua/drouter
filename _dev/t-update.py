@@ -792,6 +792,15 @@ ck('_do_backup 校验 BK_CREATED（不只看 returncode）',
    '（returncode==0 在「自动备份未开启」时也会出现，'
    '只看它会把「什么都没备份」当成「备份成功」）')
 ck('_do_backup 用 --run-now 调用', "'--run-now'" in uc)
+# ⚠️ backupd 的 call() 必须用 sudo -n 提权（2026-10-10 真机修的 bug）：
+#   「更新前备份」由 drouter-web（drouter 用户）spawn backupd，这条链不带 sudo
+#   时 helper 继承 drouter 身份，写 /opt/drouter/backups（root:root）直接
+#   [Errno 13] Permission denied，更新被卡死在备份这步。sudoers 已放行
+#   drouter 免密跑 helper 白名单，所以 root/drouter 两种身份都通。
+#   判据查**语义**（subprocess 命令数组里真有 sudo 前缀），不能只查「出现 sudo 这个词」。
+_bkd = read(P('backend', 'drouter-backupd.py'))
+ck('backupd call() 用 sudo -n 提权（否则 drouter 身份写不进备份目录）',
+   re.search(r"\['sudo',\s*'-n',\s*'/usr/bin/python3',\s*HELPER", _bkd) is not None)
 
 # ④ P0-4：apply 必须有白名单且在写库前
 ck('apply_module 有模块白名单', 'APPLY_MODULES' in w)

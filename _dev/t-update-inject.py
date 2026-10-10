@@ -98,6 +98,14 @@ CASES = [
      "        import drouter_update as U",
      'web.py 用 importlib'),
 
+    # backupd call() 去掉 sudo 前缀：drouter 身份（更新前备份）写不进
+    # /opt/drouter/backups → [Errno 13] Permission denied（2026-10-10 真机修）。
+    ('backupd call() 去掉 sudo（drouter 身份写不进备份目录）',
+     'backend/drouter-backupd.py',
+     "            ['sudo', '-n', '/usr/bin/python3', HELPER, action,",
+     "            ['/usr/bin/python3', HELPER, action,",
+     'backupd call() 用 sudo -n 提权'),
+
     ('/api/update 路由被摘掉',
      'backend/drouter-web.py',
      "        if p.startswith('/api/update'):",
